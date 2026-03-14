@@ -177,10 +177,6 @@ async fn run_hook(
     issue: &Issue,
 ) -> Result<()> {
     let cargo_home = workspace.join(".cargo-home");
-    tokio::fs::create_dir_all(&cargo_home)
-        .await
-        .with_context(|| format!("failed to create workspace cargo home for {hook_name}"))?;
-
     let mut command = Command::new("bash");
     command.arg("-lc").arg(script);
     command.current_dir(workspace);
@@ -313,6 +309,5 @@ workspace:
             fs::read_to_string(workspace.join("cargo-home-path.txt")).unwrap(),
             workspace.join(".cargo-home").display().to_string()
         );
-        assert!(workspace.join(".cargo-home").is_dir());
     }
 }
