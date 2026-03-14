@@ -1,0 +1,9 @@
+.git
+.github
+**/target
+elixir/_build
+elixir/deps
+elixir/.elixir_ls
+rust/.env
+rust/.env.*
+node_modules
