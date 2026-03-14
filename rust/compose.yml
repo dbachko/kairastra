@@ -7,6 +7,7 @@ services:
         CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.114.0}
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN}
+      CODEX_AUTH_MODE: ${CODEX_AUTH_MODE:-auto}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       WORKFLOW_PATH: /config/WORKFLOW.md
       SYMPHONY_WORKSPACE_ROOT: ${SYMPHONY_WORKSPACE_ROOT:-/workspaces}
@@ -16,7 +17,9 @@ services:
       - ${WORKFLOW_FILE:-../WORKFLOW.md}:/config/WORKFLOW.md:ro
       - ${SEED_REPO_PATH:-..}:/seed-repo:ro
       - symphony_rust_workspaces:${SYMPHONY_WORKSPACE_ROOT:-/workspaces}
+      - symphony_rust_codex:/root/.codex
     restart: unless-stopped
 
 volumes:
   symphony_rust_workspaces:
+  symphony_rust_codex:

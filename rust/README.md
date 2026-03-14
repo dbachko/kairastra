@@ -42,13 +42,37 @@ Files added for the container flow:
 
 Important notes:
 
-- Fill in `GITHUB_TOKEN` and `OPENAI_API_KEY` in `rust/.env`.
+- Fill in `GITHUB_TOKEN` in `rust/.env`.
 - Set `WORKFLOW_FILE` in `rust/.env` to the host path of the workflow file you want mounted into the container.
 - Set `SEED_REPO_PATH` in `rust/.env` to the host path of the repository copy that should be cloned into per-issue workspaces. The default `..` works when you run Compose from `rust/` inside this repo.
 - Your workflow should usually use `workspace.root: $SYMPHONY_WORKSPACE_ROOT` so the same file works inside Docker.
 - The Compose setup mounts the seed repo at `/seed-repo`, and the checked-in `WORKFLOW.md` prefers cloning from that local mount before falling back to GitHub.
-- The container entrypoint logs Codex in from `OPENAI_API_KEY` automatically when `/root/.codex/auth.json` is not present yet.
-- The runtime image installs `codex` and starts `symphony-rust` directly.
+- `CODEX_AUTH_MODE` controls Codex auth bootstrap in the container:
+  - `auto` (default): if `OPENAI_API_KEY` is set, bootstrap API-key login; otherwise rely on persisted login state.
+  - `api_key`: bootstrap from `OPENAI_API_KEY` only.
+  - `chatgpt`: skip API-key bootstrap and use persisted Codex login state only.
+- Compose persists `/root/.codex` with the `symphony_rust_codex` volume so login survives restarts.
+- The runtime image installs `codex`, `gh`, `docker`, and `docker-compose`, and it reuses the Rust toolchain from the builder stage so workspace `cargo` commands match the app build toolchain.
+- `docker compose ...` inside the container is shimmed to Debian's `docker-compose` binary. That is enough for config-oriented validation; mount the host Docker socket separately if you want worker turns to build or run sibling containers.
+
+### Headless device-auth (Docker ChatGPT subscription mode)
+
+1. Set `CODEX_AUTH_MODE=chatgpt` (or `auto` with no `OPENAI_API_KEY`) in `rust/.env`.
+2. Start the stack once: `docker compose -f rust/compose.yml --env-file rust/.env up -d`.
+3. Run device login inside the running container: `docker compose -f rust/compose.yml --env-file rust/.env exec symphony-rust codex login`.
+4. Complete the device code flow from a browser.
+5. Restart normally; Compose keeps `/root/.codex` persisted.
+
+### Headless device-auth (VPS without Docker)
+
+1. SSH to the VPS and run `codex login`.
+2. Complete the device code flow in your browser.
+3. Start Symphony Rust on the VPS; Codex uses the saved login from `~/.codex`.
+
+### API-key mode
+
+- Set `OPENAI_API_KEY` and use `CODEX_AUTH_MODE=api_key` (or `auto`).
+- On first start, the container runs `codex login --with-api-key` and stores auth under `/root/.codex`.
 
 ## Minimal GitHub workflow
 

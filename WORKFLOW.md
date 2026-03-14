@@ -15,21 +15,28 @@ workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:
   after_create: |
+    auth_header="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+
     if [ -n "$SYMPHONY_SEED_REPO" ] && [ -d "$SYMPHONY_SEED_REPO/.git" ]; then
       git clone "$SYMPHONY_SEED_REPO" .
+      git remote set-url origin https://github.com/dbachko/symphony-gh.git
     else
-      auth_header="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
       git -c http.extraheader="Authorization: Basic ${auth_header}" clone --depth 1 https://github.com/dbachko/symphony-gh.git .
     fi
+
+    git config http.https://github.com/.extraheader "Authorization: Basic ${auth_header}"
+    git config user.name "Symphony Rust"
+    git config user.email "symphony-rust@users.noreply.github.com"
 agent:
   max_concurrent_agents: 1
-  max_turns: 3
+  max_turns: 10
 codex:
   command: codex app-server
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+    networkAccess: true
   read_timeout_ms: 5000
   turn_timeout_ms: 1800000
   stall_timeout_ms: 300000
@@ -82,6 +89,27 @@ Instructions:
 4. Run focused validation for the touched scope.
 5. Post a concise issue comment with what changed and what was validated.
 6. If the task is fully complete, close the issue with `github_rest`. Otherwise leave it open.
+
+## Complex E2E protocol
+
+If the issue title starts with `Symphony Rust Complex E2E`, run this protocol instead of the default flow:
+
+1. Treat the issue body as the single source of truth for progress.
+2. Replace the issue body with:
+   - the original feature request content
+   - a `## Codex Workpad` section
+   - a short `Plan` section with a 4-6 item markdown checklist
+   - an `Acceptance Criteria` checklist
+   - a `Validation` checklist
+   - a `Notes` section
+3. Create a new branch from `main` named `symphony-rust-e2e/<issue-number>-<short-slug>`.
+4. Work through the checklist in order. After each meaningful milestone, update the same issue body and check off completed items.
+5. Use `github_rest` to post concise progress comments when you finish planning, when implementation is done, and when validation passes.
+6. Run focused validation for the changed scope and record the exact commands and outcomes in the issue body's `Validation` section.
+7. Commit the completed changes, push the branch to `origin`, and create a pull request with `github_rest` against `main`.
+8. Post a final issue comment containing the branch name, commit SHA, PR URL, and validation summary.
+9. Close the issue with `github_rest`.
+10. Do not ask for human input unless GitHub auth or required secrets are missing.
 
 ## E2E smoke-test protocol
 

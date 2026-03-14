@@ -396,12 +396,33 @@ impl Settings {
     }
 
     pub fn turn_sandbox_policy(&self, workspace: &Path) -> JsonValue {
-        self.codex.turn_sandbox_policy.clone().unwrap_or_else(|| {
-            json!({
+        let workspace_root = workspace.to_string_lossy().to_string();
+
+        match self.codex.turn_sandbox_policy.clone() {
+            Some(mut policy) => {
+                if let Some(object) = policy.as_object_mut() {
+                    let is_workspace_write = object
+                        .get("type")
+                        .and_then(JsonValue::as_str)
+                        .map(|value| value == "workspaceWrite")
+                        .unwrap_or(false);
+                    let missing_writable_roots = object
+                        .get("writableRoots")
+                        .map(|value| value.is_null())
+                        .unwrap_or(true);
+
+                    if is_workspace_write && missing_writable_roots {
+                        object.insert("writableRoots".to_string(), json!([workspace_root]));
+                    }
+                }
+
+                policy
+            }
+            None => json!({
                 "type": "workspaceWrite",
-                "writableRoots": [workspace.to_string_lossy().to_string()]
-            })
-        })
+                "writableRoots": [workspace_root]
+            }),
+        }
     }
 }
 
@@ -494,6 +515,7 @@ fn default_approval_policy() -> JsonValue {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::path::Path;
 
     use crate::model::WorkflowDefinition;
 
@@ -522,5 +544,85 @@ tracker:
     #[test]
     fn normalizes_states_for_lookup() {
         assert_eq!(normalize_issue_state(" In Progress "), "in progress");
+    }
+
+    #[test]
+    fn default_turn_sandbox_policy_uses_workspace_root() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        let policy = settings.turn_sandbox_policy(Path::new("/tmp/workspace"));
+
+        assert_eq!(policy["type"], "workspaceWrite");
+        assert_eq!(policy["writableRoots"], serde_json::json!(["/tmp/workspace"]));
+    }
+
+    #[test]
+    fn explicit_workspace_write_policy_injects_workspace_root_when_missing() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+codex:
+  turn_sandbox_policy:
+    type: workspaceWrite
+    networkAccess: true
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        let policy = settings.turn_sandbox_policy(Path::new("/tmp/workspace"));
+
+        assert_eq!(policy["type"], "workspaceWrite");
+        assert_eq!(policy["networkAccess"], serde_json::json!(true));
+        assert_eq!(policy["writableRoots"], serde_json::json!(["/tmp/workspace"]));
+    }
+
+    #[test]
+    fn explicit_writable_roots_are_preserved() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+codex:
+  turn_sandbox_policy:
+    type: workspaceWrite
+    writableRoots:
+      - relative/path
+    networkAccess: true
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        let policy = settings.turn_sandbox_policy(Path::new("/tmp/workspace"));
+
+        assert_eq!(policy["writableRoots"], serde_json::json!(["relative/path"]));
+        assert_eq!(policy["networkAccess"], serde_json::json!(true));
     }
 }
