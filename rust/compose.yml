@@ -10,9 +10,11 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       WORKFLOW_PATH: /config/WORKFLOW.md
       SYMPHONY_WORKSPACE_ROOT: ${SYMPHONY_WORKSPACE_ROOT:-/workspaces}
+      SYMPHONY_SEED_REPO: /seed-repo
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - ${WORKFLOW_FILE:-../WORKFLOW.md}:/config/WORKFLOW.md:ro
+      - ${SEED_REPO_PATH:-..}:/seed-repo:ro
       - symphony_rust_workspaces:${SYMPHONY_WORKSPACE_ROOT:-/workspaces}
     restart: unless-stopped
 

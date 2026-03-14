@@ -44,7 +44,10 @@ Important notes:
 
 - Fill in `GITHUB_TOKEN` and `OPENAI_API_KEY` in `rust/.env`.
 - Set `WORKFLOW_FILE` in `rust/.env` to the host path of the workflow file you want mounted into the container.
+- Set `SEED_REPO_PATH` in `rust/.env` to the host path of the repository copy that should be cloned into per-issue workspaces. The default `..` works when you run Compose from `rust/` inside this repo.
 - Your workflow should usually use `workspace.root: $SYMPHONY_WORKSPACE_ROOT` so the same file works inside Docker.
+- The Compose setup mounts the seed repo at `/seed-repo`, and the checked-in `WORKFLOW.md` prefers cloning from that local mount before falling back to GitHub.
+- The container entrypoint logs Codex in from `OPENAI_API_KEY` automatically when `/root/.codex/auth.json` is not present yet.
 - The runtime image installs `codex` and starts `symphony-rust` directly.
 
 ## Minimal GitHub workflow

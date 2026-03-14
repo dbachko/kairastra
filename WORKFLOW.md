@@ -15,8 +15,12 @@ workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:
   after_create: |
-    auth_header="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
-    git -c http.extraheader="Authorization: Basic ${auth_header}" clone --depth 1 https://github.com/dbachko/symphony-gh.git .
+    if [ -n "$SYMPHONY_SEED_REPO" ] && [ -d "$SYMPHONY_SEED_REPO/.git" ]; then
+      git clone "$SYMPHONY_SEED_REPO" .
+    else
+      auth_header="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+      git -c http.extraheader="Authorization: Basic ${auth_header}" clone --depth 1 https://github.com/dbachko/symphony-gh.git .
+    fi
 agent:
   max_concurrent_agents: 1
   max_turns: 3
