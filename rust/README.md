@@ -26,13 +26,24 @@ You can also set `WORKFLOW_PATH=/path/to/WORKFLOW.md` instead of passing a posit
 
 ## Docker
 
-Build and run with Docker Compose:
+Use the Make targets for the container flow:
 
 ```bash
 cd rust
 cp .env.example .env
-docker compose up --build
+make docker-build
+make docker-up
 ```
+
+Available targets:
+
+- `make docker-build`: build the `symphony-rust` image from `rust/compose.yml`.
+- `make docker-up`: start the stack in detached mode with rebuild.
+- `make docker-down`: stop and remove the stack.
+- `make docker-logs`: follow service logs.
+- `make docker-login`: run interactive `codex login` in the running container.
+
+`docker-login` is for ChatGPT subscription/device-auth flows (`CODEX_AUTH_MODE=chatgpt` or `auto` without `OPENAI_API_KEY`). Run it after `make docker-up` so auth state is stored in the persisted `/root/.codex` volume.
 
 Files added for the container flow:
 
@@ -58,8 +69,8 @@ Important notes:
 ### Headless device-auth (Docker ChatGPT subscription mode)
 
 1. Set `CODEX_AUTH_MODE=chatgpt` (or `auto` with no `OPENAI_API_KEY`) in `rust/.env`.
-2. Start the stack once: `docker compose -f rust/compose.yml --env-file rust/.env up -d`.
-3. Run device login inside the running container: `docker compose -f rust/compose.yml --env-file rust/.env exec symphony-rust codex login`.
+2. Start the stack once: `make -C rust docker-up`.
+3. Run device login inside the running container: `make -C rust docker-login`.
 4. Complete the device code flow from a browser.
 5. Restart normally; Compose keeps `/root/.codex` persisted.
 
