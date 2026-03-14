@@ -78,9 +78,15 @@ impl AppServerSession {
     ) -> Result<Self> {
         validate_workspace_cwd(&settings.workspace.root, workspace)?;
 
+        let cargo_home = workspace.join(".cargo-home");
+        tokio::fs::create_dir_all(&cargo_home)
+            .await
+            .context("failed to create workspace cargo home")?;
+
         let mut command = Command::new("bash");
         command.arg("-lc").arg(&settings.codex.command);
         command.current_dir(workspace);
+        command.env("CARGO_HOME", &cargo_home);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());

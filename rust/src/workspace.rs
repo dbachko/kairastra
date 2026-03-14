@@ -176,9 +176,15 @@ async fn run_hook(
     workspace: &Path,
     issue: &Issue,
 ) -> Result<()> {
+    let cargo_home = workspace.join(".cargo-home");
+    tokio::fs::create_dir_all(&cargo_home)
+        .await
+        .with_context(|| format!("failed to create workspace cargo home for {hook_name}"))?;
+
     let mut command = Command::new("bash");
     command.arg("-lc").arg(script);
     command.current_dir(workspace);
+    command.env("CARGO_HOME", &cargo_home);
     command.env("ISSUE_ID", &issue.id);
     command.env("ISSUE_IDENTIFIER", &issue.identifier);
     command.env("ISSUE_TITLE", &issue.title);
@@ -217,7 +223,7 @@ mod tests {
     use crate::config::Settings;
     use crate::model::{Issue, WorkflowDefinition};
 
-    use super::{ensure_workspace, remove_issue_workspace, sanitize_workspace_key};
+    use super::{ensure_workspace, remove_issue_workspace, run_hook, sanitize_workspace_key};
 
     fn test_settings(root: &Path) -> Settings {
         let definition = WorkflowDefinition {
@@ -284,5 +290,29 @@ workspace:
 
         assert!(!target.path.exists());
         assert!(keep.path.exists());
+    }
+
+    #[tokio::test]
+    async fn hook_commands_get_workspace_local_cargo_home() {
+        let dir = tempdir().unwrap();
+        let settings = test_settings(dir.path());
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        run_hook(
+            &settings,
+            "after_create",
+            "printf '%s' \"$CARGO_HOME\" > cargo-home-path.txt",
+            &workspace,
+            &issue("MT-1"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(workspace.join("cargo-home-path.txt")).unwrap(),
+            workspace.join(".cargo-home").display().to_string()
+        );
+        assert!(workspace.join(".cargo-home").is_dir());
     }
 }

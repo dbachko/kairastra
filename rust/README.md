@@ -64,6 +64,7 @@ Important notes:
   - `chatgpt`: skip API-key bootstrap and use persisted Codex login state only.
 - Compose persists `/root/.codex` with the `symphony_rust_codex` volume so login survives restarts.
 - The runtime image installs `codex`, `gh`, `make`, `docker`, and `docker-compose`, and it reuses the Rust toolchain from the builder stage so workspace `cargo` commands match the app build toolchain.
+- Agent turns and workspace hooks use a workspace-local `.cargo-home` cache so sandboxed `cargo` commands do not try to write into the read-only toolchain image path.
 - `docker compose ...` inside the container is shimmed to Debian's `docker-compose` binary. That is enough for config-oriented validation; mount the host Docker socket separately if you want worker turns to build or run sibling containers.
 
 ### Headless device-auth (Docker ChatGPT subscription mode)

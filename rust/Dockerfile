@@ -26,7 +26,6 @@ COPY rust/docker-compose-shim /usr/local/bin/docker
 
 WORKDIR /app
 
-ENV CARGO_HOME=/usr/local/cargo
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:${PATH}
 ENV RUST_LOG=info
