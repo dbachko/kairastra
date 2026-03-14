@@ -33,12 +33,15 @@ cd rust
 cp .env.example .env
 make docker-build
 make docker-up
+make docker-ps
+make docker-down
 ```
 
 Available targets:
 
 - `make docker-build`: build the `symphony-rust` image from `rust/compose.yml`.
 - `make docker-up`: start the stack in detached mode with rebuild.
+- `make docker-ps`: show service status for the running compose stack.
 - `make docker-down`: stop and remove the stack.
 - `make docker-logs`: follow service logs.
 - `make docker-login`: run interactive `codex login` in the running container.

@@ -4,13 +4,16 @@ SERVICE := symphony-rust
 
 DOCKER_COMPOSE := docker compose -f $(COMPOSE_FILE) --env-file $(ENV_FILE)
 
-.PHONY: docker-build docker-up docker-down docker-logs docker-login
+.PHONY: docker-build docker-up docker-ps docker-down docker-logs docker-login
 
 docker-build:
 	$(DOCKER_COMPOSE) build
 
 docker-up:
 	$(DOCKER_COMPOSE) up -d --build
+
+docker-ps:
+	$(DOCKER_COMPOSE) ps
 
 docker-down:
 	$(DOCKER_COMPOSE) down
