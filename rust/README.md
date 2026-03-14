@@ -33,6 +33,7 @@ cd rust
 cp .env.example .env
 make docker-build
 make docker-up
+make docker-down
 ```
 
 Available targets:
