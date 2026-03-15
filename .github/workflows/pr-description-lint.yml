@@ -7,27 +7,34 @@ on:
 jobs:
   validate-pr-description:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: elixir
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up mise tools
-        uses: jdx/mise-action@v3
-        with:
-          install: true
-          cache: true
-          working_directory: elixir
-
       - name: Validate PR description format
         env:
           PR_BODY_JSON: ${{ toJson(github.event.pull_request.body) }}
         run: |
-          mix local.hex --force
-          mix local.rebar --force
-          mix deps.get
+          set -euo pipefail
           printf '%s' "$PR_BODY_JSON" | jq -r '.' > /tmp/pr_body.md
-          mix pr_body.check --file /tmp/pr_body.md
+
+          required_headers=(
+            "#### Context"
+            "#### TL;DR"
+            "#### Summary"
+            "#### Alternatives"
+            "#### Test Plan"
+          )
+
+          for header in "${required_headers[@]}"; do
+            if ! rg -Fq "$header" /tmp/pr_body.md; then
+              echo "Missing required PR section: $header" >&2
+              exit 1
+            fi
+          done
+
+          if rg -n '<!--|TODO|TBD' /tmp/pr_body.md; then
+            echo "PR description still contains placeholders" >&2
+            exit 1
+          fi

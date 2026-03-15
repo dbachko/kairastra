@@ -9,8 +9,10 @@ description:
 
 ## Prerequisites
 
-- `gh` CLI is installed and available in `PATH`.
-- `gh auth status` succeeds for GitHub operations in this repo.
+- `gh` CLI is preferred when it can talk to GitHub successfully in this repo.
+- If `gh` API calls fail because of local TLS/certificate problems or similar
+  host-specific transport issues, fall back to direct GitHub API calls with the
+  existing repo token instead of stopping.
 
 ## Goals
 
@@ -26,7 +28,11 @@ description:
 ## Steps
 
 1. Identify current branch and confirm remote state.
-2. Run local validation (`make -C elixir all`) before pushing.
+2. Run local validation appropriate for the current change before pushing.
+   - For runtime/code changes in this repo, default to `cargo fmt --check` and
+     `cargo test` from `rust/`.
+   - For docs-only changes, run the smallest relevant verification and state
+     what you skipped.
 3. Push branch to `origin` with upstream tracking if needed, using whatever
    remote URL is already configured.
 4. If push is not clean/rejected:
@@ -52,8 +58,21 @@ description:
      scope (all intended work on the branch), not just the newest commits,
      including newly added work, removed work, or changed approach.
    - Do not reuse stale description text from earlier iterations.
-7. Validate PR body with `mix pr_body.check` and fix all reported issues.
-8. Reply with the PR URL from `gh pr view`.
+7. Validate the PR body locally before finishing:
+   - Ensure all template sections are filled.
+   - Ensure placeholder comments (`<!-- ... -->`) are removed.
+   - Ensure the `Test Plan` reflects the actual validation run for this change.
+8. If `gh pr create` / `gh pr edit` cannot reach GitHub because of local TLS,
+   certificate, or host transport issues, use a direct API fallback:
+   - Reuse the exact same title and fully rendered PR body file.
+   - Prefer `github_rest` / `github_graphql` if injected.
+   - Otherwise use `curl` with `GITHUB_TOKEN`, `GH_TOKEN`, or the token already
+     embedded in the configured `origin` URL.
+   - The fallback must still satisfy the repo PR template and placeholder
+     checks; this is not a license to post an ad hoc PR body.
+9. Reply with the PR URL from `gh pr view` or the direct API response.
+10. Never rely on interactive `gh` prompts. All `gh pr create` / `gh pr edit`
+    calls must pass both the title and a concrete body file.
 
 ## Commands
 
@@ -62,7 +81,7 @@ description:
 branch=$(git branch --show-current)
 
 # Minimal validation gate
-make -C elixir all
+(cd rust && cargo fmt --check && cargo test)
 
 # Initial push: respect the current origin remote.
 git push -u origin HEAD
@@ -86,26 +105,82 @@ fi
 
 # Write a clear, human-friendly title that summarizes the shipped change.
 pr_title="<clear PR title written for this change>"
-if [ -z "$pr_state" ]; then
-  gh pr create --title "$pr_title"
-else
-  # Reconsider title on every branch update; edit if scope shifted.
-  gh pr edit --title "$pr_title"
+tmp_pr_body=$(mktemp)
+# Draft a fully concrete body from .github/pull_request_template.md before any
+# gh PR mutation. Do not leave template comments or placeholders behind.
+# Example workflow:
+# 1) copy the template into $tmp_pr_body
+# 2) replace every placeholder section with real content for this change
+# 3) use the same body file for both create and edit flows
+cp .github/pull_request_template.md "$tmp_pr_body"
+
+if rg -n '<!--|TODO|TBD' "$tmp_pr_body"; then
+  echo "PR body still contains placeholders" >&2
+  exit 1
 fi
 
-# Write/edit PR body to match .github/pull_request_template.md before validation.
-# Example workflow:
-# 1) open the template and draft body content for this PR
-# 2) gh pr edit --body-file /tmp/pr_body.md
-# 3) for branch updates, re-check that title/body still match current diff
-
-tmp_pr_body=$(mktemp)
-gh pr view --json body -q .body > "$tmp_pr_body"
-(cd elixir && mix pr_body.check --file "$tmp_pr_body")
-rm -f "$tmp_pr_body"
+if [ -z "$pr_state" ]; then
+  gh pr create --title "$pr_title" --body-file "$tmp_pr_body"
+else
+  # Reconsider title on every branch update; edit if scope shifted.
+  gh pr edit --title "$pr_title" --body-file "$tmp_pr_body"
+fi
 
 # Show PR URL for the reply
 gh pr view --json url -q .url
+
+rm -f "$tmp_pr_body"
+```
+
+## Direct API Fallback
+
+Use this only when the `gh` path fails because the local environment cannot
+talk to GitHub cleanly.
+
+```sh
+branch=$(git branch --show-current)
+repo_slug=$(git remote get-url origin | sed -E 's#(https://x-access-token:[^@]+@|https://|git@)github.com[:/]##; s#\\.git$##')
+repo_owner=${repo_slug%%/*}
+repo_name=${repo_slug#*/}
+token=${GITHUB_TOKEN:-${GH_TOKEN:-}}
+if [ -z "$token" ]; then
+  token=$(git remote get-url origin | sed -nE 's#https://x-access-token:([^@]+)@github.com/.*#\\1#p')
+fi
+
+if [ -z "$token" ]; then
+  echo "No GitHub token available for direct API fallback." >&2
+  exit 1
+fi
+
+existing_pr_number=$(curl -fsSL \
+  -H "Authorization: Bearer $token" \
+  -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/repos/${repo_owner}/${repo_name}/pulls?head=${repo_owner}:${branch}&state=open" \
+  | jq -r '.[0].number // empty')
+
+if [ -z "$existing_pr_number" ]; then
+  curl -fsSL -X POST \
+    -H "Authorization: Bearer $token" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${repo_owner}/${repo_name}/pulls" \
+    -d @<(jq -n \
+      --arg title "$pr_title" \
+      --arg head "$branch" \
+      --arg base "main" \
+      --rawfile body "$tmp_pr_body" \
+      '{title:$title, head:$head, base:$base, body:$body}') \
+    | jq -r '.html_url'
+else
+  curl -fsSL -X PATCH \
+    -H "Authorization: Bearer $token" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${repo_owner}/${repo_name}/pulls/${existing_pr_number}" \
+    -d @<(jq -n \
+      --arg title "$pr_title" \
+      --rawfile body "$tmp_pr_body" \
+      '{title:$title, body:$body}') \
+    | jq -r '.html_url'
+fi
 ```
 
 ## Notes

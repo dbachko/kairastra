@@ -18,5 +18,6 @@
 
 #### Test Plan
 
-- [ ] `make -C elixir all`
+- [ ] `cargo fmt --check`
+- [ ] `cargo test`
 - [ ] <!-- Additional targeted checks (list below) -->

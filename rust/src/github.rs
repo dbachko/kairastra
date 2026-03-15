@@ -74,11 +74,10 @@ impl GitHubTracker {
             .context("failed to decode GitHub GraphQL response")?;
 
         if !status.is_success() {
+            if rest_response_indicates_rate_limit(status.as_u16(), &body) {
+                return Err(anyhow!("github_rate_limit"));
+            }
             return Err(anyhow!("github_graphql_status: {} body={body}", status));
-        }
-
-        if let Some(errors) = body.get("errors") {
-            return Err(anyhow!("github_graphql_errors: {errors}"));
         }
 
         Ok(body)
@@ -114,6 +113,9 @@ impl GitHubTracker {
             .context("failed to decode GitHub REST response")?;
 
         if !status.is_success() {
+            if rest_response_indicates_rate_limit(status.as_u16(), &body) {
+                return Err(anyhow!("github_rate_limit"));
+            }
             return Err(anyhow!(
                 "github_rest_status: {} path={} body={body}",
                 status,
@@ -129,13 +131,14 @@ impl GitHubTracker {
         let envelope: GraphqlEnvelope<T> =
             serde_json::from_value(body).context("failed to decode GitHub GraphQL envelope")?;
 
-        if let Some(errors) = envelope.errors {
-            return Err(anyhow!("github_graphql_errors: {:?}", errors));
+        match (envelope.data, envelope.errors) {
+            (Some(data), _) => Ok(data),
+            (None, Some(errors)) if graphql_errors_indicate_rate_limit(&errors) => {
+                Err(anyhow!("github_rate_limit"))
+            }
+            (None, Some(errors)) => Err(anyhow!("github_graphql_errors: {:?}", errors)),
+            (None, None) => Err(anyhow!("github_graphql_missing_data")),
         }
-
-        envelope
-            .data
-            .ok_or_else(|| anyhow!("github_graphql_missing_data"))
     }
 
     async fn list_project_items(&self) -> Result<Vec<ProjectItemNode>> {
@@ -196,6 +199,11 @@ query SymphonyProjectItems(
               state
               createdAt
               updatedAt
+              assignees(first: 20) {
+                nodes {
+                  login
+                }
+              }
               labels(first: 50) {
                 nodes {
                   name
@@ -245,6 +253,11 @@ query SymphonyProjectItems(
               state
               createdAt
               updatedAt
+              assignees(first: 20) {
+                nodes {
+                  login
+                }
+              }
               labels(first: 50) {
                 nodes {
                   name
@@ -296,6 +309,352 @@ query SymphonyProjectItems(
         }
 
         Ok(items)
+    }
+
+    async fn load_project_status_field_metadata(&self) -> Result<ProjectStatusFieldMetadata> {
+        let project_number = self
+            .settings
+            .project_v2_number
+            .ok_or_else(|| anyhow!("missing_github_project_v2_number"))?;
+        let status_field = self
+            .settings
+            .status_source
+            .as_ref()
+            .and_then(|source| source.name.clone())
+            .unwrap_or_else(|| "Status".to_string());
+
+        let query = r#"
+query SymphonyProjectStatusField($owner: String!, $projectNumber: Int!) {
+  organization(login: $owner) {
+    projectV2(number: $projectNumber) {
+      id
+      fields(first: 50) {
+        nodes {
+          __typename
+          ... on ProjectV2SingleSelectField {
+            id
+            name
+            options {
+              id
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+  user(login: $owner) {
+    projectV2(number: $projectNumber) {
+      id
+      fields(first: 50) {
+        nodes {
+          __typename
+          ... on ProjectV2SingleSelectField {
+            id
+            name
+            options {
+              id
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+}"#;
+
+        let data: ProjectFieldMetadataResponse = self
+            .graphql(
+                query,
+                json!({
+                    "owner": self.settings.owner,
+                    "projectNumber": project_number,
+                }),
+            )
+            .await?;
+
+        let project = data
+            .organization
+            .or(data.user)
+            .and_then(|owner| owner.project_v2)
+            .ok_or_else(|| anyhow!("github_project_not_found"))?;
+
+        let field = project
+            .fields
+            .nodes
+            .into_iter()
+            .find_map(|field| match field {
+                ProjectFieldNode::ProjectV2SingleSelectField(field)
+                    if field.name.eq_ignore_ascii_case(&status_field) =>
+                {
+                    Some(field)
+                }
+                ProjectFieldNode::ProjectV2SingleSelectField(_) => None,
+                ProjectFieldNode::Other => None,
+            })
+            .ok_or_else(|| anyhow!("github_project_status_field_not_found"))?;
+
+        Ok(ProjectStatusFieldMetadata {
+            project_id: project.id,
+            field_id: field.id,
+            options: field.options,
+        })
+    }
+
+    pub async fn transition_issue_project_status(
+        &self,
+        issue: &Issue,
+        target_status: &str,
+    ) -> Result<Issue> {
+        if self.settings.mode != GitHubMode::ProjectsV2
+            || issue.state.trim().eq_ignore_ascii_case(target_status)
+        {
+            return Ok(issue.clone());
+        }
+
+        let Some(project_item_id) = issue.project_item_id.as_ref() else {
+            return Ok(issue.clone());
+        };
+
+        let metadata = self.load_project_status_field_metadata().await?;
+        let option_id = metadata
+            .options
+            .iter()
+            .find(|option| option.name.eq_ignore_ascii_case(target_status))
+            .map(|option| option.id.clone())
+            .ok_or_else(|| anyhow!("github_project_status_option_not_found: {target_status}"))?;
+
+        self.graphql_raw(
+            r#"
+mutation SymphonyUpdateProjectItemStatus(
+  $projectId: ID!,
+  $itemId: ID!,
+  $fieldId: ID!,
+  $optionId: String!
+) {
+  updateProjectV2ItemFieldValue(
+    input: {
+      projectId: $projectId
+      itemId: $itemId
+      fieldId: $fieldId
+      value: { singleSelectOptionId: $optionId }
+    }
+  ) {
+    projectV2Item {
+      id
+    }
+  }
+}"#,
+            json!({
+                "projectId": metadata.project_id,
+                "itemId": project_item_id,
+                "fieldId": metadata.field_id,
+                "optionId": option_id,
+            }),
+        )
+        .await?;
+
+        let refreshed = self.fetch_issue_states_by_ids(&[issue.id.clone()]).await?;
+        Ok(refreshed.into_iter().next().unwrap_or_else(|| {
+            let mut updated = issue.clone();
+            updated.state = target_status.to_string();
+            updated
+        }))
+    }
+
+    pub async fn transition_issue_to_in_progress_on_claim(&self, issue: &Issue) -> Result<Issue> {
+        if !issue.state.trim().eq_ignore_ascii_case("todo") {
+            return Ok(issue.clone());
+        }
+        self.transition_issue_project_status(issue, "In Progress")
+            .await
+    }
+
+    pub async fn transition_closed_issue_to_done(&self, issue: &Issue) -> Result<Issue> {
+        if !issue.state.trim().eq_ignore_ascii_case("closed") {
+            return Ok(issue.clone());
+        }
+        self.transition_issue_project_status(issue, "Done").await
+    }
+
+    pub async fn has_open_pull_request_for_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .find_open_pull_request_for_branch(owner, repo, branch)
+            .await?
+            .is_some())
+    }
+
+    pub async fn find_open_pull_request_for_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<OpenPullRequest>> {
+        let path =
+            format!("/repos/{owner}/{repo}/pulls?state=open&head={owner}:{branch}&per_page=1");
+        let response = self.rest_json(reqwest::Method::GET, &path, None).await?;
+        let pulls: Vec<RestPullRequest> =
+            serde_json::from_value(response).context("invalid GitHub pull request list payload")?;
+
+        Ok(pulls.into_iter().next().map(|pull| OpenPullRequest {
+            number: pull.number,
+            title: pull.title,
+            url: pull.html_url,
+            head_sha: pull.head.sha,
+        }))
+    }
+
+    pub async fn pull_request_checks_summary(
+        &self,
+        owner: &str,
+        repo: &str,
+        head_sha: &str,
+    ) -> Result<PullRequestChecksSummary> {
+        let check_runs_path =
+            format!("/repos/{owner}/{repo}/commits/{head_sha}/check-runs?per_page=100");
+        let check_runs_response = self
+            .rest_json(reqwest::Method::GET, &check_runs_path, None)
+            .await?;
+        let check_runs: RestCheckRunsResponse = serde_json::from_value(check_runs_response)
+            .context("invalid GitHub check-runs payload")?;
+
+        let statuses_path = format!("/repos/{owner}/{repo}/commits/{head_sha}/status");
+        let statuses_response = self
+            .rest_json(reqwest::Method::GET, &statuses_path, None)
+            .await?;
+        let statuses: RestCombinedStatus = serde_json::from_value(statuses_response)
+            .context("invalid GitHub commit status payload")?;
+
+        let had_checks = !(check_runs.check_runs.is_empty() && statuses.statuses.is_empty());
+        let mut failing = Vec::new();
+        let mut pending = Vec::new();
+
+        for check in check_runs.check_runs {
+            match check.status.as_str() {
+                "completed" => match check.conclusion.as_deref() {
+                    Some("success") | Some("neutral") | Some("skipped") => {}
+                    Some(_) | None => failing.push(check.name),
+                },
+                _ => pending.push(check.name),
+            }
+        }
+
+        for status in statuses.statuses {
+            let name = status.context.unwrap_or_else(|| "status".to_string());
+            match status.state.as_deref() {
+                Some("success") => {}
+                Some("failure") | Some("error") => failing.push(name),
+                Some("pending") => pending.push(name),
+                Some(_) | None => pending.push(name),
+            }
+        }
+
+        let state = if !failing.is_empty() {
+            PullRequestChecksState::Failing
+        } else if !pending.is_empty() {
+            PullRequestChecksState::Pending
+        } else if had_checks {
+            PullRequestChecksState::Passing
+        } else {
+            PullRequestChecksState::NoChecks
+        };
+
+        Ok(PullRequestChecksSummary {
+            state,
+            failing,
+            pending,
+        })
+    }
+
+    pub async fn update_workpad_comment(&self, issue: &Issue, body: &str) -> Result<Issue> {
+        let Some(comment_id) = issue.workpad_comment_id else {
+            return self.ensure_workpad_comment(issue, body).await;
+        };
+
+        let (owner, repo, _) = issue_locator(issue)?;
+        let path = format!("/repos/{owner}/{repo}/issues/comments/{comment_id}");
+        let response = self
+            .rest_json(reqwest::Method::PATCH, &path, Some(json!({ "body": body })))
+            .await?;
+        let comment: RestIssueComment = serde_json::from_value(response)
+            .context("invalid GitHub updated issue comment payload")?;
+
+        let mut updated = issue.clone();
+        updated.workpad_comment_id = Some(comment.id);
+        updated.workpad_comment_url = comment.html_url;
+        updated.workpad_comment_body = Some(comment.body);
+        Ok(updated)
+    }
+
+    pub async fn list_issue_comments(&self, issue: &Issue) -> Result<Vec<RestIssueComment>> {
+        let (owner, repo, issue_number) = issue_locator(issue)?;
+        let path = format!("/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100");
+        let response = self.rest_json(reqwest::Method::GET, &path, None).await?;
+        serde_json::from_value(response).context("invalid GitHub issue comments payload")
+    }
+
+    fn parse_issue_comments(response: JsonValue) -> Result<Vec<RestIssueComment>> {
+        response
+            .as_array()
+            .ok_or_else(|| anyhow!("github_issue_comments_payload_invalid"))?;
+        serde_json::from_value(response).context("invalid GitHub issue comments payload")
+    }
+
+    pub async fn ensure_workpad_comment(&self, issue: &Issue, body: &str) -> Result<Issue> {
+        let (owner, repo, issue_number) = issue_locator(issue)?;
+        let path = format!("/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100");
+        let response = self.rest_json(reqwest::Method::GET, &path, None).await?;
+        let comments = Self::parse_issue_comments(response)?;
+
+        if let Some(comment) = comments
+            .into_iter()
+            .rev()
+            .find(|comment| comment.body.contains("## Codex Workpad"))
+        {
+            let mut updated = issue.clone();
+            updated.workpad_comment_id = Some(comment.id);
+            updated.workpad_comment_url = comment.html_url;
+            updated.workpad_comment_body = Some(comment.body);
+            return Ok(updated);
+        }
+
+        let path = format!("/repos/{owner}/{repo}/issues/{issue_number}/comments");
+        let response = self
+            .rest_json(reqwest::Method::POST, &path, Some(json!({ "body": body })))
+            .await?;
+        let comment: RestIssueComment = serde_json::from_value(response)
+            .context("invalid GitHub created issue comment payload")?;
+
+        let mut updated = issue.clone();
+        updated.workpad_comment_id = Some(comment.id);
+        updated.workpad_comment_url = comment.html_url;
+        updated.workpad_comment_body = Some(comment.body);
+        Ok(updated)
+    }
+
+    pub async fn refresh_workpad_comment(&self, issue: &Issue) -> Result<Issue> {
+        let (owner, repo, issue_number) = issue_locator(issue)?;
+        let path = format!("/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100");
+        let response = self.rest_json(reqwest::Method::GET, &path, None).await?;
+        let comments = Self::parse_issue_comments(response)?;
+
+        let mut updated = issue.clone();
+        if let Some(comment) = comments
+            .into_iter()
+            .rev()
+            .find(|comment| comment.body.contains("## Codex Workpad"))
+        {
+            updated.workpad_comment_id = Some(comment.id);
+            updated.workpad_comment_url = comment.html_url;
+            updated.workpad_comment_body = Some(comment.body);
+        }
+
+        Ok(updated)
     }
 
     async fn list_repo_issues(&self, state: &str) -> Result<Vec<RestIssue>> {
@@ -418,18 +777,34 @@ query SymphonyProjectItems(
     }
 
     async fn normalize_project_issue(&self, item: ProjectItemNode) -> Result<Option<Issue>> {
-        let content = match item.content {
+        let ProjectItemNode {
+            id: project_item_id,
+            status,
+            priority,
+            content,
+        } = item;
+
+        let content = match content {
             Some(ProjectItemContent::Issue(issue)) => issue,
             _ => return Ok(None),
         };
 
         let owner = content.repository.owner.login.clone();
         let repo = content.repository.name.clone();
-        let state = item
-            .status
-            .as_ref()
-            .and_then(field_value_string)
-            .unwrap_or_else(|| title_case_state(content.state.as_deref().unwrap_or("OPEN")));
+        let issue_state = title_case_state(content.state.as_deref().unwrap_or("OPEN"));
+        let project_status = status.as_ref().and_then(field_value_string);
+        let state = if issue_state.eq_ignore_ascii_case("closed") {
+            project_status
+                .filter(|status| {
+                    self.settings
+                        .terminal_states
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(status))
+                })
+                .unwrap_or(issue_state)
+        } else {
+            project_status.unwrap_or(issue_state)
+        };
 
         let blocked_by = if state.trim().eq_ignore_ascii_case("todo") {
             self.fetch_blocked_by(&owner, &repo, content.number).await?
@@ -439,13 +814,20 @@ query SymphonyProjectItems(
 
         Ok(Some(Issue {
             id: content.id.clone(),
+            project_item_id: Some(project_item_id),
             identifier: format!("{owner}/{repo}#{}", content.number),
             title: content.title.clone(),
             description: content.body.clone().filter(|value| !value.is_empty()),
-            priority: item.priority.as_ref().and_then(field_value_priority),
+            priority: priority.as_ref().and_then(field_value_priority),
             state,
             branch_name: None,
             url: Some(content.url.clone()),
+            assignees: content
+                .assignees
+                .nodes
+                .iter()
+                .filter_map(|assignee| assignee.login.as_ref().map(|value| value.to_lowercase()))
+                .collect(),
             labels: content
                 .labels
                 .nodes
@@ -455,6 +837,9 @@ query SymphonyProjectItems(
             blocked_by,
             created_at: content.created_at,
             updated_at: content.updated_at,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
         }))
     }
 
@@ -496,6 +881,7 @@ query SymphonyProjectItems(
                 .node_id
                 .clone()
                 .unwrap_or_else(|| issue.id.to_string()),
+            project_item_id: None,
             identifier: format!("{owner}/{repo}#{}", issue.number),
             title: issue.title.clone(),
             description: issue.body.clone().filter(|value| !value.is_empty()),
@@ -503,6 +889,11 @@ query SymphonyProjectItems(
             state,
             branch_name: None,
             url: issue.html_url.clone(),
+            assignees: issue
+                .assignees
+                .iter()
+                .filter_map(|assignee| assignee.login.as_ref().map(|value| value.to_lowercase()))
+                .collect(),
             labels: issue
                 .labels
                 .iter()
@@ -511,6 +902,9 @@ query SymphonyProjectItems(
             blocked_by,
             created_at: issue.created_at,
             updated_at: issue.updated_at,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
         })
     }
 }
@@ -726,6 +1120,39 @@ fn json_priority(value: &JsonValue) -> Option<i64> {
     }
 }
 
+pub fn is_rate_limited_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("github_rate_limit"))
+}
+
+fn rest_response_indicates_rate_limit(status: u16, body: &JsonValue) -> bool {
+    if status != 403 && status != 429 {
+        return false;
+    }
+
+    body.get("message")
+        .and_then(JsonValue::as_str)
+        .map(|message| message.to_ascii_lowercase().contains("rate limit"))
+        .unwrap_or(false)
+}
+
+fn graphql_errors_indicate_rate_limit(errors: &[GraphqlError]) -> bool {
+    errors.iter().any(|error| {
+        error
+            .code
+            .as_deref()
+            .map(|code| code.eq_ignore_ascii_case("graphql_rate_limit"))
+            .unwrap_or(false)
+            || error
+                .error_type
+                .as_deref()
+                .map(|kind| kind.eq_ignore_ascii_case("RATE_LIMIT"))
+                .unwrap_or(false)
+            || error.message.to_ascii_lowercase().contains("rate limit")
+    })
+}
+
 fn issue_identifier_from_json(value: &JsonValue) -> Option<String> {
     let owner = value
         .get("repository")
@@ -762,7 +1189,15 @@ fn title_case_state(raw: &str) -> String {
 #[derive(Debug, Deserialize)]
 struct GraphqlEnvelope<T> {
     data: Option<T>,
-    errors: Option<Vec<JsonValue>>,
+    errors: Option<Vec<GraphqlError>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlError {
+    message: String,
+    #[serde(rename = "type")]
+    error_type: Option<String>,
+    code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -772,9 +1207,21 @@ struct ProjectItemsResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ProjectFieldMetadataResponse {
+    organization: Option<ProjectFieldOrganization>,
+    user: Option<ProjectFieldOrganization>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProjectOrganization {
     #[serde(rename = "projectV2")]
     project_v2: Option<ProjectV2>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectFieldOrganization {
+    #[serde(rename = "projectV2")]
+    project_v2: Option<ProjectFieldsProjectV2>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -783,10 +1230,21 @@ struct ProjectV2 {
 }
 
 #[derive(Debug, Deserialize)]
+struct ProjectFieldsProjectV2 {
+    id: String,
+    fields: ProjectFieldsPage,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProjectItemsPage {
     #[serde(rename = "pageInfo")]
     page_info: PageInfo,
     nodes: Vec<ProjectItemNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectFieldsPage {
+    nodes: Vec<ProjectFieldNode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -804,6 +1262,33 @@ struct ProjectItemNode {
     status: Option<ProjectFieldValue>,
     priority: Option<ProjectFieldValue>,
     content: Option<ProjectItemContent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+enum ProjectFieldNode {
+    ProjectV2SingleSelectField(ProjectSingleSelectField),
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectSingleSelectField {
+    id: String,
+    name: String,
+    options: Vec<ProjectSingleSelectFieldOption>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProjectSingleSelectFieldOption {
+    id: String,
+    name: String,
+}
+
+struct ProjectStatusFieldMetadata {
+    project_id: String,
+    field_id: String,
+    options: Vec<ProjectSingleSelectFieldOption>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -831,8 +1316,19 @@ struct ProjectIssue {
     created_at: Option<DateTime<Utc>>,
     #[serde(rename = "updatedAt")]
     updated_at: Option<DateTime<Utc>>,
+    assignees: ProjectAssignees,
     labels: ProjectLabels,
     repository: ProjectRepository,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectAssignees {
+    nodes: Vec<ProjectAssignee>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectAssignee {
+    login: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -865,6 +1361,7 @@ struct RestIssue {
     body: Option<String>,
     state: String,
     html_url: Option<String>,
+    assignees: Vec<RestAssignee>,
     labels: Vec<RestLabel>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
@@ -873,8 +1370,115 @@ struct RestIssue {
 }
 
 #[derive(Debug, Deserialize)]
+struct RestAssignee {
+    login: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RestLabel {
     name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RestIssueComment {
+    id: u64,
+    pub body: String,
+    pub html_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenPullRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub head_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullRequestChecksState {
+    NoChecks,
+    Passing,
+    Pending,
+    Failing,
+}
+
+#[derive(Debug, Clone)]
+pub struct PullRequestChecksSummary {
+    pub state: PullRequestChecksState,
+    pub failing: Vec<String>,
+    pub pending: Vec<String>,
+}
+
+impl PullRequestChecksSummary {
+    pub fn allows_review_handoff(&self) -> bool {
+        matches!(
+            self.state,
+            PullRequestChecksState::NoChecks | PullRequestChecksState::Passing
+        )
+    }
+
+    pub fn summary_line(&self) -> String {
+        match self.state {
+            PullRequestChecksState::NoChecks => "no reported checks".to_string(),
+            PullRequestChecksState::Passing => "passing".to_string(),
+            PullRequestChecksState::Pending => {
+                format!("pending ({})", self.pending.join(", "))
+            }
+            PullRequestChecksState::Failing => {
+                format!("failing ({})", self.failing.join(", "))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RestPullRequest {
+    number: u64,
+    title: String,
+    html_url: String,
+    head: RestPullRequestHead,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestPullRequestHead {
+    sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestCheckRunsResponse {
+    check_runs: Vec<RestCheckRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestCheckRun {
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestCombinedStatus {
+    statuses: Vec<RestStatusContext>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestStatusContext {
+    context: Option<String>,
+    state: Option<String>,
+}
+
+fn issue_locator(issue: &Issue) -> Result<(String, String, u64)> {
+    let (repo_path, number) = issue
+        .identifier
+        .split_once('#')
+        .ok_or_else(|| anyhow!("invalid_issue_identifier: {}", issue.identifier))?;
+    let (owner, repo) = repo_path
+        .split_once('/')
+        .ok_or_else(|| anyhow!("invalid_issue_identifier: {}", issue.identifier))?;
+    let issue_number = number
+        .parse::<u64>()
+        .with_context(|| format!("invalid_issue_number: {}", issue.identifier))?;
+    Ok((owner.to_string(), repo.to_string(), issue_number))
 }
 
 #[cfg(test)]
@@ -883,9 +1487,9 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::config::Settings;
-    use crate::model::WorkflowDefinition;
+    use crate::model::{Issue, WorkflowDefinition};
 
-    use super::{GitHubTracker, Tracker};
+    use super::{is_rate_limited_error, GitHubTracker, PullRequestChecksState, Tracker};
 
     fn settings(yaml: &str) -> Settings {
         let definition = WorkflowDefinition {
@@ -893,6 +1497,46 @@ mod tests {
             prompt_template: String::new(),
         };
         Settings::from_workflow(&definition).unwrap()
+    }
+
+    #[tokio::test]
+    async fn project_fetch_surfaces_graphql_rate_limit_as_transient_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errors": [{
+                    "message": "API rate limit already exceeded for user ID 1.",
+                    "type": "RATE_LIMIT",
+                    "code": "graphql_rate_limit"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  project_v2_number: 7
+  mode: projects_v2
+  status_source:
+    type: project_field
+    name: Status
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let error = tracker.fetch_candidate_issues().await.unwrap_err();
+        assert!(is_rate_limited_error(&error));
     }
 
     #[tokio::test]
@@ -922,6 +1566,7 @@ mod tests {
                                         "state": "OPEN",
                                         "createdAt": "2026-03-13T00:00:00Z",
                                         "updatedAt": "2026-03-13T01:00:00Z",
+                                        "assignees": { "nodes": [{ "login": "codex-bot" }] },
                                         "labels": { "nodes": [{ "name": "Backend" }] },
                                         "repository": {
                                             "name": "symphony",
@@ -973,6 +1618,7 @@ mod tests {
         assert_eq!(issues[0].identifier, "openai/symphony#42");
         assert_eq!(issues[0].state, "Todo");
         assert_eq!(issues[0].priority, Some(1));
+        assert_eq!(issues[0].assignees, vec!["codex-bot"]);
         assert_eq!(issues[0].labels, vec!["backend"]);
     }
 
@@ -1020,6 +1666,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_owned_projects_v2_fallback_ignores_organization_not_found_errors() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "organization": null,
+                    "user": {
+                        "projectV2": {
+                            "items": {
+                                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                                "nodes": []
+                            }
+                        }
+                    }
+                },
+                "errors": [{
+                    "message": "Could not resolve to an Organization with the login of 'dbachko'.",
+                    "type": "NOT_FOUND",
+                    "path": ["organization"]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: dbachko
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  project_v2_number: 7
+  mode: projects_v2
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issues = tracker.fetch_candidate_issues().await.unwrap();
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_issue_overrides_project_field_status() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("SymphonyProjectItems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "organization": {
+                        "projectV2": {
+                            "items": {
+                                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                                "nodes": [{
+                                    "id": "item-1",
+                                    "status": { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Todo" },
+                                    "priority": null,
+                                    "content": {
+                                        "__typename": "Issue",
+                                        "id": "issue-node-1",
+                                        "number": 42,
+                                        "title": "Port tracker",
+                                        "body": "body",
+                                        "url": "https://github.com/openai/symphony/issues/42",
+                                        "state": "CLOSED",
+                                        "createdAt": "2026-03-13T00:00:00Z",
+                                        "updatedAt": "2026-03-13T01:00:00Z",
+                                        "assignees": { "nodes": [] },
+                                        "labels": { "nodes": [] },
+                                        "repository": {
+                                            "name": "symphony",
+                                            "owner": { "login": "openai" }
+                                        }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  project_v2_number: 7
+  mode: projects_v2
+  status_source:
+    type: project_field
+    name: Status
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issues = tracker.fetch_candidate_issues().await.unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].state, "Closed");
+    }
+
+    #[tokio::test]
     async fn issues_only_mode_uses_issue_fields_and_blockers() {
         let server = MockServer::start().await;
 
@@ -1036,6 +1798,7 @@ mod tests {
                     "body": "details",
                     "state": "open",
                     "html_url": "https://github.com/openai/symphony/issues/7",
+                    "assignees": [{ "login": "codex-bot" }],
                     "labels": [{ "name": "p2" }],
                     "created_at": "2026-03-13T00:00:00Z",
                     "updated_at": "2026-03-13T01:00:00Z"
@@ -1108,10 +1871,523 @@ mod tests {
         assert_eq!(issues[0].identifier, "openai/symphony#7");
         assert_eq!(issues[0].state, "Todo");
         assert_eq!(issues[0].priority, Some(2));
+        assert_eq!(issues[0].assignees, vec!["codex-bot"]);
         assert_eq!(issues[0].blocked_by.len(), 1);
         assert_eq!(
             issues[0].blocked_by[0].identifier.as_deref(),
             Some("openai/symphony#3")
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_transition_updates_project_status_to_in_progress() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("SymphonyProjectStatusField"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "organization": {
+                        "projectV2": {
+                            "id": "project-1",
+                            "fields": {
+                                "nodes": [{
+                                    "__typename": "ProjectV2SingleSelectField",
+                                    "id": "field-status",
+                                    "name": "Status",
+                                    "options": [
+                                        { "id": "opt-todo", "name": "Todo" },
+                                        { "id": "opt-progress", "name": "In Progress" }
+                                    ]
+                                }]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("SymphonyUpdateProjectItemStatus"))
+            .and(body_string_contains("opt-progress"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": {
+                        "projectV2Item": { "id": "item-1" }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("SymphonyProjectItems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "organization": {
+                        "projectV2": {
+                            "items": {
+                                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                                "nodes": [{
+                                    "id": "item-1",
+                                    "status": { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "In Progress" },
+                                    "priority": null,
+                                    "content": {
+                                        "__typename": "Issue",
+                                        "id": "issue-node-1",
+                                        "number": 42,
+                                        "title": "Port tracker",
+                                        "body": "body",
+                                        "url": "https://github.com/openai/symphony/issues/42",
+                                        "state": "OPEN",
+                                        "createdAt": "2026-03-13T00:00:00Z",
+                                        "updatedAt": "2026-03-13T01:00:00Z",
+                                        "assignees": { "nodes": [] },
+                                        "labels": { "nodes": [] },
+                                        "repository": {
+                                            "name": "symphony",
+                                            "owner": { "login": "openai" }
+                                        }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  project_v2_number: 7
+  mode: projects_v2
+  status_source:
+    type: project_field
+    name: Status
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issue = crate::model::Issue {
+            id: "issue-node-1".to_string(),
+            project_item_id: Some("item-1".to_string()),
+            identifier: "openai/symphony#42".to_string(),
+            title: "Port tracker".to_string(),
+            description: Some("body".to_string()),
+            priority: None,
+            state: "Todo".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/symphony/issues/42".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let updated = tracker
+            .transition_issue_to_in_progress_on_claim(&issue)
+            .await
+            .unwrap();
+        assert_eq!(updated.state, "In Progress");
+        assert_eq!(updated.project_item_id.as_deref(), Some("item-1"));
+    }
+
+    #[tokio::test]
+    async fn pull_request_checks_summary_reports_failing_checks() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/symphony/commits/abc123/check-runs"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "check_runs": [
+                    {
+                        "name": "make-all",
+                        "status": "completed",
+                        "conclusion": "failure"
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/symphony/commits/abc123/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statuses": []
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  repo: symphony
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  mode: issues_only
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let summary = tracker
+            .pull_request_checks_summary("openai", "symphony", "abc123")
+            .await
+            .unwrap();
+
+        assert_eq!(summary.state, PullRequestChecksState::Failing);
+        assert_eq!(summary.failing, vec!["make-all".to_string()]);
+        assert!(!summary.allows_review_handoff());
+    }
+
+    #[tokio::test]
+    async fn pull_request_checks_summary_reports_pending_checks() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/symphony/commits/def456/check-runs"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "check_runs": [
+                    {
+                        "name": "make-all",
+                        "status": "in_progress",
+                        "conclusion": null
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/symphony/commits/def456/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statuses": []
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  repo: symphony
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  mode: issues_only
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let summary = tracker
+            .pull_request_checks_summary("openai", "symphony", "def456")
+            .await
+            .unwrap();
+
+        assert_eq!(summary.state, PullRequestChecksState::Pending);
+        assert_eq!(summary.pending, vec!["make-all".to_string()]);
+        assert!(!summary.allows_review_handoff());
+    }
+
+    #[tokio::test]
+    async fn closed_issue_transition_updates_project_status_to_done() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("SymphonyProjectStatusField"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "organization": {
+                        "projectV2": {
+                            "id": "project-1",
+                            "fields": {
+                                "nodes": [{
+                                    "__typename": "ProjectV2SingleSelectField",
+                                    "id": "field-status",
+                                    "name": "Status",
+                                    "options": [
+                                        { "id": "opt-todo", "name": "Todo" },
+                                        { "id": "opt-done", "name": "Done" }
+                                    ]
+                                }]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("SymphonyUpdateProjectItemStatus"))
+            .and(body_string_contains("opt-done"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": {
+                        "projectV2Item": { "id": "item-1" }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("SymphonyProjectItems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "organization": {
+                        "projectV2": {
+                            "items": {
+                                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                                "nodes": [{
+                                    "id": "item-1",
+                                    "status": { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Done" },
+                                    "priority": null,
+                                    "content": {
+                                        "__typename": "Issue",
+                                        "id": "issue-node-1",
+                                        "number": 42,
+                                        "title": "Port tracker",
+                                        "body": "body",
+                                        "url": "https://github.com/openai/symphony/issues/42",
+                                        "state": "CLOSED",
+                                        "createdAt": "2026-03-13T00:00:00Z",
+                                        "updatedAt": "2026-03-13T01:00:00Z",
+                                        "assignees": { "nodes": [] },
+                                        "labels": { "nodes": [] },
+                                        "repository": {
+                                            "name": "symphony",
+                                            "owner": { "login": "openai" }
+                                        }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  project_v2_number: 7
+  mode: projects_v2
+  status_source:
+    type: project_field
+    name: Status
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issue = crate::model::Issue {
+            id: "issue-node-1".to_string(),
+            project_item_id: Some("item-1".to_string()),
+            identifier: "openai/symphony#42".to_string(),
+            title: "Port tracker".to_string(),
+            description: Some("body".to_string()),
+            priority: None,
+            state: "Closed".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/symphony/issues/42".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let updated = tracker
+            .transition_closed_issue_to_done(&issue)
+            .await
+            .unwrap();
+        assert_eq!(updated.state, "Done");
+        assert_eq!(updated.project_item_id.as_deref(), Some("item-1"));
+    }
+
+    #[tokio::test]
+    async fn ensure_workpad_comment_reuses_existing_comment() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/symphony/issues/42/comments"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 7,
+                    "body": "noise",
+                    "html_url": "https://github.com/openai/symphony/issues/42#issuecomment-7"
+                },
+                {
+                    "id": 9,
+                    "body": "## Codex Workpad\n\nexisting",
+                    "html_url": "https://github.com/openai/symphony/issues/42#issuecomment-9"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  repo: symphony
+  mode: issues_only
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issue = Issue {
+            id: "issue-node-42".to_string(),
+            project_item_id: None,
+            identifier: "openai/symphony#42".to_string(),
+            title: "Issue".to_string(),
+            description: None,
+            priority: None,
+            state: "Todo".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/symphony/issues/42".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let updated = tracker
+            .ensure_workpad_comment(&issue, "## Codex Workpad\n\nnew")
+            .await
+            .unwrap();
+
+        assert_eq!(updated.workpad_comment_id, Some(9));
+        assert_eq!(
+            updated.workpad_comment_url.as_deref(),
+            Some("https://github.com/openai/symphony/issues/42#issuecomment-9")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_workpad_comment_creates_when_missing() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/symphony/issues/42/comments"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/repos/openai/symphony/issues/42/comments"))
+            .and(body_string_contains("## Codex Workpad"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 11,
+                "body": "## Codex Workpad\n\ncreated",
+                "html_url": "https://github.com/openai/symphony/issues/42#issuecomment-11"
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  repo: symphony
+  mode: issues_only
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issue = Issue {
+            id: "issue-node-42".to_string(),
+            project_item_id: None,
+            identifier: "openai/symphony#42".to_string(),
+            title: "Issue".to_string(),
+            description: None,
+            priority: None,
+            state: "Todo".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/symphony/issues/42".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let updated = tracker
+            .ensure_workpad_comment(&issue, "## Codex Workpad\n\ncreated")
+            .await
+            .unwrap();
+
+        assert_eq!(updated.workpad_comment_id, Some(11));
+        assert_eq!(
+            updated.workpad_comment_url.as_deref(),
+            Some("https://github.com/openai/symphony/issues/42#issuecomment-11")
         );
     }
 }

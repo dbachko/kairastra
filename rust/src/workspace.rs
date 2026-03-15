@@ -103,6 +103,7 @@ pub async fn remove_issue_workspace(settings: &Settings, identifier: &str) -> Re
     if let Some(script) = settings.hooks.before_remove.as_deref() {
         let synthetic_issue = Issue {
             id: String::new(),
+            project_item_id: None,
             identifier: identifier.to_string(),
             title: String::new(),
             description: None,
@@ -110,10 +111,14 @@ pub async fn remove_issue_workspace(settings: &Settings, identifier: &str) -> Re
             state: String::new(),
             branch_name: None,
             url: None,
+            assignees: Vec::new(),
             labels: Vec::new(),
             blocked_by: Vec::new(),
             created_at: None,
             updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
         };
         let _ = run_hook(
             settings,
@@ -244,6 +249,7 @@ workspace:
     fn issue(identifier: &str) -> Issue {
         Issue {
             id: identifier.to_string(),
+            project_item_id: None,
             identifier: identifier.to_string(),
             title: "Title".to_string(),
             description: None,
@@ -251,10 +257,14 @@ workspace:
             state: "Todo".to_string(),
             branch_name: None,
             url: None,
+            assignees: Vec::new(),
             labels: Vec::new(),
             blocked_by: Vec::new(),
             created_at: None,
             updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
         }
     }
 

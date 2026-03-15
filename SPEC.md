@@ -7,8 +7,8 @@ Purpose: Define a service that orchestrates coding agents to get project work do
 ## 1. Problem Statement
 
 Symphony is a long-running automation service that continuously reads work from an issue tracker
-(Linear in this specification version), creates an isolated workspace for each issue, and runs a
-coding agent session for that issue inside the workspace.
+(GitHub Issues + Projects v2 in this specification version), creates an isolated workspace for
+each issue, and runs a coding agent session for that issue inside the workspace.
 
 The service solves four operational problems:
 
@@ -119,7 +119,7 @@ Symphony is easiest to port when kept in these layers:
 4. `Execution Layer` (workspace + agent subprocess)
    - Filesystem lifecycle, workspace preparation, coding-agent protocol.
 
-5. `Integration Layer` (Linear adapter)
+5. `Integration Layer` (GitHub adapter)
    - API calls and normalization for tracker data.
 
 6. `Observability Layer` (logs + optional status surface)
@@ -127,7 +127,7 @@ Symphony is easiest to port when kept in these layers:
 
 ### 3.3 External Dependencies
 
-- Issue tracker API (Linear for `tracker.kind: linear` in this specification version).
+- Issue tracker API (GitHub for `tracker.kind: github` in this specification version).
 - Local filesystem for workspaces and logs.
 - Optional workspace population tooling (for example Git CLI, if used).
 - Coding-agent executable that supports JSON-RPC-like app-server mode over stdio.
@@ -145,8 +145,10 @@ Fields:
 
 - `id` (string)
   - Stable tracker-internal ID.
+- `project_item_id` (string or null)
+  - Tracker-specific project item ID when the issue comes from a project-backed queue.
 - `identifier` (string)
-  - Human-readable ticket key (example: `ABC-123`).
+  - Human-readable issue key (example: `owner/repo#123`).
 - `title` (string)
 - `description` (string or null)
 - `priority` (integer or null)
@@ -156,6 +158,8 @@ Fields:
 - `branch_name` (string or null)
   - Tracker-provided branch metadata if available.
 - `url` (string or null)
+- `assignees` (list of strings)
+  - Normalized to lowercase.
 - `labels` (list of strings)
   - Normalized to lowercase.
 - `blocked_by` (list of blocker refs)
@@ -342,19 +346,39 @@ Fields:
 
 - `kind` (string)
   - Required for dispatch.
-  - Current supported value: `linear`
+  - Current supported value: `github`
+- `mode` (string)
+  - Supported values: `projects_v2`, `issues_only`
+  - Default: `projects_v2`
 - `endpoint` (string)
-  - Default for `tracker.kind == "linear"`: `https://api.linear.app/graphql`
+  - Default for `tracker.kind == "github"`: `https://api.github.com/graphql`
+- `rest_endpoint` (string)
+  - Default for `tracker.kind == "github"`: `https://api.github.com`
 - `api_key` (string)
   - May be a literal token or `$VAR_NAME`.
-  - Canonical environment variable for `tracker.kind == "linear"`: `LINEAR_API_KEY`.
+  - Canonical environment variables for `tracker.kind == "github"`: `GITHUB_TOKEN`, `GH_TOKEN`.
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
-- `project_slug` (string)
-  - Required for dispatch when `tracker.kind == "linear"`.
+- `owner` (string)
+  - Required for dispatch when `tracker.kind == "github"`.
+- `repo` (string, optional)
+  - Required when `tracker.mode == "issues_only"`.
+  - Recommended for `projects_v2` when prompts, hooks, or runtime heuristics need a canonical
+    repository.
+- `project_v2_number` (integer)
+  - Required when `tracker.mode == "projects_v2"`.
+- `project_url` (string, optional)
+  - Recommended when the exact dashboard URL should be surfaced to prompts and operator logs.
 - `active_states` (list of strings)
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings)
   - Default: `Closed`, `Cancelled`, `Canceled`, `Duplicate`, `Done`
+- `status_source` (object, optional)
+  - Describes where workflow state comes from.
+  - Supported types for the GitHub implementation: `project_field`, `issue_field`, `github_state`,
+    `label`
+- `priority_source` (object, optional)
+  - Describes where priority comes from.
+  - Supported types for the GitHub implementation: `project_field`, `issue_field`
 
 #### 5.3.2 `polling` (object)
 
@@ -405,9 +429,14 @@ Fields:
 - `max_concurrent_agents` (integer or string integer)
   - Default: `10`
   - Changes should be re-applied at runtime and affect subsequent dispatch decisions.
+- `max_turns` (integer or string integer)
+  - Default: `20`
+  - Maximum turns allowed in one worker lifetime before continuation retry logic applies.
 - `max_retry_backoff_ms` (integer or string integer)
   - Default: `300000` (5 minutes)
   - Changes should be re-applied at runtime and affect future retry scheduling.
+- `assignee_login` (string, optional)
+  - When set, only issues assigned to this GitHub login are eligible for dispatch.
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
   - State keys are normalized (`lowercase`) for lookup.
@@ -464,7 +493,7 @@ Template input variables:
 Fallback prompt behavior:
 
 - If the workflow prompt body is empty, the runtime may use a minimal default prompt
-  (`You are working on an issue from Linear.`).
+  (`You are working on a GitHub issue.`).
 - Workflow file read/parse failures are configuration/validation errors and should not silently fall
   back to a prompt.
 
@@ -544,17 +573,26 @@ Validation checks:
 - Workflow file can be loaded and parsed.
 - `tracker.kind` is present and supported.
 - `tracker.api_key` is present after `$` resolution.
-- `tracker.project_slug` is present when required by the selected tracker kind.
+- `tracker.owner` is present when required by the selected tracker kind.
+- `tracker.repo` is present when required by the selected tracker mode.
+- `tracker.project_v2_number` is present when required by the selected tracker mode.
 - `codex.command` is present and non-empty.
 
 ### 6.4 Config Fields Summary (Cheat Sheet)
 
 This section is intentionally redundant so a coding agent can implement the config layer quickly.
 
-- `tracker.kind`: string, required, currently `linear`
-- `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
-- `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
-- `tracker.project_slug`: string, required when `tracker.kind=linear`
+- `tracker.kind`: string, required, currently `github`
+- `tracker.mode`: string, default `projects_v2`
+- `tracker.endpoint`: string, default `https://api.github.com/graphql` when `tracker.kind=github`
+- `tracker.rest_endpoint`: string, default `https://api.github.com` when `tracker.kind=github`
+- `tracker.api_key`: string or `$VAR`, canonical envs `GITHUB_TOKEN` / `GH_TOKEN` when `tracker.kind=github`
+- `tracker.owner`: string, required when `tracker.kind=github`
+- `tracker.repo`: string, required in `issues_only` mode, optional otherwise
+- `tracker.project_v2_number`: integer, required in `projects_v2` mode
+- `tracker.project_url`: string, optional
+- `tracker.status_source`: object, optional
+- `tracker.priority_source`: object, optional
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms`: integer, default `30000`
@@ -571,6 +609,7 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
+- `agent.assignee_login`: string, optional
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
@@ -1062,16 +1101,17 @@ Unsupported dynamic tool calls:
 Optional client-side tool extension:
 
 - An implementation may expose a limited set of client-side tools to the app-server session.
-- Current optional standardized tool: `linear_graphql`.
+- Current optional standardized tools: `github_graphql`, `github_rest`.
 - If implemented, supported tools should be advertised to the app-server session during startup
   using the protocol mechanism supported by the targeted Codex app-server version.
 - Unsupported tool names should still return a failure result and continue the session.
 
-`linear_graphql` extension contract:
+`github_graphql` extension contract:
 
-- Purpose: execute a raw GraphQL query or mutation against Linear using Symphony's configured
+- Purpose: execute a raw GraphQL query or mutation against GitHub using Symphony's configured
   tracker auth for the current session.
-- Availability: only meaningful when `tracker.kind == "linear"` and valid Linear auth is configured.
+- Availability: only meaningful when `tracker.kind == "github"` and valid GitHub auth is
+  configured.
 - Preferred input shape:
 
   ```json
@@ -1090,7 +1130,7 @@ Optional client-side tool extension:
 - Execute one GraphQL operation per tool call.
 - If the provided document contains multiple operations, reject the tool call as invalid input.
 - `operationName` selection is intentionally out of scope for this extension.
-- Reuse the configured Linear endpoint and auth from the active Symphony workflow/runtime config; do
+- Reuse the configured GitHub endpoint and auth from the active Symphony workflow/runtime config; do
   not require the coding agent to read raw tokens from disk.
 - Tool result semantics:
   - transport success + no top-level GraphQL `errors` -> `success=true`
@@ -1099,6 +1139,33 @@ Optional client-side tool extension:
   - invalid input, missing auth, or transport failure -> `success=false` with an error payload
 - Return the GraphQL response or error payload as structured tool output that the model can inspect
   in-session.
+
+`github_rest` extension contract:
+
+- Purpose: execute a constrained set of GitHub REST API operations for issues and pull requests
+  using Symphony's configured tracker auth for the current session.
+- Availability: only meaningful when `tracker.kind == "github"` and valid GitHub auth is
+  configured.
+- Preferred input shape:
+
+  ```json
+  {
+    "method": "GET | POST | PATCH",
+    "path": "/repos/<owner>/<repo>/issues/123/comments",
+    "body": {
+      "optional": "request payload object"
+    }
+  }
+  ```
+
+- `method` and `path` are required strings.
+- Implementations may restrict methods and path prefixes; the current GitHub implementation limits
+  REST access to issue- and pull-request-related paths.
+- Tool result semantics:
+  - allow-listed request succeeds -> `success=true`
+  - unsupported method/path, invalid input, missing auth, or transport failure -> `success=false`
+    with a structured error payload
+- Unsupported or out-of-scope REST requests must fail without stalling the session.
 
 Illustrative responses (equivalent payload shapes are acceptable if they preserve the same outcome):
 
@@ -1150,14 +1217,14 @@ Note:
 
 - Workspaces are intentionally preserved after successful runs.
 
-## 11. Issue Tracker Integration Contract (Linear-Compatible)
+## 11. Issue Tracker Integration Contract (GitHub-Compatible)
 
 ### 11.1 Required Operations
 
 An implementation must support these tracker adapter operations:
 
 1. `fetch_candidate_issues()`
-   - Return issues in configured active states for a configured project.
+   - Return issues in configured active states for the configured tracker scope.
 
 2. `fetch_issues_by_states(state_names)`
    - Used for startup terminal cleanup.
@@ -1165,26 +1232,37 @@ An implementation must support these tracker adapter operations:
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
 
-### 11.2 Query Semantics (Linear)
+### 11.2 Query Semantics (GitHub)
 
-Linear-specific requirements for `tracker.kind == "linear"`:
+GitHub-specific requirements for `tracker.kind == "github"`:
 
-- `tracker.kind == "linear"`
-- GraphQL endpoint (default `https://api.linear.app/graphql`)
+- `tracker.kind == "github"`
+- GraphQL endpoint default: `https://api.github.com/graphql`
+- REST endpoint default: `https://api.github.com`
 - Auth token sent in `Authorization` header
-- `tracker.project_slug` maps to Linear project `slugId`
-- Candidate issue query filters project using `project: { slugId: { eq: $projectSlug } }`
-- Issue-state refresh query uses GraphQL issue IDs with variable type `[ID!]`
-- Pagination required for candidate issues
-- Page size default: `50`
-- Network timeout: `30000 ms`
+- `tracker.owner` identifies the GitHub organization or user that owns the project or repository
+- `tracker.mode == "projects_v2"`:
+  - `tracker.project_v2_number` selects the GitHub Project v2 board
+  - candidate issue query paginates project items and normalizes only items whose content is an
+    issue
+  - the default workflow-state source is a Project field named `Status`
+  - the default priority source is a Project field named `Priority`
+- `tracker.mode == "issues_only"`:
+  - `tracker.repo` is required
+  - candidate issue query enumerates repository issues and excludes pull requests
+  - workflow state may come from GitHub issue state directly or from a configured status source
+- Issue-state refresh should use tracker-native stable IDs.
+- Pagination required for candidate issues or project items
+- Page size is implementation-defined (`100` in the current Rust implementation)
+- Network timeout behavior is implementation-defined and should be documented by each
+  implementation
 
 Important:
 
-- Linear GraphQL schema details can drift. Keep query construction isolated and test the exact query
-  fields/types required by this specification.
+- GitHub API schemas can drift. Keep query construction isolated and test the exact fields/types
+  required by this specification.
 
-A non-Linear implementation may change transport details, but the normalized outputs must match the
+A non-GitHub implementation may change transport details, but the normalized outputs must match the
 domain model in Section 4.
 
 ### 11.3 Normalization Rules
@@ -1193,10 +1271,16 @@ Candidate issue normalization should produce fields listed in Section 4.1.1.
 
 Additional normalization details:
 
+- `project_item_id` -> populate when available from a project-backed queue
+- `assignees` -> lowercase strings
 - `labels` -> lowercase strings
-- `blocked_by` -> derived from inverse relations where relation type is `blocks`
+- `blocked_by` -> derive from tracker dependency or relation APIs when available
 - `priority` -> integer only (non-integers become null)
 - `created_at` and `updated_at` -> parse ISO-8601 timestamps
+- For project-backed GitHub queues:
+  - if the underlying GitHub issue is closed and the project status is a terminal workflow state
+    such as `Done`, surface the terminal project state
+  - otherwise, a closed GitHub issue should normalize to `Closed`
 
 ### 11.4 Error Handling Contract
 
@@ -1204,12 +1288,15 @@ Recommended error categories:
 
 - `unsupported_tracker_kind`
 - `missing_tracker_api_key`
-- `missing_tracker_project_slug`
-- `linear_api_request` (transport failures)
-- `linear_api_status` (non-200 HTTP)
-- `linear_graphql_errors`
-- `linear_unknown_payload`
-- `linear_missing_end_cursor` (pagination integrity error)
+- `missing_tracker_owner`
+- `missing_tracker_repo`
+- `missing_github_project_v2_number`
+- `github_api_request` (transport failures)
+- `github_rest_status` (non-200 REST responses)
+- `github_graphql_status` (non-200 GraphQL responses)
+- `github_graphql_errors`
+- `github_unknown_payload`
+- `github_missing_end_cursor` (pagination integrity error)
 
 Orchestrator behavior on tracker errors:
 
@@ -1219,15 +1306,24 @@ Orchestrator behavior on tracker errors:
 
 ### 11.5 Tracker Writes (Important Boundary)
 
-Symphony does not require first-class tracker write APIs in the orchestrator.
+Symphony does not require general-purpose tracker write APIs in the orchestrator, but limited
+runtime-owned workflow transitions are allowed.
 
-- Ticket mutations (state transitions, comments, PR metadata) are typically handled by the coding
-  agent using tools defined by the workflow prompt.
-- The service remains a scheduler/runner and tracker reader.
-- Workflow-specific success often means "reached the next handoff state" (for example
+- Ticket mutations such as workpad comments, issue body edits, PR linkage, and most workflow notes
+  are typically handled by the coding agent using tools defined by the workflow prompt.
+- The service remains primarily a scheduler/runner and tracker reader.
+- Implementations may own narrow workflow-state transitions when that improves correctness or
+  prevents stuck queues.
+- The current GitHub implementation owns these minimal transitions:
+  - claim transition: `Todo -> In Progress`
+  - review handoff transition: `In Progress -> Human Review` only when an open PR exists for the
+    issue branch, the workpad shows non-bootstrap progress, and GitHub Actions / required PR
+    checks are green
+  - terminal cleanup transition: closed issue -> project `Done`
+- Workflow-specific success may still mean "reached the next handoff state" (for example
   `Human Review`) rather than tracker terminal state `Done`.
-- If the optional `linear_graphql` client-side tool extension is implemented, it is still part of
-  the agent toolchain rather than orchestrator business logic.
+- If optional GitHub client-side tool extensions are implemented, they remain part of the agent
+  toolchain rather than a replacement for orchestrator policy.
 
 ## 12. Prompt Construction and Context Assembly
 
@@ -1675,10 +1771,10 @@ Possible hardening measures include:
   of running with a maximally permissive configuration.
 - Adding external isolation layers such as OS/container/VM sandboxing, network restrictions, or
   separate credentials beyond the built-in Codex policy controls.
-- Filtering which Linear issues, projects, teams, labels, or other tracker sources are eligible for
-  dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
-- Narrowing the optional `linear_graphql` tool so it can only read or mutate data inside the
-  intended project scope, rather than exposing general workspace-wide tracker access.
+- Filtering which GitHub issues, projects, labels, assignees, or other tracker sources are
+  eligible for dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
+- Narrowing optional GitHub tracker tools so they can only read or mutate data inside the intended
+  repository/project scope, rather than exposing general workspace-wide tracker access.
 - Reducing the set of client-side tools, credentials, filesystem paths, and network destinations
   available to the agent to the minimum needed for the workflow.
 
@@ -1882,7 +1978,17 @@ on_worker_exit(issue_id, reason, state):
   state = add_runtime_seconds_to_totals(state, running_entry)
 
   if reason == normal:
-    state.completed.add(issue_id)  # bookkeeping only
+    refreshed = tracker.fetch_issue_states_by_ids([issue_id])
+
+    if refreshed returns terminal issue:
+      state.claimed.remove(issue_id)
+      cleanup_terminal_issue_workspace(issue_id)
+      return state
+
+    if refreshed returns non-active issue:
+      state.claimed.remove(issue_id)
+      return state
+
     state = schedule_retry(state, issue_id, 1, {
       identifier: running_entry.identifier,
       delay_type: continuation
@@ -1952,7 +2058,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Invalid YAML front matter returns typed error
 - Front matter non-map returns typed error
 - Config defaults apply when optional values are missing
-- `tracker.kind` validation enforces currently supported kind (`linear`)
+- `tracker.kind` validation enforces currently supported kind (`github`)
 - `tracker.api_key` works (including `$VAR` indirection)
 - `$VAR` resolution works for tracker API key and path values
 - `~` path expansion works
@@ -1969,7 +2075,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Existing non-directory path at workspace location is handled safely (replace or fail per
   implementation policy)
 - Optional workspace population/synchronization errors are surfaced
-- Temporary artifacts (`tmp`, `.elixir_ls`) are removed during prep
+- Workspace-local helper/cache paths are kept inside the workspace root
 - `after_create` hook runs only on new workspace creation
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
@@ -1979,14 +2085,16 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.3 Issue Tracker Client
 
-- Candidate issue fetch uses active states and project slug
-- Linear query uses the specified project filter field (`slugId`)
+- Candidate issue fetch uses configured active states and tracker scope
+- `projects_v2` mode uses the configured project number and status field
+- `issues_only` mode uses the configured repository and excludes pull requests
 - Empty `fetch_issues_by_states([])` returns empty without API call
 - Pagination preserves order across multiple pages
-- Blockers are normalized from inverse relations of type `blocks`
+- Blockers are normalized from tracker dependency or relation endpoints when available
 - Labels are normalized to lowercase
+- Assignees are normalized to lowercase
 - Issue state refresh by ID returns minimal normalized issues
-- Issue state refresh query uses GraphQL ID typing (`[ID!]`) as specified in Section 11.2
+- Project-backed refresh preserves `project_item_id` and terminal project status normalization
 - Error mapping for request errors, non-200, GraphQL errors, malformed payloads
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
@@ -1994,11 +2102,17 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Dispatch sort order is priority then oldest creation time
 - `Todo` issue with non-terminal blockers is not eligible
 - `Todo` issue with terminal blockers is eligible
+- If assignee filtering is configured, only matching assignees are dispatchable
+- Runtime-owned claim transition moves `Todo` to `In Progress` when implemented
 - Active-state issue refresh updates running entry state
 - Non-active state stops running agent without workspace cleanup
 - Terminal state stops running agent and cleans workspace
+- Runtime-owned review handoff moves `In Progress` to `Human Review` only when an open PR exists,
+  the workpad shows non-bootstrap progress, and GitHub Actions / required PR checks are green
+- Runtime-owned terminal cleanup moves a closed issue to project `Done` before workspace removal
+  when that behavior is implemented
 - Reconciliation with no running issues is a no-op
-- Normal worker exit schedules a short continuation retry (attempt 1)
+- Normal worker exit schedules a short continuation retry only when the issue remains active
 - Abnormal worker exit increments retries with 10s-based exponential backoff
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error
@@ -2030,11 +2144,17 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   telemetry are accepted when they preserve the same logical meaning
 - If optional client-side tools are implemented, the startup handshake advertises the supported tool
   specs required for discovery by the targeted app-server version
-- If the optional `linear_graphql` client-side tool extension is implemented:
+- If the optional `github_graphql` client-side tool extension is implemented:
   - the tool is advertised to the session
-  - valid `query` / `variables` inputs execute against configured Linear auth
+  - valid `query` / `variables` inputs execute against configured GitHub auth
   - top-level GraphQL `errors` produce `success=false` while preserving the GraphQL body
   - invalid arguments, missing auth, and transport failures return structured failure payloads
+  - unsupported tool names still fail without stalling the session
+- If the optional `github_rest` client-side tool extension is implemented:
+  - the tool is advertised to the session
+  - valid allow-listed REST requests execute against configured GitHub auth
+  - unsupported methods/paths, invalid arguments, missing auth, and transport failures return
+    structured failure payloads
   - unsupported tool names still fail without stalling the session
 
 ### 17.6 Observability
@@ -2062,8 +2182,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 These checks are recommended for production readiness and may be skipped in CI when credentials,
 network access, or external service permissions are unavailable.
 
-- A real tracker smoke test can be run with valid credentials supplied by `LINEAR_API_KEY` or a
-  documented local bootstrap mechanism (for example `~/.linear_api_key`).
+- A real tracker smoke test can be run with valid credentials supplied by `GITHUB_TOKEN` or
+  `GH_TOKEN`.
 - Real integration tests should use isolated test identifiers/workspaces and clean up tracker
   artifacts when practical.
 - A skipped real-integration test should be reported as skipped, not silently treated as passed.
@@ -2092,25 +2212,29 @@ Use the same validation profiles as Section 17:
 - Coding-agent app-server subprocess client with JSON line protocol
 - Codex launch command config (`codex.command`, default `codex app-server`)
 - Strict prompt rendering with `issue` and `attempt` variables
-- Exponential retry queue with continuation retries after normal exit
+- Exponential retry queue with continuation retries after normal exit while the issue remains active
 - Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
 - Reconciliation that stops runs on terminal/non-active tracker states
 - Workspace cleanup for terminal issues (startup sweep + active transition)
 - Structured logs with `issue_id`, `issue_identifier`, and `session_id`
 - Operator-visible observability (structured logs; optional snapshot/status surface)
+- Runtime-owned workflow transitions are correct when implemented (for example claim, review
+  handoff, terminal cleanup)
 
 ### 18.2 Recommended Extensions (Not Required for Conformance)
 
 - Optional HTTP server honors CLI `--port` over `server.port`, uses a safe default bind host, and
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
-- Optional `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
+- Optional `github_graphql` client-side tool extension exposes raw GitHub GraphQL access through the
   app-server session using configured Symphony auth.
+- Optional `github_rest` client-side tool extension exposes constrained GitHub REST access through
+  the app-server session using configured Symphony auth.
 - TODO: Persist retry queue and session metadata across process restarts.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.
-- TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
-  of only via agent tools.
-- TODO: Add pluggable issue tracker adapters beyond Linear.
+- TODO: Decide whether to expand runtime-owned tracker writes beyond the current minimal workflow
+  transitions.
+- TODO: Add pluggable issue tracker adapters beyond GitHub.
 
 ### 18.3 Operational Validation Before Production (Recommended)
 

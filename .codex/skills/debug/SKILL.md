@@ -11,108 +11,111 @@ description:
 ## Goals
 
 - Find why a run is stuck, retrying, or failing.
-- Correlate Linear issue identity to a Codex session quickly.
-- Read the right logs in the right order to isolate root cause.
+- Correlate a GitHub issue to a worker attempt quickly.
+- Read the right runtime output in the right order to isolate root cause.
 
-## Log Sources
+## Runtime output sources
 
-- Primary runtime log: `log/symphony.log`
-  - Default comes from `SymphonyElixir.LogFile` (`log/symphony.log`).
-  - Includes orchestrator, agent runner, and Codex app-server lifecycle logs.
-- Rotated runtime logs: `log/symphony.log*`
-  - Check these when the relevant run is older.
+Symphony Rust logs to stdout/stderr through `tracing`; there is no repo-local
+file logger by default.
+
+Use one of these sources:
+
+- Local foreground run:
+  - `RUST_LOG=info cargo run -- /path/to/WORKFLOW.md 2>&1 | tee /tmp/symphony.log`
+- Docker Compose:
+  - `make -C rust docker-logs`
+  - or `docker compose -f rust/compose.yml --env-file rust/.env logs -f symphony-rust`
+- Service manager / hosted process:
+  - whatever stdout capture the host uses, for example `journalctl`, container
+    logs, or redirected files.
 
 ## Correlation Keys
 
-- `issue_identifier`: human ticket key (example: `MT-625`)
-- `issue_id`: Linear UUID (stable internal ID)
-- `session_id`: Codex thread-turn pair (`<thread_id>-<turn_id>`)
+- `issue_identifier`: GitHub issue identifier such as `openai/symphony#42`
+- `issue_id`: GitHub node id when available in runtime state
+- `session_id`: Codex thread-turn pair (`<thread_id>-<turn_id>`) when emitted in
+  app-server payloads
 
-`elixir/docs/logging.md` requires these fields for issue/session lifecycle logs. Use
-them as your join keys during debugging.
+In practice, `issue_identifier` is the most stable entry point in the current
+runtime logs.
 
 ## Quick Triage (Stuck Run)
 
 1. Confirm scheduler/worker symptoms for the ticket.
 2. Find recent lines for the ticket (`issue_identifier` first).
-3. Extract `session_id` from matching lines.
-4. Trace that `session_id` across start, stream, completion/failure, and stall
-   handling logs.
-5. Decide class of failure: timeout/stall, app-server startup failure, turn
-   failure, or orchestrator retry loop.
+3. Look for whether the worker completed, retried, or was cleaned up as
+   terminal.
+4. If needed, inspect app-server output and PR/issue state to separate runtime
+   failures from workflow-state transitions.
+5. Decide class of failure: startup/auth failure, turn failure, stall/timeout,
+   retry loop, or bad tracker state.
 
 ## Commands
 
 ```bash
-# 1) Narrow by ticket key (fastest entry point)
-rg -n "issue_identifier=MT-625" log/symphony.log*
+# 1) Capture local logs to a file if you are running in the foreground
+RUST_LOG=info cargo run -- /path/to/WORKFLOW.md 2>&1 | tee /tmp/symphony.log
 
-# 2) If needed, narrow by Linear UUID
-rg -n "issue_id=<linear-uuid>" log/symphony.log*
+# 2) Narrow by GitHub issue identifier
+rg -n 'issue_identifier=.*owner/repo#123' /tmp/symphony.log
 
-# 3) Pull session IDs seen for that ticket
-rg -o "session_id=[^ ;]+" log/symphony.log* | sort -u
+# 3) Focus on retry / terminal signals
+rg -n 'worker failed|worker completed|turn_stalled|turn_failed|cleanup failed|failed to normalize closed issue' /tmp/symphony.log
 
-# 4) Trace one session end-to-end
-rg -n "session_id=<thread>-<turn>" log/symphony.log*
+# 4) Docker logs
+make -C rust docker-logs
 
-# 5) Focus on stuck/retry signals
-rg -n "Issue stalled|scheduling retry|turn_timeout|turn_failed|Codex session failed|Codex session ended with error" log/symphony.log*
+# 5) Inspect live GitHub state if runtime behavior looks inconsistent
+gh issue view owner/repo#123
+gh pr view --json state,mergeable,headRefName,url
 ```
 
 ## Investigation Flow
 
 1. Locate the ticket slice:
-    - Search by `issue_identifier=<KEY>`.
-    - If noise is high, add `issue_id=<UUID>`.
+    - Search by `issue_identifier=<owner>/<repo>#<number>`.
+    - If the run was containerized, start with Compose logs before grepping.
 2. Establish timeline:
-    - Identify first `Codex session started ... session_id=...`.
-    - Follow with `Codex session completed`, `ended with error`, or worker exit
-      lines.
+    - Find the first worker dispatch or event line for that issue.
+    - Follow through `worker completed`, `worker failed`, retry scheduling, or
+      cleanup warnings.
 3. Classify the problem:
-    - Stall loop: `Issue stalled ... restarting with backoff`.
-    - App-server startup: `Codex session failed ...`.
-    - Turn execution failure: `turn_failed`, `turn_cancelled`, `turn_timeout`, or
-      `ended with error`.
-    - Worker crash: `Agent task exited ... reason=...`.
+    - Claim / routing issue: wrong assignee, wrong Project status, or blocker
+      state prevented dispatch.
+    - App-server startup: Codex command/auth/runtime launch failed.
+    - Turn execution failure: tool call failure, approval failure, or
+      `turn_stalled`.
+    - Retry loop: repeated worker failure or max-turn continuation behavior.
+    - Cleanup mismatch: issue closed but Project item still not in `Done`.
 4. Validate scope:
-    - Check whether failures are isolated to one issue/session or repeating across
-      multiple tickets.
+    - Check whether failures are isolated to one issue or repeating across
+      multiple issues.
 5. Capture evidence:
-    - Save key log lines with timestamps, `issue_identifier`, `issue_id`, and
-      `session_id`.
+    - Save key log lines with timestamps and `issue_identifier`.
+    - Pair them with the current GitHub issue/PR/Project state.
     - Record probable root cause and the exact failing stage.
 
-## Reading Codex Session Logs
+## Reading runtime output
 
-In Symphony, Codex session diagnostics are emitted into `log/symphony.log` and
-keyed by `session_id`. Read them as a lifecycle:
+Read the Rust runtime as a lifecycle:
 
-1. `Codex session started ... session_id=...`
-2. Session stream/lifecycle events for the same `session_id`
-3. Terminal event:
-    - `Codex session completed ...`, or
-    - `Codex session ended with error ...`, or
-    - `Issue stalled ... restarting with backoff`
+1. startup log / workflow load
+2. dispatch or reconciliation activity for an issue
+3. app-server warnings or worker failure/completion
+4. retry or cleanup behavior
 
 For one specific session investigation, keep the trace narrow:
 
-1. Capture one `session_id` for the ticket.
-2. Build a timestamped slice for only that session:
-    - `rg -n "session_id=<thread>-<turn>" log/symphony.log*`
-3. Mark the exact failing stage:
-    - Startup failure before stream events (`Codex session failed ...`).
-    - Turn/runtime failure after stream events (`turn_*` / `ended with error`).
-    - Stall recovery (`Issue stalled ... restarting with backoff`).
-4. Pair findings with `issue_identifier` and `issue_id` from nearby lines to
-   confirm you are not mixing concurrent retries.
-
-Always pair session findings with `issue_identifier`/`issue_id` to avoid mixing
-concurrent runs.
+1. Capture the issue identifier.
+2. Build a timestamped slice for only that issue from stdout or container logs.
+3. Mark the exact failing stage.
+4. Pair findings with live GitHub state before concluding the bug is in the
+   runtime.
 
 ## Notes
 
-- Prefer `rg` over `grep` for speed on large logs.
-- Check rotated logs (`log/symphony.log*`) before concluding data is missing.
-- If required context fields are missing in new log statements, align with
-  `elixir/docs/logging.md` conventions.
+- Prefer `rg` over `grep` for speed on large captured logs.
+- If you need richer local traces, rerun with `RUST_LOG=debug`.
+- The current runtime does not persist a default log file; create one explicitly
+  with shell redirection or use container/service logs.

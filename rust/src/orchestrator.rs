@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::app_server::AppServerEventKind;
 use crate::config::{normalize_issue_state, Settings};
-use crate::github::{GitHubTracker, Tracker};
+use crate::github::{is_rate_limited_error, GitHubTracker, Tracker};
 use crate::model::Issue;
 use crate::runner::{run_issue, WorkerMessage, WorkerOutcome};
 use crate::workflow::{WorkflowSnapshot, WorkflowStore};
@@ -63,9 +63,23 @@ impl Orchestrator {
             retry_attempts: HashMap::new(),
         };
 
-        self.startup_cleanup(&snapshot).await?;
-        self.poll_tick(&snapshot, &mut state, &unbounded_channel().0)
-            .await?;
+        if let Err(error) = self.startup_cleanup(&snapshot).await {
+            if is_rate_limited_error(&error) {
+                warn!(error = ?error, "tracker rate limited during startup cleanup");
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if let Err(error) = self
+            .poll_tick(&snapshot, &mut state, &unbounded_channel().0)
+            .await
+        {
+            if is_rate_limited_error(&error) {
+                warn!(error = ?error, "tracker rate limited during run_once poll");
+                return Ok(());
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -78,9 +92,15 @@ impl Orchestrator {
         };
 
         let initial_snapshot = self.workflow_store.current()?;
-        self.startup_cleanup(&initial_snapshot).await?;
-        self.poll_tick(&initial_snapshot, &mut state, &worker_tx)
-            .await?;
+        if let Err(error) = self.startup_cleanup(&initial_snapshot).await {
+            log_runtime_error("startup cleanup", &error);
+        }
+        if let Err(error) = self
+            .poll_tick(&initial_snapshot, &mut state, &worker_tx)
+            .await
+        {
+            log_runtime_error("initial poll", &error);
+        }
 
         loop {
             let snapshot = self.workflow_store.current()?;
@@ -97,14 +117,20 @@ impl Orchestrator {
                 }
                 maybe_message = worker_rx.recv() => {
                     if let Some(message) = maybe_message {
-                        self.handle_worker_message(&snapshot, &mut state, message).await?;
+                        if let Err(error) = self.handle_worker_message(&snapshot, &mut state, message).await {
+                            log_runtime_error("worker message handling", &error);
+                        }
                     }
                 }
                 _ = sleep(retry_wait) => {
-                    self.dispatch_due_retries(&snapshot, &mut state, &worker_tx).await?;
+                    if let Err(error) = self.dispatch_due_retries(&snapshot, &mut state, &worker_tx).await {
+                        log_runtime_error("retry dispatch", &error);
+                    }
                 }
                 _ = sleep(poll_interval) => {
-                    self.poll_tick(&snapshot, &mut state, &worker_tx).await?;
+                    if let Err(error) = self.poll_tick(&snapshot, &mut state, &worker_tx).await {
+                        log_runtime_error("poll tick", &error);
+                    }
                 }
             }
         }
@@ -118,15 +144,8 @@ impl Orchestrator {
             .context("failed to fetch terminal issues during startup cleanup")?;
 
         for issue in issues {
-            if let Err(error) =
-                workspace::remove_issue_workspace(&snapshot.settings, &issue.identifier).await
-            {
-                warn!(
-                    issue_identifier = %issue.identifier,
-                    error = ?error,
-                    "workspace cleanup failed during startup"
-                );
-            }
+            self.cleanup_terminal_issue(snapshot, issue, "startup")
+                .await;
         }
 
         Ok(())
@@ -218,16 +237,7 @@ impl Orchestrator {
                 }
                 Some(issue) if snapshot.settings.terminal_state(&issue.state) => {
                     state.claimed.remove(&issue_id);
-                    if let Err(error) =
-                        workspace::remove_issue_workspace(&snapshot.settings, &issue.identifier)
-                            .await
-                    {
-                        warn!(
-                            issue_identifier = %issue.identifier,
-                            error = ?error,
-                            "workspace cleanup failed while reconciling retry"
-                        );
-                    }
+                    self.cleanup_terminal_issue(snapshot, issue, "retry").await;
                 }
                 _ => {
                     state.claimed.remove(&issue_id);
@@ -280,16 +290,8 @@ impl Orchestrator {
                 Some(issue) if snapshot.settings.terminal_state(&issue.state) => {
                     running.handle.abort();
                     state.claimed.remove(&issue_id);
-                    if let Err(error) =
-                        workspace::remove_issue_workspace(&snapshot.settings, &issue.identifier)
-                            .await
-                    {
-                        warn!(
-                            issue_identifier = %issue.identifier,
-                            error = ?error,
-                            "workspace cleanup failed during terminal reconciliation"
-                        );
-                    }
+                    self.cleanup_terminal_issue(snapshot, issue.clone(), "terminal reconciliation")
+                        .await;
                     remove_ids.push(issue_id.clone());
                 }
                 Some(issue) if !snapshot.settings.active_state(&issue.state) => {
@@ -323,6 +325,37 @@ impl Orchestrator {
         }
 
         Ok(())
+    }
+
+    async fn cleanup_terminal_issue(
+        &self,
+        snapshot: &WorkflowSnapshot,
+        issue: Issue,
+        context: &str,
+    ) {
+        let issue = match self.tracker.transition_closed_issue_to_done(&issue).await {
+            Ok(updated) => updated,
+            Err(error) => {
+                warn!(
+                    issue_identifier = %issue.identifier,
+                    error = ?error,
+                    cleanup_context = context,
+                    "failed to normalize closed issue to done before cleanup"
+                );
+                issue
+            }
+        };
+
+        if let Err(error) =
+            workspace::remove_issue_workspace(&snapshot.settings, &issue.identifier).await
+        {
+            warn!(
+                issue_identifier = %issue.identifier,
+                error = ?error,
+                cleanup_context = context,
+                "workspace cleanup failed for terminal issue"
+            );
+        }
     }
 
     async fn spawn_worker(
@@ -392,7 +425,7 @@ impl Orchestrator {
             .tracker
             .fetch_issue_states_by_ids(&[issue.id.clone()])
             .await?;
-        let Some(issue) = refreshed.into_iter().next() else {
+        let Some(mut issue) = refreshed.into_iter().next() else {
             return Ok(None);
         };
 
@@ -412,6 +445,13 @@ impl Orchestrator {
             })
         {
             return Ok(None);
+        }
+
+        if issue.state.trim().eq_ignore_ascii_case("todo") {
+            issue = self
+                .tracker
+                .transition_issue_to_in_progress_on_claim(&issue)
+                .await?;
         }
 
         Ok(Some(issue))
@@ -469,6 +509,27 @@ impl Orchestrator {
                 let _ = state.running.remove(&issue_id);
                 match result {
                     Ok(WorkerOutcome::Completed) => {
+                        match self
+                            .tracker
+                            .fetch_issue_states_by_ids(&[issue_id.clone()])
+                            .await
+                        {
+                            Ok(refreshed) => {
+                                if let Some(issue) = refreshed.into_iter().next() {
+                                    if snapshot.settings.terminal_state(&issue.state) {
+                                        self.cleanup_terminal_issue(
+                                            snapshot,
+                                            issue,
+                                            "worker completion",
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                log_runtime_error("worker completion refresh", &error);
+                            }
+                        }
                         state.claimed.remove(&issue_id);
                         info!(issue_identifier = %identifier, "worker completed");
                     }
@@ -491,6 +552,14 @@ impl Orchestrator {
         }
 
         Ok(())
+    }
+}
+
+fn log_runtime_error(phase: &str, error: &anyhow::Error) {
+    if is_rate_limited_error(error) {
+        warn!(phase, error = ?error, "tracker rate limited; continuing");
+    } else {
+        error!(phase, error = ?error, "runtime operation failed; continuing");
     }
 }
 
@@ -592,6 +661,16 @@ fn issue_eligible(
         return false;
     }
 
+    if let Some(assignee_login) = snapshot.settings.agent.assignee_login.as_deref() {
+        if !issue
+            .assignees
+            .iter()
+            .any(|assignee| assignee.eq_ignore_ascii_case(assignee_login))
+        {
+            return false;
+        }
+    }
+
     if issue.state.trim().eq_ignore_ascii_case("todo")
         && issue.blocked_by.iter().any(|blocker| {
             blocker
@@ -642,7 +721,7 @@ tracker:
   owner: openai
   project_v2_number: 7
   api_key: fake
-  active_states: ["Todo", "In Progress"]
+  active_states: ["Todo", "In Progress", "Merging", "Rework"]
   terminal_states: ["Done", "Closed"]
 agent:
   max_concurrent_agents: 10
@@ -660,9 +739,36 @@ agent:
         }
     }
 
+    fn snapshot_with_assignee(assignee_login: &str) -> WorkflowSnapshot {
+        let workflow = WorkflowDefinition {
+            config: serde_yaml::from_str(&format!(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+  api_key: fake
+  active_states: ["Todo", "In Progress", "Merging", "Rework"]
+  terminal_states: ["Done", "Closed"]
+agent:
+  max_concurrent_agents: 10
+  assignee_login: {assignee_login}
+"#
+            ))
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+        let settings = Settings::from_workflow(&workflow).unwrap();
+        WorkflowSnapshot {
+            definition: workflow,
+            settings,
+        }
+    }
+
     fn issue(id: &str, state: &str, priority: Option<i64>) -> Issue {
         Issue {
             id: id.to_string(),
+            project_item_id: None,
             identifier: format!("openai/repo#{id}"),
             title: format!("Issue {id}"),
             description: None,
@@ -670,10 +776,14 @@ agent:
             state: state.to_string(),
             branch_name: None,
             url: None,
+            assignees: Vec::new(),
             labels: Vec::new(),
             blocked_by: Vec::new(),
             created_at: None,
             updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
         }
     }
 
@@ -722,5 +832,71 @@ agent:
         let selected = select_dispatchable(&snapshot, &issues, &state);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "1");
+    }
+
+    #[test]
+    fn human_review_is_not_dispatchable_when_not_active() {
+        let snapshot = snapshot();
+        let state = RuntimeState {
+            running: Default::default(),
+            claimed: Default::default(),
+            retry_attempts: Default::default(),
+        };
+
+        let issue = issue("1", "Human Review", Some(1));
+        assert!(!issue_eligible(&snapshot, &issue, &state, &HashMap::new()));
+    }
+
+    #[test]
+    fn merging_and_rework_are_dispatchable_when_active() {
+        let snapshot = snapshot();
+        let state = RuntimeState {
+            running: Default::default(),
+            claimed: Default::default(),
+            retry_attempts: Default::default(),
+        };
+
+        let merging = issue("1", "Merging", Some(1));
+        let rework = issue("2", "Rework", Some(1));
+
+        assert!(issue_eligible(&snapshot, &merging, &state, &HashMap::new()));
+        assert!(issue_eligible(&snapshot, &rework, &state, &HashMap::new()));
+    }
+
+    #[test]
+    fn configured_assignee_filter_requires_matching_login() {
+        let snapshot = snapshot_with_assignee("codex-bot");
+        let state = RuntimeState {
+            running: Default::default(),
+            claimed: Default::default(),
+            retry_attempts: Default::default(),
+        };
+
+        let mut assigned = issue("1", "Todo", Some(1));
+        assigned.assignees = vec!["codex-bot".to_string()];
+
+        let mut other_assignee = issue("2", "Todo", Some(1));
+        other_assignee.assignees = vec!["someone-else".to_string()];
+
+        let unassigned = issue("3", "Todo", Some(1));
+
+        assert!(issue_eligible(
+            &snapshot,
+            &assigned,
+            &state,
+            &HashMap::new()
+        ));
+        assert!(!issue_eligible(
+            &snapshot,
+            &other_assignee,
+            &state,
+            &HashMap::new()
+        ));
+        assert!(!issue_eligible(
+            &snapshot,
+            &unassigned,
+            &state,
+            &HashMap::new()
+        ));
     }
 }

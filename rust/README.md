@@ -1,15 +1,21 @@
 # Symphony Rust
 
-This directory contains a Rust implementation of Symphony oriented around GitHub Issues and Projects v2, following [`SPEC.md`](../SPEC.md) and the GitHub design notes in `syphony-gh.md`.
+This directory contains the current Symphony implementation for this repo. It is oriented around
+GitHub Issues and Projects v2, following [`SPEC.md`](../SPEC.md) and the GitHub design notes in
+`syphony-gh.md`.
 
 ## What is implemented
 
 - `WORKFLOW.md` loader with YAML front matter, prompt body parsing, and last-known-good reload behavior.
 - Typed runtime config for `tracker.kind: github`.
 - GitHub tracker adapter with `projects_v2` as the primary mode and `issues_only` as a fallback.
+- GitHub Project dashboard URL support via `tracker.project_url` and derived fallback URLs.
 - Per-issue workspace creation, deterministic workspace keys, and lifecycle hooks.
 - Liquid prompt rendering.
-- Codex app-server client with the required `initialize -> initialized -> thread/start -> turn/start` handshake.
+- Codex app-server client with v2 `thread/start -> turn/start` support plus legacy
+  `newConversation -> addConversationListener -> sendUserTurn` fallback for older local Codex
+  runtimes, including legacy sandbox-policy translation and injected `GITHUB_TOKEN` / `GH_TOKEN`
+  env vars so GitHub mutations still work through `gh`.
 - Polling orchestrator with in-memory claims, reconciliation, continuation retries, and exponential backoff retries.
 
 ## Run
@@ -17,6 +23,7 @@ This directory contains a Rust implementation of Symphony oriented around GitHub
 ```bash
 cd rust
 cargo test
+cargo fmt --check
 cargo run -- /path/to/WORKFLOW.md
 ```
 
@@ -93,10 +100,12 @@ Important notes:
 tracker:
   kind: github
   api_key: $GITHUB_TOKEN
-  owner: your-org
   mode: projects_v2
-  project_v2_number: 7
-  active_states: ["Todo", "In Progress"]
+  owner: $SYMPHONY_GITHUB_OWNER
+  repo: $SYMPHONY_GITHUB_REPO
+  project_v2_number: $SYMPHONY_GITHUB_PROJECT_NUMBER
+  project_url: $SYMPHONY_GITHUB_PROJECT_URL
+  active_states: ["Todo", "In Progress", "Merging", "Rework"]
   terminal_states: ["Done", "Closed", "Cancelled", "Duplicate"]
   status_source:
     type: project_field
@@ -108,10 +117,12 @@ workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:
   after_create: |
-    git clone https://github.com/your-org/your-repo.git .
+    git clone "$SYMPHONY_GIT_CLONE_URL" .
+    rsync -a --delete --exclude '.git' "$SYMPHONY_SEED_REPO"/ ./
 agent:
   max_concurrent_agents: 4
   max_turns: 20
+  assignee_login: $SYMPHONY_AGENT_ASSIGNEE
 codex:
   command: codex app-server
 ---
@@ -125,8 +136,40 @@ Body:
 {% endif %}
 ```
 
+## Bootstrap GitHub Project metadata
+
+From the repo root, use the bootstrap script to converge a GitHub Project and repo onto the Symphony workflow shape:
+
+```bash
+python3 scripts/bootstrap_github_project.py --dry-run
+python3 scripts/bootstrap_github_project.py
+```
+
+The script expects these env vars, or equivalent CLI flags:
+
+- `SYMPHONY_GITHUB_OWNER`
+- `SYMPHONY_GITHUB_REPO`
+- `SYMPHONY_GITHUB_PROJECT_NUMBER`
+
+What it ensures:
+
+- Project `Status` options: `Backlog`, `Todo`, `In Progress`, `Human Review`, `Merging`, `Rework`, `Done`, `Cancelled`, `Duplicate`
+- Project `Priority` numeric field
+- A small default repo label pack for Symphony-oriented filtering
+
+Important distinction:
+
+- The Project `Status` field should contain the full workflow vocabulary, including non-dispatch states like `Backlog` and `Human Review`.
+- The workflow `active_states` remain narrower and should contain only the states Symphony is allowed to actively dispatch, such as `Todo`, `In Progress`, `Merging`, and `Rework`.
+
 ## Notes
 
-- This is a first Rust port, not a full parity rewrite of the Elixir implementation.
 - The current code targets local workers only.
 - GitHub dynamic tools are limited to `github_graphql` and a small `github_rest` allow-list.
+- `tracker.project_url` is optional but recommended when you want the prompt/runtime to surface the exact GitHub Project dashboard URL, especially for org-owned projects where the canonical URL cannot be derived locally.
+- The checked-in [WORKFLOW.md](../WORKFLOW.md) is a generic GitHub Projects workflow. Parameterize it with `SYMPHONY_GITHUB_OWNER`, `SYMPHONY_GITHUB_REPO`, `SYMPHONY_GITHUB_PROJECT_NUMBER`, `SYMPHONY_GITHUB_PROJECT_URL`, and `SYMPHONY_GIT_CLONE_URL`.
+- When both `SYMPHONY_GIT_CLONE_URL` and `SYMPHONY_SEED_REPO` are set, Symphony clones the canonical remote history first and then overlays the local seed contents on top. That preserves a merge base with `origin/main` while still letting workers start from a dirty local checkout for live testing.
+- The checked-in workflow assumes a review handoff model with `Todo`, `In Progress`, `Human Review`, `Merging`, `Rework`, and `Done` statuses, while only `Todo`, `In Progress`, `Merging`, and `Rework` are active dispatch states.
+- Runtime-owned review handoff keeps issues in `In Progress` until a PR exists, the workpad is reconciled beyond bootstrap state, and GitHub Actions / required PR checks are green.
+- Set `agent.assignee_login` when you want a worker to claim only issues assigned to a specific GitHub login.
+- Progress tracking in the checked-in workflow happens in one persistent `## Codex Workpad` issue comment, with fallback to the issue body only if comment editing is unavailable.

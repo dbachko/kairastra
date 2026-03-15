@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use symphony_rust::github::GitHubTracker;
@@ -39,6 +40,11 @@ async fn main() -> Result<()> {
 
     let workflow_store = Arc::new(WorkflowStore::new(workflow_path));
     let snapshot = workflow_store.current()?;
+    if let Some(dashboard_url) = snapshot.settings.tracker_dashboard_url() {
+        info!(dashboard_url = %dashboard_url, "using GitHub dashboard for Symphony");
+    } else {
+        warn!("no GitHub dashboard URL configured; falling back to tracker-only polling");
+    }
     let tracker = Arc::new(GitHubTracker::new(snapshot.settings.tracker.clone())?);
     let orchestrator = Orchestrator::new(workflow_store, tracker);
 

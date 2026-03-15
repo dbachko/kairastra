@@ -37,6 +37,7 @@ pub struct TrackerSettings {
     pub owner: String,
     pub repo: Option<String>,
     pub project_v2_number: Option<u32>,
+    pub project_url: Option<String>,
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
     pub status_source: Option<FieldSource>,
@@ -69,6 +70,7 @@ pub struct AgentSettings {
     pub max_concurrent_agents: usize,
     pub max_turns: usize,
     pub max_retry_backoff_ms: u64,
+    pub assignee_login: Option<String>,
     pub max_concurrent_agents_by_state: HashMap<String, usize>,
 }
 
@@ -132,6 +134,7 @@ struct RawTracker {
     owner: Option<String>,
     repo: Option<String>,
     project_v2_number: Option<IntOrString>,
+    project_url: Option<String>,
     active_states: Vec<String>,
     terminal_states: Vec<String>,
     status_source: Option<FieldSource>,
@@ -168,6 +171,7 @@ struct RawAgent {
     max_concurrent_agents: Option<IntOrString>,
     max_turns: Option<IntOrString>,
     max_retry_backoff_ms: Option<IntOrString>,
+    assignee_login: Option<String>,
     max_concurrent_agents_by_state: HashMap<String, IntOrString>,
 }
 
@@ -206,8 +210,8 @@ impl Settings {
 
         let api_key = resolve_secret(raw.tracker.api_key, &["GITHUB_TOKEN", "GH_TOKEN"])
             .ok_or_else(|| anyhow!("missing_github_api_token"))?;
-        let owner = required_string(raw.tracker.owner, "tracker.owner")?;
-        let repo = raw.tracker.repo.filter(|value| !value.trim().is_empty());
+        let owner = resolve_required_string(raw.tracker.owner, "tracker.owner")?;
+        let repo = resolve_optional_string(raw.tracker.repo);
         let project_v2_number = match raw.tracker.mode {
             GitHubMode::ProjectsV2 => Some(
                 resolve_u32(raw.tracker.project_v2_number, "tracker.project_v2_number")?
@@ -215,6 +219,7 @@ impl Settings {
             ),
             GitHubMode::IssuesOnly => None,
         };
+        let project_url = resolve_optional_string(raw.tracker.project_url);
 
         if raw.tracker.mode == GitHubMode::IssuesOnly && repo.is_none() {
             return Err(anyhow!("missing_github_repo"));
@@ -321,6 +326,7 @@ impl Settings {
                 owner,
                 repo,
                 project_v2_number,
+                project_url,
                 active_states: if raw.tracker.active_states.is_empty() {
                     vec!["Todo".to_string(), "In Progress".to_string()]
                 } else {
@@ -357,6 +363,8 @@ impl Settings {
                 max_concurrent_agents,
                 max_turns,
                 max_retry_backoff_ms,
+                assignee_login: resolve_optional_string(raw.agent.assignee_login)
+                    .map(|value| value.to_lowercase()),
                 max_concurrent_agents_by_state: state_limits,
             },
             codex,
@@ -365,9 +373,35 @@ impl Settings {
 
     pub fn workflow_prompt(&self, workflow: &WorkflowDefinition) -> String {
         if workflow.prompt_template.trim().is_empty() {
-            "You are working on a GitHub issue.\n\nIdentifier: {{ issue.identifier }}\nTitle: {{ issue.title }}\n\nBody:\n{% if issue.description %}\n{{ issue.description }}\n{% else %}\nNo description provided.\n{% endif %}\n".to_string()
+            "You are working on a GitHub issue.\n\n{% if tracker.dashboard_url %}GitHub dashboard: {{ tracker.dashboard_url }}\n\n{% endif %}Identifier: {{ issue.identifier }}\nTitle: {{ issue.title }}\n\nBody:\n{% if issue.description %}\n{{ issue.description }}\n{% else %}\nNo description provided.\n{% endif %}\n".to_string()
         } else {
             workflow.prompt_template.clone()
+        }
+    }
+
+    pub fn tracker_dashboard_url(&self) -> Option<String> {
+        if let Some(project_url) = self
+            .tracker
+            .project_url
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return Some(project_url.to_string());
+        }
+
+        match self.tracker.mode {
+            GitHubMode::ProjectsV2 => self.tracker.project_v2_number.map(|project_number| {
+                format!(
+                    "https://github.com/users/{}/projects/{}",
+                    self.tracker.owner, project_number
+                )
+            }),
+            GitHubMode::IssuesOnly => self
+                .tracker
+                .repo
+                .as_ref()
+                .map(|repo| format!("https://github.com/{}/{repo}/issues", self.tracker.owner)),
         }
     }
 
@@ -430,11 +464,9 @@ pub fn normalize_issue_state(state: &str) -> String {
     state.trim().to_lowercase()
 }
 
-fn required_string(value: Option<String>, field_name: &str) -> Result<String> {
-    match value {
-        Some(value) if !value.trim().is_empty() => Ok(value),
-        _ => Err(anyhow!("invalid_workflow_config: {field_name} is required")),
-    }
+fn resolve_required_string(raw: Option<String>, field_name: &str) -> Result<String> {
+    resolve_optional_string(raw)
+        .ok_or_else(|| anyhow!("invalid_workflow_config: {field_name} is required"))
 }
 
 fn resolve_secret(raw: Option<String>, fallback_envs: &[&str]) -> Option<String> {
@@ -493,12 +525,33 @@ fn resolve_u64(value: Option<IntOrString>, default: u64, field_name: &str) -> Re
 fn resolve_optional_u64(value: Option<IntOrString>, field_name: &str) -> Result<Option<u64>> {
     match value {
         Some(IntOrString::Int(value)) => Ok(Some(value)),
-        Some(IntOrString::String(value)) => value
-            .trim()
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|_| anyhow!("invalid_workflow_config: {field_name} must be an integer")),
+        Some(IntOrString::String(value)) => {
+            let trimmed = value.trim();
+            let resolved = if let Some(env_name) = trimmed.strip_prefix('$') {
+                env::var(env_name)
+                    .with_context(|| format!("environment variable ${env_name} is not set"))?
+            } else {
+                trimmed.to_string()
+            };
+
+            resolved
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| anyhow!("invalid_workflow_config: {field_name} must be an integer"))
+        }
         None => Ok(None),
+    }
+}
+
+fn resolve_optional_string(raw: Option<String>) -> Option<String> {
+    match raw {
+        Some(value) if value.starts_with('$') && !value.contains('/') => {
+            env::var(value.trim_start_matches('$'))
+                .ok()
+                .filter(|resolved| !resolved.trim().is_empty())
+        }
+        Some(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
     }
 }
 
@@ -542,6 +595,54 @@ tracker:
     }
 
     #[test]
+    fn resolves_env_backed_owner_and_repo() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        env::set_var("SYMPHONY_GITHUB_OWNER", "openai");
+        env::set_var("SYMPHONY_GITHUB_REPO", "symphony");
+
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: $SYMPHONY_GITHUB_OWNER
+  repo: $SYMPHONY_GITHUB_REPO
+  project_v2_number: 7
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(settings.tracker.owner, "openai");
+        assert_eq!(settings.tracker.repo.as_deref(), Some("symphony"));
+    }
+
+    #[test]
+    fn resolves_env_backed_agent_assignee_login() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        env::set_var("SYMPHONY_AGENT_ASSIGNEE", "Codex-Bot");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+agent:
+  assignee_login: $SYMPHONY_AGENT_ASSIGNEE
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(settings.agent.assignee_login.as_deref(), Some("codex-bot"));
+    }
+
+    #[test]
     fn normalizes_states_for_lookup() {
         assert_eq!(normalize_issue_state(" In Progress "), "in progress");
     }
@@ -566,7 +667,10 @@ tracker:
         let policy = settings.turn_sandbox_policy(Path::new("/tmp/workspace"));
 
         assert_eq!(policy["type"], "workspaceWrite");
-        assert_eq!(policy["writableRoots"], serde_json::json!(["/tmp/workspace"]));
+        assert_eq!(
+            policy["writableRoots"],
+            serde_json::json!(["/tmp/workspace"])
+        );
     }
 
     #[test]
@@ -594,7 +698,10 @@ codex:
 
         assert_eq!(policy["type"], "workspaceWrite");
         assert_eq!(policy["networkAccess"], serde_json::json!(true));
-        assert_eq!(policy["writableRoots"], serde_json::json!(["/tmp/workspace"]));
+        assert_eq!(
+            policy["writableRoots"],
+            serde_json::json!(["/tmp/workspace"])
+        );
     }
 
     #[test]
@@ -622,7 +729,44 @@ codex:
         let settings = Settings::from_workflow(&definition).unwrap();
         let policy = settings.turn_sandbox_policy(Path::new("/tmp/workspace"));
 
-        assert_eq!(policy["writableRoots"], serde_json::json!(["relative/path"]));
+        assert_eq!(
+            policy["writableRoots"],
+            serde_json::json!(["relative/path"])
+        );
         assert_eq!(policy["networkAccess"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn resolves_env_backed_project_number_and_dashboard_url() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        env::set_var("SYMPHONY_PROJECT_NUMBER", "19");
+        env::set_var(
+            "SYMPHONY_PROJECT_URL",
+            "https://github.com/users/dbachko/projects/19",
+        );
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: dbachko
+  project_v2_number: $SYMPHONY_PROJECT_NUMBER
+  project_url: $SYMPHONY_PROJECT_URL
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(settings.tracker.project_v2_number, Some(19));
+        assert_eq!(
+            settings.tracker.project_url.as_deref(),
+            Some("https://github.com/users/dbachko/projects/19")
+        );
+        assert_eq!(
+            settings.tracker_dashboard_url().as_deref(),
+            Some("https://github.com/users/dbachko/projects/19")
+        );
     }
 }

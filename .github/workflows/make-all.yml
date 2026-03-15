@@ -7,32 +7,25 @@ on:
       - main
 
 jobs:
-  make-all:
+  rust-checks:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: elixir
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up mise tools
-        uses: jdx/mise-action@v3
-        with:
-          install: true
-          cache: true
-          working_directory: elixir
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache deps and build
-        uses: actions/cache@v4
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            elixir/deps
-            elixir/_build
-          key: ${{ runner.os }}-mix-${{ hashFiles('elixir/mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-
+          workspaces: rust -> target
 
-      - name: Verify make all
-        run: make all
+      - name: Check formatting
+        working-directory: rust
+        run: cargo fmt --check
+
+      - name: Run tests
+        working-directory: rust
+        run: cargo test
