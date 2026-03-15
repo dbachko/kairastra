@@ -566,7 +566,10 @@ tracker:
         let policy = settings.turn_sandbox_policy(Path::new("/tmp/workspace"));
 
         assert_eq!(policy["type"], "workspaceWrite");
-        assert_eq!(policy["writableRoots"], serde_json::json!(["/tmp/workspace"]));
+        assert_eq!(
+            policy["writableRoots"],
+            serde_json::json!(["/tmp/workspace"])
+        );
     }
 
     #[test]
@@ -594,7 +597,10 @@ codex:
 
         assert_eq!(policy["type"], "workspaceWrite");
         assert_eq!(policy["networkAccess"], serde_json::json!(true));
-        assert_eq!(policy["writableRoots"], serde_json::json!(["/tmp/workspace"]));
+        assert_eq!(
+            policy["writableRoots"],
+            serde_json::json!(["/tmp/workspace"])
+        );
     }
 
     #[test]
@@ -622,7 +628,10 @@ codex:
         let settings = Settings::from_workflow(&definition).unwrap();
         let policy = settings.turn_sandbox_policy(Path::new("/tmp/workspace"));
 
-        assert_eq!(policy["writableRoots"], serde_json::json!(["relative/path"]));
+        assert_eq!(
+            policy["writableRoots"],
+            serde_json::json!(["relative/path"])
+        );
         assert_eq!(policy["networkAccess"], serde_json::json!(true));
     }
 }
