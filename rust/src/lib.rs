@@ -5,5 +5,6 @@ pub mod model;
 pub mod orchestrator;
 pub mod prompt;
 pub mod runner;
+pub mod webhook;
 pub mod workflow;
 pub mod workspace;

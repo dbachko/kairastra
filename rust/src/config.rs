@@ -18,11 +18,13 @@ const DEFAULT_CODEX_COMMAND: &str = "codex app-server";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_TURN_TIMEOUT_MS: u64 = 3_600_000;
 const DEFAULT_STALL_TIMEOUT_MS: u64 = 300_000;
+const DEFAULT_WEBHOOK_PATH: &str = "/github/webhook";
 
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub tracker: TrackerSettings,
     pub polling: PollingSettings,
+    pub webhooks: WebhookSettings,
     pub workspace: WorkspaceSettings,
     pub hooks: HookSettings,
     pub agent: AgentSettings,
@@ -49,6 +51,13 @@ pub struct TrackerSettings {
 #[derive(Debug, Clone)]
 pub struct PollingSettings {
     pub interval_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebhookSettings {
+    pub listen: Option<String>,
+    pub path: String,
+    pub secret: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +128,7 @@ pub struct FieldSource {
 struct RawSettings {
     tracker: RawTracker,
     polling: RawPolling,
+    webhooks: RawWebhooks,
     workspace: RawWorkspace,
     hooks: RawHooks,
     agent: RawAgent,
@@ -147,6 +157,14 @@ struct RawTracker {
 #[serde(default)]
 struct RawPolling {
     interval_ms: Option<IntOrString>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct RawWebhooks {
+    listen: Option<String>,
+    path: Option<String>,
+    secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -232,6 +250,16 @@ impl Settings {
                 "polling.interval_ms",
             )?,
         };
+
+        let webhook_listen = resolve_optional_string(raw.webhooks.listen);
+        let webhook_secret = resolve_secret(raw.webhooks.secret, &["GITHUB_WEBHOOK_SECRET"]);
+        if webhook_listen.is_some() && webhook_secret.is_none() {
+            return Err(anyhow!(
+                "invalid_workflow_config: webhooks.secret or GITHUB_WEBHOOK_SECRET is required when webhooks.listen is set"
+            ));
+        }
+        let webhook_path = resolve_optional_string(raw.webhooks.path)
+            .unwrap_or_else(|| DEFAULT_WEBHOOK_PATH.to_string());
 
         let workspace_root = match raw.workspace.root {
             Some(root) => expand_path(&root)?,
@@ -355,6 +383,11 @@ impl Settings {
                     .unwrap_or_else(|| "https://api.github.com".to_string()),
             },
             polling,
+            webhooks: WebhookSettings {
+                listen: webhook_listen,
+                path: webhook_path,
+                secret: webhook_secret,
+            },
             workspace: WorkspaceSettings {
                 root: workspace_root,
             },
@@ -768,5 +801,31 @@ tracker:
             settings.tracker_dashboard_url().as_deref(),
             Some("https://github.com/users/dbachko/projects/19")
         );
+    }
+
+    #[test]
+    fn resolves_env_backed_webhook_secret() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        env::set_var("GITHUB_WEBHOOK_SECRET", "webhook-secret");
+
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: dbachko
+  project_v2_number: 7
+webhooks:
+  listen: 127.0.0.1:8787
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(settings.webhooks.listen.as_deref(), Some("127.0.0.1:8787"));
+        assert_eq!(settings.webhooks.secret.as_deref(), Some("webhook-secret"));
+        assert_eq!(settings.webhooks.path, "/github/webhook");
     }
 }

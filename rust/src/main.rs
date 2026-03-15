@@ -3,11 +3,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
+use tokio::sync::Notify;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use symphony_rust::github::GitHubTracker;
 use symphony_rust::orchestrator::Orchestrator;
+use symphony_rust::webhook;
 use symphony_rust::workflow::{default_workflow_path, WorkflowStore};
 
 #[derive(Debug, Parser)]
@@ -45,14 +47,20 @@ async fn main() -> Result<()> {
     } else {
         warn!("no GitHub dashboard URL configured; falling back to tracker-only polling");
     }
+    let wake_signal = Arc::new(Notify::new());
     let tracker = Arc::new(GitHubTracker::new(snapshot.settings.tracker.clone())?);
-    let orchestrator = Orchestrator::new(workflow_store, tracker);
+    let webhook_server = webhook::spawn(&snapshot.settings.webhooks, wake_signal.clone()).await?;
+    let orchestrator = Orchestrator::new(workflow_store, tracker, wake_signal);
 
-    if cli.once {
-        orchestrator.run_once().await?;
+    let orchestration = if cli.once {
+        orchestrator.run_once().await
     } else {
-        orchestrator.run().await?;
+        orchestrator.run().await
+    };
+
+    if let Some(server) = webhook_server {
+        server.abort();
     }
 
-    Ok(())
+    orchestration
 }

@@ -16,7 +16,8 @@ GitHub Issues and Projects v2, following [`SPEC.md`](../SPEC.md) and the GitHub 
   `newConversation -> addConversationListener -> sendUserTurn` fallback for older local Codex
   runtimes, including legacy sandbox-policy translation and injected `GITHUB_TOKEN` / `GH_TOKEN`
   env vars so GitHub mutations still work through `gh`.
-- Polling orchestrator with in-memory claims, reconciliation, continuation retries, and exponential backoff retries.
+- Webhook-first orchestrator wakeups with slow fallback polling, in-memory claims, reconciliation,
+  continuation retries, and exponential backoff retries.
 
 ## Run
 
@@ -113,6 +114,12 @@ tracker:
   priority_source:
     type: project_field
     name: Priority
+polling:
+  interval_ms: 60000
+webhooks:
+  listen: $SYMPHONY_WEBHOOK_LISTEN
+  path: $SYMPHONY_WEBHOOK_PATH
+  secret: $GITHUB_WEBHOOK_SECRET
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:
@@ -168,6 +175,8 @@ Important distinction:
 - GitHub dynamic tools are limited to `github_graphql` and a small `github_rest` allow-list.
 - `tracker.project_url` is optional but recommended when you want the prompt/runtime to surface the exact GitHub Project dashboard URL, especially for org-owned projects where the canonical URL cannot be derived locally.
 - The checked-in [WORKFLOW.md](../WORKFLOW.md) is a generic GitHub Projects workflow. Parameterize it with `SYMPHONY_GITHUB_OWNER`, `SYMPHONY_GITHUB_REPO`, `SYMPHONY_GITHUB_PROJECT_NUMBER`, `SYMPHONY_GITHUB_PROJECT_URL`, and `SYMPHONY_GIT_CLONE_URL`.
+- Set `SYMPHONY_WEBHOOK_LISTEN` and `GITHUB_WEBHOOK_SECRET` to enable the built-in GitHub webhook listener. It verifies `X-Hub-Signature-256`, accepts key issue/PR/check/Project events, and wakes the orchestrator immediately.
+- Keep `polling.interval_ms` relatively slow when webhooks are enabled. Polling remains the fallback reconciliation path, especially for user-owned Projects v2 where a webhook-only design is not reliable.
 - When both `SYMPHONY_GIT_CLONE_URL` and `SYMPHONY_SEED_REPO` are set, Symphony clones the canonical remote history first and then overlays the local seed contents on top. That preserves a merge base with `origin/main` while still letting workers start from a dirty local checkout for live testing.
 - The checked-in workflow assumes a review handoff model with `Todo`, `In Progress`, `Human Review`, `Merging`, `Rework`, and `Done` statuses, while only `Todo`, `In Progress`, `Merging`, and `Rework` are active dispatch states.
 - Runtime-owned review handoff keeps issues in `In Progress` until a PR exists, the workpad is reconciled beyond bootstrap state, and GitHub Actions / required PR checks are green.

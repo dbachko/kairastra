@@ -25,7 +25,11 @@ tracker:
     - Duplicate
     - Done
 polling:
-  interval_ms: 5000
+  interval_ms: 60000
+webhooks:
+  listen: $SYMPHONY_WEBHOOK_LISTEN
+  path: $SYMPHONY_WEBHOOK_PATH
+  secret: $GITHUB_WEBHOOK_SECRET
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:

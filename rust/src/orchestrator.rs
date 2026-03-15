@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::{mpsc::unbounded_channel, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
@@ -24,6 +24,7 @@ const FAILURE_RETRY_BASE_MS: u64 = 10_000;
 pub struct Orchestrator {
     workflow_store: Arc<WorkflowStore>,
     tracker: Arc<GitHubTracker>,
+    wake_signal: Arc<Notify>,
 }
 
 struct RuntimeState {
@@ -48,10 +49,15 @@ struct RetryEntry {
 }
 
 impl Orchestrator {
-    pub fn new(workflow_store: Arc<WorkflowStore>, tracker: Arc<GitHubTracker>) -> Self {
+    pub fn new(
+        workflow_store: Arc<WorkflowStore>,
+        tracker: Arc<GitHubTracker>,
+        wake_signal: Arc<Notify>,
+    ) -> Self {
         Self {
             workflow_store,
             tracker,
+            wake_signal,
         }
     }
 
@@ -130,6 +136,12 @@ impl Orchestrator {
                 _ = sleep(poll_interval) => {
                     if let Err(error) = self.poll_tick(&snapshot, &mut state, &worker_tx).await {
                         log_runtime_error("poll tick", &error);
+                    }
+                }
+                _ = self.wake_signal.notified() => {
+                    info!("received webhook wake signal; polling tracker immediately");
+                    if let Err(error) = self.poll_tick(&snapshot, &mut state, &worker_tx).await {
+                        log_runtime_error("webhook wake poll", &error);
                     }
                 }
             }
