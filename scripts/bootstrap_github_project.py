@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.parse
+from dataclasses import dataclass
+from typing import Any
+
+
+STATUS_OPTIONS = [
+    {
+        "name": "Backlog",
+        "color": "GRAY",
+        "description": "Out of scope until moved into the active queue.",
+    },
+    {
+        "name": "Todo",
+        "color": "BLUE",
+        "description": "Queued for Symphony to pick up.",
+    },
+    {
+        "name": "In Progress",
+        "color": "YELLOW",
+        "description": "Actively being worked by Symphony.",
+    },
+    {
+        "name": "Human Review",
+        "color": "PURPLE",
+        "description": "Waiting for human review or approval.",
+    },
+    {
+        "name": "Merging",
+        "color": "PINK",
+        "description": "Approved and ready for landing.",
+    },
+    {
+        "name": "Rework",
+        "color": "ORANGE",
+        "description": "Changes requested and work needs another pass.",
+    },
+    {
+        "name": "Done",
+        "color": "GREEN",
+        "description": "Completed and landed.",
+    },
+    {
+        "name": "Cancelled",
+        "color": "RED",
+        "description": "Stopped intentionally without completion.",
+    },
+    {
+        "name": "Duplicate",
+        "color": "GRAY",
+        "description": "Superseded by another issue.",
+    },
+]
+
+DEFAULT_LABELS = [
+    {
+        "name": "symphony",
+        "color": "5319e7",
+        "description": "Tracked by the Symphony orchestration workflow.",
+    },
+    {
+        "name": "agent:codex",
+        "color": "1f6feb",
+        "description": "Assigned to Codex-driven automation.",
+    },
+    {
+        "name": "blocked",
+        "color": "d73a4a",
+        "description": "Blocked on another task, dependency, or external input.",
+    },
+    {
+        "name": "needs-review",
+        "color": "fbca04",
+        "description": "Ready for human review.",
+    },
+    {
+        "name": "rework",
+        "color": "e99695",
+        "description": "Needs another implementation pass.",
+    },
+]
+
+
+@dataclass
+class Action:
+    summary: str
+    changed: bool
+
+
+class BootstrapError(RuntimeError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Bootstrap a GitHub Project and repo for Symphony orchestration."
+    )
+    parser.add_argument(
+        "--owner",
+        default=os.getenv("SYMPHONY_GITHUB_OWNER"),
+        help="GitHub user or org that owns the Project.",
+    )
+    parser.add_argument(
+        "--repo",
+        default=os.getenv("SYMPHONY_GITHUB_REPO"),
+        help="GitHub repository name for issue labels.",
+    )
+    parser.add_argument(
+        "--project-number",
+        type=int,
+        default=_env_int("SYMPHONY_GITHUB_PROJECT_NUMBER"),
+        help="GitHub Project v2 number.",
+    )
+    parser.add_argument(
+        "--priority-field-name",
+        default="Priority",
+        help="Project field name to ensure for numeric prioritization.",
+    )
+    parser.add_argument(
+        "--skip-labels",
+        action="store_true",
+        help="Do not create or update the default Symphony label pack.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned changes without mutating GitHub.",
+    )
+    args = parser.parse_args()
+
+    missing = [
+        name
+        for name, value in (
+            ("--owner / SYMPHONY_GITHUB_OWNER", args.owner),
+            ("--repo / SYMPHONY_GITHUB_REPO", args.repo),
+            ("--project-number / SYMPHONY_GITHUB_PROJECT_NUMBER", args.project_number),
+        )
+        if not value
+    ]
+    if missing:
+        parser.error(f"missing required settings: {', '.join(missing)}")
+
+    return args
+
+
+def _env_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise BootstrapError(f"{name} must be an integer, got {value!r}") from exc
+
+
+def run_json(command: list[str], payload: dict[str, Any] | None = None) -> Any:
+    result = subprocess.run(
+        command,
+        input=json.dumps(payload) if payload is not None else None,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        raise BootstrapError(
+            f"command failed ({' '.join(command)}): {stderr or result.stdout.strip()}"
+        )
+    stdout = result.stdout.strip()
+    return json.loads(stdout) if stdout else None
+
+
+def run(command: list[str]) -> None:
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        raise BootstrapError(
+            f"command failed ({' '.join(command)}): {stderr or result.stdout.strip()}"
+        )
+
+
+def gh_graphql(query: str, variables: dict[str, Any] | None = None) -> Any:
+    return run_json(
+        ["gh", "api", "graphql", "--input", "-"],
+        {"query": query, "variables": variables or {}},
+    )
+
+
+def load_project(project_number: int, owner: str) -> dict[str, Any]:
+    return run_json(
+        ["gh", "project", "view", str(project_number), "--owner", owner, "--format", "json"]
+    )
+
+
+def load_fields(project_number: int, owner: str) -> list[dict[str, Any]]:
+    payload = run_json(
+        ["gh", "project", "field-list", str(project_number), "--owner", owner, "--format", "json"]
+    )
+    return payload.get("fields", [])
+
+
+def ensure_status_field(
+    *,
+    owner: str,
+    project_number: int,
+    fields: list[dict[str, Any]],
+    dry_run: bool,
+) -> Action:
+    desired_names = [option["name"] for option in STATUS_OPTIONS]
+    status_field = next((field for field in fields if field.get("name") == "Status"), None)
+
+    if status_field is None:
+        summary = f"create project Status field with options: {', '.join(desired_names)}"
+        if not dry_run:
+            run(
+                [
+                    "gh",
+                    "project",
+                    "field-create",
+                    str(project_number),
+                    "--owner",
+                    owner,
+                    "--name",
+                    "Status",
+                    "--data-type",
+                    "SINGLE_SELECT",
+                    "--single-select-options",
+                    ",".join(desired_names),
+                ]
+            )
+        return Action(summary, True)
+
+    current_names = [option.get("name") for option in status_field.get("options", [])]
+    if current_names == desired_names:
+        return Action("Status field already matches the Symphony workflow states.", False)
+
+    summary = (
+        "update Status field options from "
+        f"{current_names!r} to {desired_names!r}"
+    )
+    if not dry_run:
+        gh_graphql(
+            """
+            mutation UpdateProjectField($fieldId: ID!, $name: String!, $options: [ProjectV2SingleSelectFieldOptionInput!]) {
+              updateProjectV2Field(
+                input: {
+                  fieldId: $fieldId
+                  name: $name
+                  singleSelectOptions: $options
+                }
+              ) {
+                projectV2Field {
+                  ... on ProjectV2SingleSelectField {
+                    id
+                    name
+                  }
+                }
+              }
+            }
+            """,
+            {
+                "fieldId": status_field["id"],
+                "name": "Status",
+                "options": STATUS_OPTIONS,
+            },
+        )
+    return Action(summary, True)
+
+
+def ensure_priority_field(
+    *,
+    owner: str,
+    project_number: int,
+    field_name: str,
+    fields: list[dict[str, Any]],
+    dry_run: bool,
+) -> Action:
+    if any(field.get("name") == field_name for field in fields):
+        return Action(f"{field_name} field already exists.", False)
+
+    summary = f"create numeric project field {field_name!r}"
+    if not dry_run:
+        run(
+            [
+                "gh",
+                "project",
+                "field-create",
+                str(project_number),
+                "--owner",
+                owner,
+                "--name",
+                field_name,
+                "--data-type",
+                "NUMBER",
+            ]
+        )
+    return Action(summary, True)
+
+
+def list_labels(owner: str, repo: str) -> dict[str, dict[str, Any]]:
+    page = 1
+    labels: dict[str, dict[str, Any]] = {}
+    while True:
+        response = run_json(
+            [
+                "gh",
+                "api",
+                f"repos/{owner}/{repo}/labels?per_page=100&page={page}",
+            ]
+        )
+        if not response:
+            break
+        for label in response:
+            labels[label["name"].lower()] = label
+        page += 1
+    return labels
+
+
+def ensure_labels(owner: str, repo: str, dry_run: bool) -> list[Action]:
+    existing = list_labels(owner, repo)
+    actions: list[Action] = []
+
+    for label in DEFAULT_LABELS:
+        current = existing.get(label["name"].lower())
+        if current is None:
+            summary = f"create repo label {label['name']!r}"
+            if not dry_run:
+                run(
+                    [
+                        "gh",
+                        "api",
+                        f"repos/{owner}/{repo}/labels",
+                        "--method",
+                        "POST",
+                        "-f",
+                        f"name={label['name']}",
+                        "-f",
+                        f"color={label['color']}",
+                        "-f",
+                        f"description={label['description']}",
+                    ]
+                )
+            actions.append(Action(summary, True))
+            continue
+
+        current_color = current.get("color", "").lower()
+        current_description = current.get("description") or ""
+        if current_color == label["color"].lower() and current_description == label["description"]:
+            actions.append(Action(f"label {label['name']!r} already matches.", False))
+            continue
+
+        summary = f"update repo label {label['name']!r}"
+        if not dry_run:
+            encoded_name = urllib.parse.quote(label["name"], safe="")
+            run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{owner}/{repo}/labels/{encoded_name}",
+                    "--method",
+                    "PATCH",
+                    "-f",
+                    f"new_name={label['name']}",
+                    "-f",
+                    f"color={label['color']}",
+                    "-f",
+                    f"description={label['description']}",
+                ]
+            )
+        actions.append(Action(summary, True))
+
+    return actions
+
+
+def main() -> int:
+    args = parse_args()
+
+    project = load_project(args.project_number, args.owner)
+    fields = load_fields(args.project_number, args.owner)
+
+    actions = [
+        ensure_status_field(
+            owner=args.owner,
+            project_number=args.project_number,
+            fields=fields,
+            dry_run=args.dry_run,
+        ),
+        ensure_priority_field(
+            owner=args.owner,
+            project_number=args.project_number,
+            field_name=args.priority_field_name,
+            fields=fields,
+            dry_run=args.dry_run,
+        ),
+    ]
+
+    if not args.skip_labels:
+        actions.extend(ensure_labels(args.owner, args.repo, args.dry_run))
+
+    changed = [action.summary for action in actions if action.changed]
+    unchanged = [action.summary for action in actions if not action.changed]
+
+    print(f"Project: {project['title']} ({args.owner}#{args.project_number})")
+    print(f"Repository: {args.owner}/{args.repo}")
+    print(f"Mode: {'dry-run' if args.dry_run else 'apply'}")
+    print()
+
+    if changed:
+        print("Changes:")
+        for summary in changed:
+            print(f"- {summary}")
+    else:
+        print("Changes:")
+        print("- none")
+
+    if unchanged:
+        print()
+        print("Already satisfied:")
+        for summary in unchanged:
+            print(f"- {summary}")
+
+    print()
+    print(
+        "Recommended Project status options: "
+        + ", ".join(option["name"] for option in STATUS_OPTIONS)
+    )
+    print(
+        "Dispatchable workflow states stay narrower: Todo, In Progress, Merging, Rework."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BootstrapError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)

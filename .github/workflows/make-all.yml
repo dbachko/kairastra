@@ -1,0 +1,31 @@
+name: make-all
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust-checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+
+      - name: Check formatting
+        working-directory: rust
+        run: cargo fmt --check
+
+      - name: Run tests
+        working-directory: rust
+        run: cargo test
