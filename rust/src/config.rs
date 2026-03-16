@@ -77,6 +77,9 @@ pub struct AgentSettings {
 #[derive(Debug, Clone)]
 pub struct CodexSettings {
     pub command: String,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub fast: Option<bool>,
     pub approval_policy: JsonValue,
     pub thread_sandbox: String,
     pub turn_sandbox_policy: Option<JsonValue>,
@@ -179,6 +182,9 @@ struct RawAgent {
 #[serde(default)]
 struct RawCodex {
     command: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    fast: Option<BoolOrString>,
     approval_policy: Option<JsonValue>,
     thread_sandbox: Option<String>,
     turn_sandbox_policy: Option<JsonValue>,
@@ -191,6 +197,13 @@ struct RawCodex {
 #[serde(untagged)]
 enum IntOrString {
     Int(u64),
+    String(String),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum BoolOrString {
+    Bool(bool),
     String(String),
 }
 
@@ -271,11 +284,19 @@ impl Settings {
             }
         }
 
+        let reasoning_effort = resolve_optional_string(raw.codex.reasoning_effort);
+        if let Some(value) = reasoning_effort.as_deref() {
+            validate_reasoning_effort(value)?;
+        }
+
         let codex = CodexSettings {
             command: raw
                 .codex
                 .command
                 .unwrap_or_else(|| DEFAULT_CODEX_COMMAND.to_string()),
+            model: resolve_optional_string(raw.codex.model),
+            reasoning_effort,
+            fast: resolve_optional_bool(raw.codex.fast, "codex.fast")?,
             approval_policy: raw
                 .codex
                 .approval_policy
@@ -555,6 +576,40 @@ fn resolve_optional_string(raw: Option<String>) -> Option<String> {
     }
 }
 
+fn resolve_optional_bool(value: Option<BoolOrString>, field_name: &str) -> Result<Option<bool>> {
+    match value {
+        Some(BoolOrString::Bool(value)) => Ok(Some(value)),
+        Some(BoolOrString::String(value)) => {
+            let trimmed = value.trim();
+            let resolved = if let Some(env_name) = trimmed.strip_prefix('$') {
+                env::var(env_name)
+                    .with_context(|| format!("environment variable ${env_name} is not set"))?
+            } else {
+                trimmed.to_string()
+            };
+            let normalized = resolved.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "" => Ok(None),
+                "true" | "1" | "yes" | "on" => Ok(Some(true)),
+                "false" | "0" | "no" | "off" => Ok(Some(false)),
+                _ => Err(anyhow!(
+                    "invalid_workflow_config: {field_name} must be a boolean"
+                )),
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn validate_reasoning_effort(value: &str) -> Result<()> {
+    match value {
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(()),
+        _ => Err(anyhow!(
+            "invalid_workflow_config: codex.reasoning_effort must be one of none, minimal, low, medium, high, xhigh"
+        )),
+    }
+}
+
 fn default_approval_policy() -> JsonValue {
     json!({
         "reject": {
@@ -640,6 +695,75 @@ agent:
 
         let settings = Settings::from_workflow(&definition).unwrap();
         assert_eq!(settings.agent.assignee_login.as_deref(), Some("codex-bot"));
+    }
+
+    #[test]
+    fn resolves_env_backed_codex_model() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        env::set_var("SYMPHONY_CODEX_MODEL", "gpt-5.4");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+codex:
+  model: $SYMPHONY_CODEX_MODEL
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(settings.codex.model.as_deref(), Some("gpt-5.4"));
+    }
+
+    #[test]
+    fn resolves_env_backed_codex_reasoning_effort() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        env::set_var("SYMPHONY_CODEX_REASONING_EFFORT", "high");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+codex:
+  reasoning_effort: $SYMPHONY_CODEX_REASONING_EFFORT
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(settings.codex.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn resolves_env_backed_codex_fast_flag() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        env::set_var("SYMPHONY_CODEX_FAST", "true");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+codex:
+  fast: $SYMPHONY_CODEX_FAST
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(settings.codex.fast, Some(true));
     }
 
     #[test]

@@ -100,6 +100,13 @@ pub async fn run_issue(
             drop(forward_tx);
             let _ = forwarder.await;
 
+            // Codex may have updated the persistent workpad comment during the turn.
+            // Refresh it before adding Symphony's runtime section so we never clobber
+            // the latest plan/checklist content with a stale bootstrap copy.
+            if current_issue.workpad_comment_id.is_some() {
+                current_issue = tracker.refresh_workpad_comment(&current_issue).await?;
+            }
+
             let branch = current_branch(&workspace.path).await?;
             let open_pr = if let (Some((owner, repo)), Some(branch)) =
                 (issue_repo(&current_issue), branch.as_deref())

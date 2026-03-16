@@ -13,7 +13,7 @@ FROM node:20-bookworm-slim AS runtime
 ARG CODEX_CLI_VERSION=0.114.0
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates docker-compose docker.io gcc gh git libc6-dev make pkg-config \
+    && apt-get install -y --no-install-recommends bash ca-certificates docker-compose docker.io gcc gh git libc6-dev make openssh-client pkg-config rsync \
     && npm install -g "@openai/codex@${CODEX_CLI_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
@@ -32,3 +32,4 @@ ENV RUST_LOG=info
 ENV SYMPHONY_WORKSPACE_ROOT=/workspaces
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["run"]

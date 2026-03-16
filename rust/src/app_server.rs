@@ -20,15 +20,8 @@ use crate::model::Issue;
 const INITIALIZE_ID: u64 = 1;
 const THREAD_START_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;
-const LEGACY_LISTENER_ID: u64 = 4;
 const NON_INTERACTIVE_TOOL_INPUT_ANSWER: &str =
     "This is a non-interactive session. Operator input is unavailable.";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppServerProtocol {
-    V2,
-    LegacyV1,
-}
 
 #[derive(Debug, Clone)]
 pub struct AppServerEvent {
@@ -69,9 +62,7 @@ pub struct AppServerSession {
     child: Child,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
-    protocol: AppServerProtocol,
     thread_id: String,
-    model: Option<String>,
     workspace: PathBuf,
     auto_approve_requests: bool,
     approval_policy: JsonValue,
@@ -128,9 +119,7 @@ impl AppServerSession {
             child,
             stdin,
             stdout: BufReader::new(stdout).lines(),
-            protocol: AppServerProtocol::V2,
             thread_id: String::new(),
-            model: None,
             workspace: workspace_path,
             auto_approve_requests,
             approval_policy,
@@ -139,20 +128,7 @@ impl AppServerSession {
         };
 
         session.send_initialize(settings).await?;
-        match session.start_thread(settings).await {
-            Ok(thread_id) => {
-                session.protocol = AppServerProtocol::V2;
-                session.thread_id = thread_id;
-            }
-            Err(error) if should_fallback_to_legacy_protocol(&error) => {
-                debug!(error = ?error, "falling back to legacy Codex app-server protocol");
-                let (conversation_id, model) = session.start_legacy_thread(settings).await?;
-                session.protocol = AppServerProtocol::LegacyV1;
-                session.thread_id = conversation_id;
-                session.model = Some(model);
-            }
-            Err(error) => return Err(error),
-        }
+        session.thread_id = session.start_thread(settings).await?;
         Ok(session)
     }
 
@@ -167,14 +143,11 @@ impl AppServerSession {
         prompt: &str,
         on_event: &UnboundedSender<AppServerEvent>,
     ) -> Result<TurnResult> {
-        let turn_id = self.start_turn(issue, prompt).await?;
-
-        if let Some(turn_id) = turn_id.as_ref() {
-            emit_session_started(on_event, self.process_id(), &self.thread_id, turn_id);
-        }
+        let turn_id = self.start_turn(settings, issue, prompt).await?;
+        emit_session_started(on_event, self.process_id(), &self.thread_id, &turn_id);
 
         let turn_id = self
-            .await_turn_completion(settings, turn_id, on_event)
+            .await_turn_completion(settings, Some(turn_id), on_event)
             .await?;
         let session_id = format!("{}-{turn_id}", self.thread_id);
 
@@ -235,6 +208,8 @@ impl AppServerSession {
                 "sandbox": settings.codex.thread_sandbox,
                 "cwd": self.workspace.to_string_lossy(),
                 "dynamicTools": dynamic_tool_specs(),
+                "model": settings.codex.model,
+                "serviceTier": service_tier(&settings.codex),
             }
         }))
         .await?;
@@ -250,62 +225,12 @@ impl AppServerSession {
             .ok_or_else(|| anyhow!("invalid_thread_payload"))
     }
 
-    async fn start_legacy_thread(&mut self, settings: &Settings) -> Result<(String, String)> {
-        self.write_message(json!({
-            "method": "newConversation",
-            "id": THREAD_START_ID,
-            "params": {
-                "cwd": self.workspace.to_string_lossy(),
-                "approvalPolicy": legacy_approval_policy(&self.approval_policy),
-                "sandboxPolicy": legacy_sandbox_policy(&self.turn_sandbox_policy),
-                "dynamicTools": dynamic_tool_specs(),
-                "includePlanTool": false,
-                "includeApplyPatchTool": true,
-            }
-        }))
-        .await?;
-
-        let payload = self
-            .await_response(THREAD_START_ID, settings.codex.read_timeout_ms)
-            .await?;
-        let conversation_id = payload
-            .get("conversationId")
-            .and_then(JsonValue::as_str)
-            .map(ToString::to_string)
-            .ok_or_else(|| anyhow!("invalid_legacy_conversation_payload"))?;
-        let model = payload
-            .get("model")
-            .and_then(JsonValue::as_str)
-            .map(ToString::to_string)
-            .ok_or_else(|| anyhow!("invalid_legacy_model_payload"))?;
-
-        self.write_message(json!({
-            "method": "addConversationListener",
-            "id": LEGACY_LISTENER_ID,
-            "params": {
-                "conversationId": conversation_id,
-                "experimentalRawEvents": true,
-            }
-        }))
-        .await?;
-        let _ = self
-            .await_response(LEGACY_LISTENER_ID, settings.codex.read_timeout_ms)
-            .await?;
-
-        Ok((conversation_id, model))
-    }
-
-    async fn start_turn(&mut self, issue: &Issue, prompt: &str) -> Result<Option<String>> {
-        match self.protocol {
-            AppServerProtocol::V2 => self.start_turn_v2(issue, prompt).await.map(Some),
-            AppServerProtocol::LegacyV1 => {
-                self.start_turn_legacy(prompt).await?;
-                Ok(None)
-            }
-        }
-    }
-
-    async fn start_turn_v2(&mut self, issue: &Issue, prompt: &str) -> Result<String> {
+    async fn start_turn(
+        &mut self,
+        settings: &Settings,
+        issue: &Issue,
+        prompt: &str,
+    ) -> Result<String> {
         self.write_message(json!({
             "method": "turn/start",
             "id": TURN_START_ID,
@@ -321,6 +246,9 @@ impl AppServerSession {
                 "title": format!("{}: {}", issue.identifier, issue.title),
                 "approvalPolicy": self.approval_policy,
                 "sandboxPolicy": self.turn_sandbox_policy,
+                "model": settings.codex.model,
+                "effort": settings.codex.reasoning_effort,
+                "serviceTier": service_tier(&settings.codex),
             }
         }))
         .await?;
@@ -332,38 +260,6 @@ impl AppServerSession {
             .and_then(JsonValue::as_str)
             .map(ToString::to_string)
             .ok_or_else(|| anyhow!("invalid_turn_payload"))
-    }
-
-    async fn start_turn_legacy(&mut self, prompt: &str) -> Result<()> {
-        let model = self
-            .model
-            .clone()
-            .ok_or_else(|| anyhow!("missing_legacy_conversation_model"))?;
-
-        self.write_message(json!({
-            "method": "sendUserTurn",
-            "id": TURN_START_ID,
-            "params": {
-                "conversationId": self.thread_id,
-                "items": [
-                    {
-                        "type": "text",
-                        "data": {
-                            "text": prompt
-                        }
-                    }
-                ],
-                "cwd": self.workspace.to_string_lossy(),
-                "approvalPolicy": legacy_approval_policy(&self.approval_policy),
-                "sandboxPolicy": legacy_sandbox_policy(&self.turn_sandbox_policy),
-                "model": model,
-                "summary": "auto",
-            }
-        }))
-        .await?;
-
-        let _ = self.await_response(TURN_START_ID, 10_000).await?;
-        Ok(())
     }
 
     async fn await_response(&mut self, expected_id: u64, timeout_ms: u64) -> Result<JsonValue> {
@@ -408,8 +304,7 @@ impl AppServerSession {
     ) -> Result<String> {
         let turn_started = Instant::now();
         let mut last_event_at = Instant::now();
-        let mut turn_id = initial_turn_id;
-        let mut session_started_emitted = turn_id.is_some();
+        let turn_id = initial_turn_id;
 
         loop {
             if settings.codex.turn_timeout_ms > 0
@@ -486,71 +381,6 @@ impl AppServerSession {
             };
 
             match method {
-                "codex/event/task_started" => {
-                    if turn_id.is_none() {
-                        turn_id = extract_legacy_turn_id(&payload);
-                    }
-                    if !session_started_emitted {
-                        let resolved_turn_id =
-                            turn_id.clone().unwrap_or_else(|| "legacy-turn".to_string());
-                        emit_session_started(
-                            on_event,
-                            self.process_id(),
-                            &self.thread_id,
-                            &resolved_turn_id,
-                        );
-                        session_started_emitted = true;
-                    }
-
-                    let session_id = turn_id
-                        .as_ref()
-                        .map(|value| format!("{}-{value}", self.thread_id));
-                    let _ = on_event.send(AppServerEvent {
-                        event: AppServerEventKind::Notification,
-                        timestamp: now,
-                        payload,
-                        session_id,
-                        codex_app_server_pid: self.process_id().map(|value| value.to_string()),
-                    });
-                }
-                "codex/event/task_complete" => {
-                    let resolved_turn_id = turn_id
-                        .clone()
-                        .or_else(|| extract_legacy_turn_id(&payload))
-                        .unwrap_or_else(|| "legacy-turn".to_string());
-                    if !session_started_emitted {
-                        emit_session_started(
-                            on_event,
-                            self.process_id(),
-                            &self.thread_id,
-                            &resolved_turn_id,
-                        );
-                    }
-                    let session_id = format!("{}-{resolved_turn_id}", self.thread_id);
-                    let _ = on_event.send(AppServerEvent {
-                        event: AppServerEventKind::TurnCompleted,
-                        timestamp: now,
-                        payload,
-                        session_id: Some(session_id),
-                        codex_app_server_pid: self.process_id().map(|value| value.to_string()),
-                    });
-                    return Ok(resolved_turn_id);
-                }
-                "codex/event/error" => {
-                    let resolved_turn_id = turn_id
-                        .clone()
-                        .or_else(|| extract_legacy_turn_id(&payload))
-                        .unwrap_or_else(|| "legacy-turn".to_string());
-                    let session_id = format!("{}-{resolved_turn_id}", self.thread_id);
-                    let _ = on_event.send(AppServerEvent {
-                        event: AppServerEventKind::TurnFailed,
-                        timestamp: now,
-                        payload: payload.clone(),
-                        session_id: Some(session_id),
-                        codex_app_server_pid: self.process_id().map(|value| value.to_string()),
-                    });
-                    return Err(anyhow!("turn_failed: {}", payload));
-                }
                 "turn/completed" => {
                     let resolved_turn_id = turn_id
                         .clone()
@@ -864,11 +694,93 @@ fn validate_workspace_cwd(root: &Path, workspace: &Path) -> Result<()> {
     Ok(())
 }
 
+fn service_tier(codex: &crate::config::CodexSettings) -> Option<&'static str> {
+    match codex.fast {
+        Some(true) => Some("fast"),
+        Some(false) => Some("flex"),
+        None => None,
+    }
+}
+
 async fn log_stderr(stderr: ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        warn!(line, "codex stderr");
+        let sanitized = strip_ansi_sequences(&line);
+        let trimmed = sanitized.trim();
+        if trimmed.is_empty() || is_noisy_codex_stderr(trimmed) {
+            debug!(line = trimmed, "codex stderr");
+            continue;
+        }
+
+        if looks_like_error(trimmed) {
+            warn!(line = trimmed, "codex stderr");
+        } else {
+            debug!(line = trimmed, "codex stderr");
+        }
     }
+}
+
+fn is_noisy_codex_stderr(line: &str) -> bool {
+    line.contains("codex_otel.")
+        || line.contains("event.name=")
+        || line.contains("session_loop")
+        || line.contains("submission_dispatch")
+        || line.contains("turn.id=")
+        || line.contains("conversation.id=")
+        || line.contains("app.version=")
+        || line.contains("tool_name=")
+        || line.contains("codex_core::file_watcher")
+        || line.contains("codex_core::analytics_client: events failed with status 403 Forbidden")
+        || line.contains("No watch was found")
+        || line.contains("channel closed")
+        || line.contains("processor task exited")
+        || line.contains("outbound router task exited")
+        || line.contains("stdout writer exited")
+        || line.starts_with("Wall time:")
+        || line.starts_with("Process exited with code")
+        || line.starts_with("Original token count:")
+        || line == "Output:"
+}
+
+fn looks_like_error(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains(" error")
+        || lower.starts_with("error")
+        || lower.contains(" failed")
+        || lower.contains(" failure")
+        || lower.contains("panic")
+        || lower.contains("fatal")
+        || lower.contains("denied")
+        || lower.contains("exception")
+        || lower.contains("timed out")
+}
+
+fn strip_ansi_sequences(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == 0x1b {
+            index += 1;
+            if index < bytes.len() && bytes[index] == b'[' {
+                index += 1;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if (byte as char).is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        output.push(bytes[index] as char);
+        index += 1;
+    }
+
+    output
 }
 
 fn emit_session_started(
@@ -893,78 +805,6 @@ fn emit_session_started(
 
 fn current_session_id(thread_id: &str, turn_id: Option<&str>) -> Option<String> {
     turn_id.map(|turn_id| format!("{thread_id}-{turn_id}"))
-}
-
-fn should_fallback_to_legacy_protocol(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("unknown variant `thread/start`")
-        || message.contains("unknown variant 'thread/start'")
-        || message.contains("unknown method `thread/start`")
-        || message.contains("Method not found")
-}
-
-fn extract_legacy_turn_id(payload: &JsonValue) -> Option<String> {
-    payload
-        .get("params")
-        .and_then(|params| params.get("id"))
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-}
-
-fn legacy_approval_policy(approval_policy: &JsonValue) -> JsonValue {
-    approval_policy.clone()
-}
-
-fn legacy_sandbox_policy(turn_sandbox_policy: &JsonValue) -> JsonValue {
-    let Some(policy_type) = turn_sandbox_policy.get("type").and_then(JsonValue::as_str) else {
-        return json!({
-            "mode": "workspace-write"
-        });
-    };
-
-    match policy_type {
-        "workspaceWrite" => {
-            let mut policy =
-                serde_json::Map::from_iter([("mode".to_string(), json!("workspace-write"))]);
-            if let Some(network_access) = turn_sandbox_policy.get("networkAccess") {
-                policy.insert("network_access".to_string(), network_access.clone());
-            }
-            if let Some(read_only_access) = turn_sandbox_policy.get("readOnlyAccess") {
-                policy.insert("read_only_access".to_string(), read_only_access.clone());
-            }
-            if let Some(writable_roots) = turn_sandbox_policy.get("writableRoots") {
-                policy.insert("writable_roots".to_string(), writable_roots.clone());
-            }
-            JsonValue::Object(policy)
-        }
-        "readOnly" => {
-            let mut policy = serde_json::Map::from_iter([("mode".to_string(), json!("read-only"))]);
-            if let Some(network_access) = turn_sandbox_policy.get("networkAccess") {
-                policy.insert("network_access".to_string(), network_access.clone());
-            }
-            if let Some(access) = turn_sandbox_policy
-                .get("access")
-                .or_else(|| turn_sandbox_policy.get("readOnlyAccess"))
-            {
-                policy.insert("access".to_string(), access.clone());
-            }
-            JsonValue::Object(policy)
-        }
-        "dangerFullAccess" => json!({
-            "mode": "danger-full-access"
-        }),
-        "externalSandbox" => {
-            let mut policy =
-                serde_json::Map::from_iter([("mode".to_string(), json!("danger-full-access"))]);
-            if let Some(network_access) = turn_sandbox_policy.get("networkAccess") {
-                policy.insert("network_access".to_string(), network_access.clone());
-            }
-            JsonValue::Object(policy)
-        }
-        other => json!({
-            "mode": other
-        }),
-    }
 }
 
 fn needs_input(method: &str, payload: &JsonValue) -> bool {
@@ -1121,7 +961,6 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    use serde_json::json;
     use tempfile::tempdir;
     use tokio::sync::mpsc::unbounded_channel;
     use wiremock::matchers::{body_string_contains, method, path};
@@ -1364,7 +1203,10 @@ done
             &workspace_root,
             &script.display().to_string(),
             "",
-            "  approval_policy: never",
+            r#"  approval_policy: never
+  model: gpt-5.4
+  reasoning_effort: high
+  fast: true"#,
         );
         let tracker = tracker(&settings);
         let mut session = AppServerSession::start(&settings, tracker, &workspace)
@@ -1380,104 +1222,41 @@ done
 
         let trace = fs::read_to_string(trace_file).unwrap();
         assert!(trace.contains(r#""decision":"acceptForSession""#));
-    }
-
-    #[tokio::test]
-    async fn falls_back_to_legacy_protocol_when_thread_start_is_unsupported() {
-        let dir = tempdir().unwrap();
-        let workspace_root = dir.path().join("workspaces");
-        let workspace = workspace_root.join("ISSUE-LEGACY");
-        fs::create_dir_all(&workspace).unwrap();
-        let trace_file = dir.path().join("legacy.trace");
-
-        let script = dir.path().join("legacy-codex.sh");
-        fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-trace_file='{}'
-printf 'GITHUB_TOKEN=%s\n' "$GITHUB_TOKEN" >> "$trace_file"
-printf 'GH_TOKEN=%s\n' "$GH_TOKEN" >> "$trace_file"
-count=0
-while IFS= read -r line; do
-  count=$((count + 1))
-  printf '%s\n' "$line" >> "$trace_file"
-  case "$count" in
-    1) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
-    2) printf '%s\n' '{{"id":2,"error":{{"code":-32600,"message":"Invalid request: unknown variant `thread/start`, expected `newConversation`"}}}}' ;;
-    4) printf '%s\n' '{{"id":2,"result":{{"conversationId":"conversation-1","model":"gpt-5.4","reasoningEffort":"high","rolloutPath":"/tmp/rollout.jsonl"}}}}' ;;
-    5) printf '%s\n' '{{"id":4,"result":{{"subscriptionId":"sub-1"}}}}' ;;
-    6)
-      printf '%s\n' '{{"id":3,"result":{{}}}}'
-      printf '%s\n' '{{"method":"codex/event/task_started","params":{{"id":"0","conversationId":"conversation-1","msg":{{"type":"task_started"}}}}}}'
-      printf '%s\n' '{{"method":"codex/event/task_complete","params":{{"id":"0","conversationId":"conversation-1","msg":{{"type":"task_complete","last_agent_message":"done"}}}}}}'
-      ;;
-  esac
-done
-"#,
-                trace_file.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&script, perms).unwrap();
-        }
-
-        let settings =
-            settings_with_command(&workspace_root, &script.display().to_string(), "", "");
-        let tracker = tracker(&settings);
-        let mut session = AppServerSession::start(&settings, tracker, &workspace)
-            .await
-            .unwrap();
-        let (tx, mut rx) = unbounded_channel();
-
-        let result = session
-            .run_turn(&settings, &issue("ISSUE-LEGACY"), "prompt", &tx)
-            .await
-            .unwrap();
-
-        assert_eq!(result.thread_id, "conversation-1");
-        assert_eq!(result.turn_id, "0");
-        assert_eq!(result.session_id, "conversation-1-0");
-
-        let trace = fs::read_to_string(trace_file).unwrap();
-        assert!(trace.contains(r#""method":"newConversation""#));
-        assert!(trace.contains(r#""method":"addConversationListener""#));
-        assert!(trace.contains(r#""method":"sendUserTurn""#));
-        assert!(trace.contains(r#""summary":"auto""#));
+        assert!(trace.contains(r#""method":"thread/start""#));
+        assert!(trace.contains(r#""method":"turn/start""#));
         assert!(trace.contains(r#""model":"gpt-5.4""#));
-        assert!(trace.contains("GITHUB_TOKEN=fake"));
-        assert!(trace.contains("GH_TOKEN=fake"));
-
-        let mut saw_session_started = false;
-        let mut saw_turn_completed = false;
-        while let Ok(event) = rx.try_recv() {
-            if matches!(event.event, AppServerEventKind::SessionStarted) {
-                saw_session_started = true;
-            }
-            if matches!(event.event, AppServerEventKind::TurnCompleted) {
-                saw_turn_completed = true;
-            }
-        }
-        assert!(saw_session_started);
-        assert!(saw_turn_completed);
+        assert!(trace.contains(r#""effort":"high""#));
+        assert!(trace.contains(r#""serviceTier":"fast""#));
     }
 
     #[test]
-    fn legacy_workspace_write_sandbox_policy_preserves_network_access() {
-        let policy = super::legacy_sandbox_policy(&json!({
-            "type": "workspaceWrite",
-            "networkAccess": true,
-            "writableRoots": ["/tmp/workspace"],
-        }));
+    fn strips_ansi_sequences_from_stderr_lines() {
+        let line = "\u{1b}[2m2026-03-16T00:00:00Z\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m boom";
+        assert_eq!(
+            super::strip_ansi_sequences(line),
+            "2026-03-16T00:00:00Z ERROR boom"
+        );
+    }
 
-        assert_eq!(policy["mode"], "workspace-write");
-        assert_eq!(policy["network_access"], json!(true));
-        assert_eq!(policy["writable_roots"], json!(["/tmp/workspace"]));
+    #[test]
+    fn filters_codex_telemetry_noise() {
+        assert!(super::is_noisy_codex_stderr(
+            "INFO codex_otel.log_only: event.name=codex.tool_result app.version=0.114.0"
+        ));
+        assert!(super::is_noisy_codex_stderr("Wall time: 0.0000 seconds"));
+        assert!(super::is_noisy_codex_stderr(
+            "WARN codex_core::file_watcher: failed to unwatch /root/.codex/skills/.system: No watch was found."
+        ));
+        assert!(super::is_noisy_codex_stderr(
+            "WARN codex_core::analytics_client: events failed with status 403 Forbidden: <!DOCTYPE html><html><title>Just a moment...</title>"
+        ));
+    }
+
+    #[test]
+    fn detects_error_like_stderr_lines() {
+        assert!(super::looks_like_error("Error: invalid_workflow_config"));
+        assert!(super::looks_like_error("permission denied"));
+        assert!(!super::looks_like_error("origin /seed-repo (fetch)"));
     }
 
     #[tokio::test]

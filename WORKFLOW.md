@@ -53,6 +53,72 @@ hooks:
       fi
     }
 
+    github_https_url() {
+      remote_url="$1"
+      case "$remote_url" in
+        git@github.com:*)
+          printf 'https://github.com/%s\n' "${remote_url#git@github.com:}"
+          ;;
+        ssh://git@github.com/*)
+          printf 'https://github.com/%s\n' "${remote_url#ssh://git@github.com/}"
+          ;;
+        *)
+          printf '%s\n' "$remote_url"
+          ;;
+      esac
+    }
+
+    configure_github_auth() {
+      if [ -z "${GITHUB_TOKEN:-}" ]; then
+        return 0
+      fi
+
+      origin_url="$(git config --get remote.origin.url || true)"
+      normalized_origin_url="$(github_https_url "$origin_url")"
+      if [ -n "$normalized_origin_url" ] && [ "$normalized_origin_url" != "$origin_url" ]; then
+        git remote set-url origin "$normalized_origin_url"
+      fi
+
+      push_url="$(git config --get remote.origin.pushurl || true)"
+      normalized_push_url="$(github_https_url "$push_url")"
+      if [ -n "$normalized_push_url" ] && [ "$normalized_push_url" != "$push_url" ]; then
+        git remote set-url --push origin "$normalized_push_url"
+      fi
+
+      auth_header="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+      git config http.https://github.com/.extraheader "Authorization: Basic ${auth_header}"
+    }
+
+    restore_support_dir_from_seed() {
+      support_dir="$1"
+      if [ -e "$support_dir" ]; then
+        return 0
+      fi
+      if [ -n "${SYMPHONY_SEED_REPO:-}" ] && [ -e "$SYMPHONY_SEED_REPO/$support_dir" ]; then
+        cp -R "$SYMPHONY_SEED_REPO/$support_dir" "$support_dir"
+      fi
+    }
+
+    require_workspace_support_dirs() {
+      for support_dir in .codex .github; do
+        restore_support_dir_from_seed "$support_dir"
+        if [ ! -e "$support_dir" ]; then
+          echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
+          exit 1
+        fi
+      done
+    }
+
+    adopt_seed_repo_origin() {
+      if [ -z "${SYMPHONY_SEED_REPO:-}" ] || [ ! -d "$SYMPHONY_SEED_REPO/.git" ]; then
+        return 0
+      fi
+      source_remote="$(git -C "$SYMPHONY_SEED_REPO" config --get remote.origin.url || true)"
+      if [ -n "$source_remote" ]; then
+        git remote set-url origin "$source_remote"
+      fi
+    }
+
     if [ -n "${SYMPHONY_GIT_CLONE_URL:-}" ]; then
       clone_with_auth "$SYMPHONY_GIT_CLONE_URL"
       if [ -n "${SYMPHONY_SEED_REPO:-}" ] && [ -d "$SYMPHONY_SEED_REPO" ]; then
@@ -60,19 +126,92 @@ hooks:
       fi
     elif [ -n "${SYMPHONY_SEED_REPO:-}" ] && [ -d "$SYMPHONY_SEED_REPO/.git" ]; then
       git clone "$SYMPHONY_SEED_REPO" .
+      adopt_seed_repo_origin
     else
       echo "Set SYMPHONY_GIT_CLONE_URL, or point SYMPHONY_SEED_REPO at a git checkout, before running Symphony." >&2
       exit 1
     fi
 
     if [ -n "${SYMPHONY_GIT_PUSH_URL:-}" ]; then
-      git remote set-url origin "$SYMPHONY_GIT_PUSH_URL"
+      git remote set-url --push origin "$SYMPHONY_GIT_PUSH_URL"
     fi
+
+    require_workspace_support_dirs
+    configure_github_auth
 
     if git rev-parse --verify origin/main >/dev/null 2>&1 && ! git merge-base HEAD origin/main >/dev/null 2>&1; then
       echo "Workspace history does not share a merge base with origin/main. Configure SYMPHONY_GIT_CLONE_URL to the canonical remote and use SYMPHONY_SEED_REPO only as an overlay." >&2
       exit 1
     fi
+
+    git config user.name "${SYMPHONY_GIT_AUTHOR_NAME:-Symphony}"
+    git config user.email "${SYMPHONY_GIT_AUTHOR_EMAIL:-symphony@users.noreply.github.com}"
+  before_run: |
+    set -euo pipefail
+
+    restore_support_dir_from_seed() {
+      support_dir="$1"
+      if [ -e "$support_dir" ]; then
+        return 0
+      fi
+      if [ -n "${SYMPHONY_SEED_REPO:-}" ] && [ -e "$SYMPHONY_SEED_REPO/$support_dir" ]; then
+        cp -R "$SYMPHONY_SEED_REPO/$support_dir" "$support_dir"
+      fi
+    }
+
+    require_workspace_support_dirs() {
+      for support_dir in .codex .github; do
+        restore_support_dir_from_seed "$support_dir"
+        if [ ! -e "$support_dir" ]; then
+          echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
+          exit 1
+        fi
+      done
+    }
+
+    github_https_url() {
+      remote_url="$1"
+      case "$remote_url" in
+        git@github.com:*)
+          printf 'https://github.com/%s\n' "${remote_url#git@github.com:}"
+          ;;
+        ssh://git@github.com/*)
+          printf 'https://github.com/%s\n' "${remote_url#ssh://git@github.com/}"
+          ;;
+        *)
+          printf '%s\n' "$remote_url"
+          ;;
+      esac
+    }
+
+    configure_github_auth() {
+      if [ -z "${GITHUB_TOKEN:-}" ]; then
+        return 0
+      fi
+
+      origin_url="$(git config --get remote.origin.url || true)"
+      normalized_origin_url="$(github_https_url "$origin_url")"
+      if [ -n "$normalized_origin_url" ] && [ "$normalized_origin_url" != "$origin_url" ]; then
+        git remote set-url origin "$normalized_origin_url"
+      fi
+
+      push_url="$(git config --get remote.origin.pushurl || true)"
+      normalized_push_url="$(github_https_url "$push_url")"
+      if [ -n "$normalized_push_url" ] && [ "$normalized_push_url" != "$push_url" ]; then
+        git remote set-url --push origin "$normalized_push_url"
+      fi
+
+      auth_header="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+      git config http.https://github.com/.extraheader "Authorization: Basic ${auth_header}"
+    }
+
+    require_workspace_support_dirs
+
+    if [ -n "${SYMPHONY_GIT_PUSH_URL:-}" ]; then
+      git remote set-url --push origin "$SYMPHONY_GIT_PUSH_URL"
+    fi
+
+    configure_github_auth
 
     git config user.name "${SYMPHONY_GIT_AUTHOR_NAME:-Symphony}"
     git config user.email "${SYMPHONY_GIT_AUTHOR_EMAIL:-symphony@users.noreply.github.com}"

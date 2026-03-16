@@ -19,4 +19,4 @@ docker-logs:
 	$(DOCKER_COMPOSE) logs -f $(SERVICE)
 
 docker-login:
-	$(DOCKER_COMPOSE) exec $(SERVICE) codex login
+	$(DOCKER_COMPOSE) exec $(SERVICE) codex login --device-auth
