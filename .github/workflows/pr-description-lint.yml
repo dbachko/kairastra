@@ -28,13 +28,13 @@ jobs:
           )
 
           for header in "${required_headers[@]}"; do
-            if ! rg -Fq "$header" /tmp/pr_body.md; then
+            if ! grep -Fq "$header" /tmp/pr_body.md; then
               echo "Missing required PR section: $header" >&2
               exit 1
             fi
           done
 
-          if rg -n '<!--|TODO|TBD' /tmp/pr_body.md; then
+          if grep -nE '<!--|TODO|TBD' /tmp/pr_body.md; then
             echo "PR description still contains placeholders" >&2
             exit 1
           fi
