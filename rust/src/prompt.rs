@@ -114,6 +114,8 @@ tracker:
   owner: openai
   project_v2_number: 7
   api_key: fake
+agent:
+  provider: codex
 "#,
             )
             .unwrap(),
@@ -161,6 +163,8 @@ tracker:
   project_v2_number: 7
   project_url: https://github.com/users/dbachko/projects/7
   api_key: fake
+agent:
+  provider: codex
 "#,
             )
             .unwrap(),

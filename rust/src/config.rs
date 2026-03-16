@@ -26,7 +26,7 @@ pub struct Settings {
     pub workspace: WorkspaceSettings,
     pub hooks: HookSettings,
     pub agent: AgentSettings,
-    pub codex: CodexSettings,
+    pub providers: ProviderSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +67,7 @@ pub struct HookSettings {
 
 #[derive(Debug, Clone)]
 pub struct AgentSettings {
+    pub provider: AgentProvider,
     pub max_concurrent_agents: usize,
     pub max_turns: usize,
     pub max_retry_backoff_ms: u64,
@@ -75,7 +76,12 @@ pub struct AgentSettings {
 }
 
 #[derive(Debug, Clone)]
-pub struct CodexSettings {
+pub struct ProviderSettings {
+    pub codex: CodexProviderSettings,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexProviderSettings {
     pub command: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -86,6 +92,24 @@ pub struct CodexSettings {
     pub read_timeout_ms: u64,
     pub turn_timeout_ms: u64,
     pub stall_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProvider {
+    Codex,
+    Claude,
+    Gemini,
+}
+
+impl AgentProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Gemini => "gemini",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -125,7 +149,7 @@ struct RawSettings {
     workspace: RawWorkspace,
     hooks: RawHooks,
     agent: RawAgent,
-    codex: RawCodex,
+    providers: RawProviders,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -171,6 +195,7 @@ struct RawHooks {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 struct RawAgent {
+    provider: Option<String>,
     max_concurrent_agents: Option<IntOrString>,
     max_turns: Option<IntOrString>,
     max_retry_backoff_ms: Option<IntOrString>,
@@ -180,7 +205,13 @@ struct RawAgent {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
-struct RawCodex {
+struct RawProviders {
+    codex: RawCodexProvider,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct RawCodexProvider {
     command: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
@@ -209,6 +240,8 @@ enum BoolOrString {
 
 impl Settings {
     pub fn from_workflow(workflow: &WorkflowDefinition) -> Result<Self> {
+        reject_legacy_codex_block(&workflow.config)?;
+
         let raw = serde_yaml::from_value::<RawSettings>(workflow.config.clone())
             .map_err(|error| anyhow!("invalid_workflow_config: {error}"))?;
 
@@ -272,6 +305,7 @@ impl Settings {
             DEFAULT_MAX_RETRY_BACKOFF_MS,
             "agent.max_retry_backoff_ms",
         )?;
+        let provider = resolve_agent_provider(raw.agent.provider)?;
 
         let mut state_limits = HashMap::new();
         for (state, limit) in raw.agent.max_concurrent_agents_by_state {
@@ -284,41 +318,44 @@ impl Settings {
             }
         }
 
-        let reasoning_effort = resolve_optional_string(raw.codex.reasoning_effort);
+        let reasoning_effort = resolve_optional_string(raw.providers.codex.reasoning_effort);
         if let Some(value) = reasoning_effort.as_deref() {
             validate_reasoning_effort(value)?;
         }
 
-        let codex = CodexSettings {
+        let codex = CodexProviderSettings {
             command: raw
+                .providers
                 .codex
                 .command
                 .unwrap_or_else(|| DEFAULT_CODEX_COMMAND.to_string()),
-            model: resolve_optional_string(raw.codex.model),
+            model: resolve_optional_string(raw.providers.codex.model),
             reasoning_effort,
-            fast: resolve_optional_bool(raw.codex.fast, "codex.fast")?,
+            fast: resolve_optional_bool(raw.providers.codex.fast, "providers.codex.fast")?,
             approval_policy: raw
+                .providers
                 .codex
                 .approval_policy
                 .unwrap_or_else(default_approval_policy),
             thread_sandbox: raw
+                .providers
                 .codex
                 .thread_sandbox
                 .unwrap_or_else(|| "workspace-write".to_string()),
-            turn_sandbox_policy: raw.codex.turn_sandbox_policy,
+            turn_sandbox_policy: raw.providers.codex.turn_sandbox_policy,
             read_timeout_ms: resolve_u64(
-                raw.codex.read_timeout_ms,
+                raw.providers.codex.read_timeout_ms,
                 DEFAULT_READ_TIMEOUT_MS,
-                "codex.read_timeout_ms",
+                "providers.codex.read_timeout_ms",
             )?,
             turn_timeout_ms: resolve_u64(
-                raw.codex.turn_timeout_ms,
+                raw.providers.codex.turn_timeout_ms,
                 DEFAULT_TURN_TIMEOUT_MS,
-                "codex.turn_timeout_ms",
+                "providers.codex.turn_timeout_ms",
             )?,
             stall_timeout_ms: resolve_optional_u64(
-                raw.codex.stall_timeout_ms,
-                "codex.stall_timeout_ms",
+                raw.providers.codex.stall_timeout_ms,
+                "providers.codex.stall_timeout_ms",
             )?
             .unwrap_or(DEFAULT_STALL_TIMEOUT_MS),
         };
@@ -333,9 +370,12 @@ impl Settings {
                 "invalid_workflow_config: agent.max_turns must be > 0"
             ));
         }
+        if provider != AgentProvider::Codex {
+            return Err(anyhow!("unsupported_agent_provider: {}", provider.as_str()));
+        }
         if codex.command.is_empty() {
             return Err(anyhow!(
-                "invalid_workflow_config: codex.command must not be empty"
+                "invalid_workflow_config: providers.codex.command must not be empty"
             ));
         }
 
@@ -381,6 +421,7 @@ impl Settings {
             },
             hooks,
             agent: AgentSettings {
+                provider,
                 max_concurrent_agents,
                 max_turns,
                 max_retry_backoff_ms,
@@ -388,7 +429,7 @@ impl Settings {
                     .map(|value| value.to_lowercase()),
                 max_concurrent_agents_by_state: state_limits,
             },
-            codex,
+            providers: ProviderSettings { codex },
         })
     }
 
@@ -453,7 +494,7 @@ impl Settings {
     pub fn turn_sandbox_policy(&self, workspace: &Path) -> JsonValue {
         let workspace_root = workspace.to_string_lossy().to_string();
 
-        match self.codex.turn_sandbox_policy.clone() {
+        match self.providers.codex.turn_sandbox_policy.clone() {
             Some(mut policy) => {
                 if let Some(object) = policy.as_object_mut() {
                     let is_workspace_write = object
@@ -483,6 +524,28 @@ impl Settings {
 
 pub fn normalize_issue_state(state: &str) -> String {
     state.trim().to_lowercase()
+}
+
+fn reject_legacy_codex_block(config: &serde_yaml::Value) -> Result<()> {
+    if config.get("codex").is_some() {
+        return Err(anyhow!(
+            "invalid_workflow_config: top-level `codex` is no longer supported; use agent.provider plus providers.codex"
+        ));
+    }
+
+    Ok(())
+}
+
+fn resolve_agent_provider(raw: Option<String>) -> Result<AgentProvider> {
+    let value = resolve_required_string(raw, "agent.provider")?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "codex" => Ok(AgentProvider::Codex),
+        "claude" => Ok(AgentProvider::Claude),
+        "gemini" => Ok(AgentProvider::Gemini),
+        _ => Err(anyhow!(
+            "invalid_workflow_config: agent.provider must be one of codex, claude, gemini"
+        )),
+    }
 }
 
 fn resolve_required_string(raw: Option<String>, field_name: &str) -> Result<String> {
@@ -605,7 +668,7 @@ fn validate_reasoning_effort(value: &str) -> Result<()> {
     match value {
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(()),
         _ => Err(anyhow!(
-            "invalid_workflow_config: codex.reasoning_effort must be one of none, minimal, low, medium, high, xhigh"
+            "invalid_workflow_config: providers.codex.reasoning_effort must be one of none, minimal, low, medium, high, xhigh"
         )),
     }
 }
@@ -639,6 +702,8 @@ tracker:
   kind: github
   owner: openai
   project_v2_number: 7
+agent:
+  provider: codex
 "#,
             )
             .unwrap(),
@@ -647,6 +712,56 @@ tracker:
 
         let settings = Settings::from_workflow(&definition).unwrap();
         assert_eq!(settings.tracker.api_key, "token-123");
+    }
+
+    #[test]
+    fn rejects_legacy_codex_block() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+agent:
+  provider: codex
+codex:
+  command: codex app-server
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let error = Settings::from_workflow(&definition)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("top-level `codex` is no longer supported"));
+    }
+
+    #[test]
+    fn rejects_unsupported_provider_until_backend_exists() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+agent:
+  provider: claude
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let error = Settings::from_workflow(&definition)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported_agent_provider: claude"));
     }
 
     #[test]
@@ -663,6 +778,8 @@ tracker:
   owner: $SYMPHONY_GITHUB_OWNER
   repo: $SYMPHONY_GITHUB_REPO
   project_v2_number: 7
+agent:
+  provider: codex
 "#,
             )
             .unwrap(),
@@ -686,6 +803,7 @@ tracker:
   owner: openai
   project_v2_number: 7
 agent:
+  provider: codex
   assignee_login: $SYMPHONY_AGENT_ASSIGNEE
 "#,
             )
@@ -708,8 +826,11 @@ tracker:
   kind: github
   owner: openai
   project_v2_number: 7
-codex:
-  model: $SYMPHONY_CODEX_MODEL
+agent:
+  provider: codex
+providers:
+  codex:
+    model: $SYMPHONY_CODEX_MODEL
 "#,
             )
             .unwrap(),
@@ -717,7 +838,7 @@ codex:
         };
 
         let settings = Settings::from_workflow(&definition).unwrap();
-        assert_eq!(settings.codex.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(settings.providers.codex.model.as_deref(), Some("gpt-5.4"));
     }
 
     #[test]
@@ -731,8 +852,11 @@ tracker:
   kind: github
   owner: openai
   project_v2_number: 7
-codex:
-  reasoning_effort: $SYMPHONY_CODEX_REASONING_EFFORT
+agent:
+  provider: codex
+providers:
+  codex:
+    reasoning_effort: $SYMPHONY_CODEX_REASONING_EFFORT
 "#,
             )
             .unwrap(),
@@ -740,7 +864,10 @@ codex:
         };
 
         let settings = Settings::from_workflow(&definition).unwrap();
-        assert_eq!(settings.codex.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            settings.providers.codex.reasoning_effort.as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
@@ -754,8 +881,11 @@ tracker:
   kind: github
   owner: openai
   project_v2_number: 7
-codex:
-  fast: $SYMPHONY_CODEX_FAST
+agent:
+  provider: codex
+providers:
+  codex:
+    fast: $SYMPHONY_CODEX_FAST
 "#,
             )
             .unwrap(),
@@ -763,7 +893,7 @@ codex:
         };
 
         let settings = Settings::from_workflow(&definition).unwrap();
-        assert_eq!(settings.codex.fast, Some(true));
+        assert_eq!(settings.providers.codex.fast, Some(true));
     }
 
     #[test]
@@ -781,6 +911,8 @@ tracker:
   kind: github
   owner: openai
   project_v2_number: 7
+agent:
+  provider: codex
 "#,
             )
             .unwrap(),
@@ -807,10 +939,13 @@ tracker:
   kind: github
   owner: openai
   project_v2_number: 7
-codex:
-  turn_sandbox_policy:
-    type: workspaceWrite
-    networkAccess: true
+agent:
+  provider: codex
+providers:
+  codex:
+    turn_sandbox_policy:
+      type: workspaceWrite
+      networkAccess: true
 "#,
             )
             .unwrap(),
@@ -838,12 +973,15 @@ tracker:
   kind: github
   owner: openai
   project_v2_number: 7
-codex:
-  turn_sandbox_policy:
-    type: workspaceWrite
-    writableRoots:
-      - relative/path
-    networkAccess: true
+agent:
+  provider: codex
+providers:
+  codex:
+    turn_sandbox_policy:
+      type: workspaceWrite
+      writableRoots:
+        - relative/path
+      networkAccess: true
 "#,
             )
             .unwrap(),
@@ -876,6 +1014,8 @@ tracker:
   owner: dbachko
   project_v2_number: $SYMPHONY_PROJECT_NUMBER
   project_url: $SYMPHONY_PROJECT_URL
+agent:
+  provider: codex
 "#,
             )
             .unwrap(),

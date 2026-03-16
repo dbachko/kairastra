@@ -1492,8 +1492,13 @@ mod tests {
     use super::{is_rate_limited_error, GitHubTracker, PullRequestChecksState, Tracker};
 
     fn settings(yaml: &str) -> Settings {
+        let yaml = if yaml.contains("\nagent:") || yaml.starts_with("agent:") {
+            yaml.to_string()
+        } else {
+            format!("{yaml}\nagent:\n  provider: codex\n")
+        };
         let definition = WorkflowDefinition {
-            config: serde_yaml::from_str(yaml).unwrap(),
+            config: serde_yaml::from_str(&yaml).unwrap(),
             prompt_template: String::new(),
         };
         Settings::from_workflow(&definition).unwrap()

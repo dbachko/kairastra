@@ -6,7 +6,7 @@ use chrono::Utc;
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app_server::{AppServerEvent, AppServerSession};
+use crate::agent::{self, AgentEvent};
 use crate::github::{GitHubTracker, OpenPullRequest, PullRequestChecksSummary, Tracker};
 use crate::model::Issue;
 use crate::prompt::{build_prompt, continuation_prompt};
@@ -28,7 +28,7 @@ pub enum WorkerMessage {
     },
     AppEvent {
         issue_id: String,
-        event: AppServerEvent,
+        event: AgentEvent,
     },
     Finished {
         issue_id: String,
@@ -60,7 +60,7 @@ pub async fn run_issue(
 
     let result = async {
         let mut session =
-            AppServerSession::start(&snapshot.settings, tracker.clone(), &workspace.path).await?;
+            agent::start_session(&snapshot.settings, tracker.clone(), &workspace.path).await?;
 
         let mut current_issue = issue.clone();
         let workpad_body = render_workpad_bootstrap(&workspace.path, &current_issue).await?;
@@ -79,7 +79,7 @@ pub async fn run_issue(
                 )
             };
 
-            let event_forwarder = tokio::sync::mpsc::unbounded_channel::<AppServerEvent>();
+            let event_forwarder = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
             let forward_tx = event_forwarder.0;
             let mut forward_rx = event_forwarder.1;
             let turn_tx = event_tx.clone();

@@ -809,18 +809,20 @@ hooks:
     git config user.name "${{SYMPHONY_GIT_AUTHOR_NAME:-Symphony}}"
     git config user.email "${{SYMPHONY_GIT_AUTHOR_EMAIL:-symphony@users.noreply.github.com}}"
 agent:
+  provider: codex
   max_concurrent_agents: {max_concurrent_agents}
   max_turns: {max_turns}
-{assignee_line}codex:
-  command: codex app-server
-  model: $SYMPHONY_CODEX_MODEL
-  reasoning_effort: $SYMPHONY_CODEX_REASONING_EFFORT
-  fast: $SYMPHONY_CODEX_FAST
-  approval_policy: never
-  thread_sandbox: workspace-write
-  turn_sandbox_policy:
-    type: workspaceWrite
-    networkAccess: true
+{assignee_line}providers:
+  codex:
+    command: codex app-server
+    model: $SYMPHONY_CODEX_MODEL
+    reasoning_effort: $SYMPHONY_CODEX_REASONING_EFFORT
+    fast: $SYMPHONY_CODEX_FAST
+    approval_policy: never
+    thread_sandbox: workspace-write
+    turn_sandbox_policy:
+      type: workspaceWrite
+      networkAccess: true
 ---
 
 You are working on GitHub issue `{{{{ issue.identifier }}}}`.
@@ -995,7 +997,9 @@ mod tests {
     fn workflow_template_uses_env_placeholders() {
         let rendered = render_workflow(&sample_values());
         assert!(rendered.contains("owner: $SYMPHONY_GITHUB_OWNER"));
+        assert!(rendered.contains("provider: codex"));
         assert!(rendered.contains("assignee_login: $SYMPHONY_AGENT_ASSIGNEE"));
+        assert!(rendered.contains("providers:"));
         assert!(rendered.contains("model: $SYMPHONY_CODEX_MODEL"));
         assert!(rendered.contains("reasoning_effort: $SYMPHONY_CODEX_REASONING_EFFORT"));
         assert!(rendered.contains("fast: $SYMPHONY_CODEX_FAST"));
