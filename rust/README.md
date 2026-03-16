@@ -8,7 +8,8 @@ GitHub Issues and Projects v2, following [`SPEC.md`](../SPEC.md) and the GitHub 
 
 - `WORKFLOW.md` loader with YAML front matter, prompt body parsing, and last-known-good reload behavior.
 - Typed runtime config for `tracker.kind: github`.
-- GitHub tracker adapter with `projects_v2` as the primary mode and `issues_only` as a fallback.
+- GitHub tracker adapter with organization-owned `projects_v2` as the primary mode and
+  `issues_only` as a fallback.
 - GitHub Project dashboard URL support via `tracker.project_url` and derived fallback URLs.
 - Per-issue workspace creation, deterministic workspace keys, and lifecycle hooks.
 - Liquid prompt rendering.
@@ -16,7 +17,7 @@ GitHub Issues and Projects v2, following [`SPEC.md`](../SPEC.md) and the GitHub 
   `newConversation -> addConversationListener -> sendUserTurn` fallback for older local Codex
   runtimes, including legacy sandbox-policy translation and injected `GITHUB_TOKEN` / `GH_TOKEN`
   env vars so GitHub mutations still work through `gh`.
-- Webhook-first orchestrator wakeups with slow fallback polling, in-memory claims, reconciliation,
+- Webhook-first orchestrator wakeups with slow recovery polling, in-memory claims, reconciliation,
   continuation retries, and exponential backoff retries.
 
 ## Run
@@ -102,8 +103,11 @@ tracker:
   kind: github
   api_key: $GITHUB_TOKEN
   mode: projects_v2
+  # Canonical deployment uses an organization login.
   owner: $SYMPHONY_GITHUB_OWNER
+  # Repository webhooks should be installed for this repository.
   repo: $SYMPHONY_GITHUB_REPO
+  # Canonical deployment uses an organization-owned Project v2.
   project_v2_number: $SYMPHONY_GITHUB_PROJECT_NUMBER
   project_url: $SYMPHONY_GITHUB_PROJECT_URL
   active_states: ["Todo", "In Progress", "Merging", "Rework"]
@@ -117,6 +121,7 @@ tracker:
 polling:
   interval_ms: 60000
 webhooks:
+  # Repo and org webhooks can share the same listener endpoint.
   listen: $SYMPHONY_WEBHOOK_LISTEN
   path: $SYMPHONY_WEBHOOK_PATH
   secret: $GITHUB_WEBHOOK_SECRET
@@ -158,6 +163,10 @@ The script expects these env vars, or equivalent CLI flags:
 - `SYMPHONY_GITHUB_REPO`
 - `SYMPHONY_GITHUB_PROJECT_NUMBER`
 
+The canonical target is an organization-owned Project v2. User-owned Projects may work as a
+compatibility path, but the webhook-first model in this branch assumes organization webhooks for
+Project events.
+
 What it ensures:
 
 - Project `Status` options: `Backlog`, `Todo`, `In Progress`, `Human Review`, `Merging`, `Rework`, `Done`, `Cancelled`, `Duplicate`
@@ -173,10 +182,13 @@ Important distinction:
 
 - The current code targets local workers only.
 - GitHub dynamic tools are limited to `github_graphql` and a small `github_rest` allow-list.
-- `tracker.project_url` is optional but recommended when you want the prompt/runtime to surface the exact GitHub Project dashboard URL, especially for org-owned projects where the canonical URL cannot be derived locally.
+- `tracker.project_url` is optional but recommended when you want the prompt/runtime to surface the exact GitHub Project dashboard URL, especially for organization-owned projects where the canonical URL cannot be derived locally.
 - The checked-in [WORKFLOW.md](../WORKFLOW.md) is a generic GitHub Projects workflow. Parameterize it with `SYMPHONY_GITHUB_OWNER`, `SYMPHONY_GITHUB_REPO`, `SYMPHONY_GITHUB_PROJECT_NUMBER`, `SYMPHONY_GITHUB_PROJECT_URL`, and `SYMPHONY_GIT_CLONE_URL`.
 - Set `SYMPHONY_WEBHOOK_LISTEN` and `GITHUB_WEBHOOK_SECRET` to enable the built-in GitHub webhook listener. It verifies `X-Hub-Signature-256`, accepts key issue/PR/check/Project events, and wakes the orchestrator immediately.
-- Keep `polling.interval_ms` relatively slow when webhooks are enabled. Polling remains the fallback reconciliation path, especially for user-owned Projects v2 where a webhook-only design is not reliable.
+- Canonical deployment uses both:
+  - repository webhooks for issue, comment, PR, review, and check events
+  - organization webhooks for Project v2 events
+- Keep `polling.interval_ms` relatively slow when webhooks are enabled. Polling remains the recovery reconciliation path for missed deliveries, downtime, and manual drift correction.
 - When both `SYMPHONY_GIT_CLONE_URL` and `SYMPHONY_SEED_REPO` are set, Symphony clones the canonical remote history first and then overlays the local seed contents on top. That preserves a merge base with `origin/main` while still letting workers start from a dirty local checkout for live testing.
 - The checked-in workflow assumes a review handoff model with `Todo`, `In Progress`, `Human Review`, `Merging`, `Rework`, and `Done` statuses, while only `Todo`, `In Progress`, `Merging`, and `Rework` are active dispatch states.
 - Runtime-owned review handoff keeps issues in `In Progress` until a PR exists, the workpad is reconciled beyond bootstrap state, and GitHub Actions / required PR checks are green.

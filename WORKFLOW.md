@@ -3,8 +3,11 @@ tracker:
   kind: github
   mode: projects_v2
   api_key: $GITHUB_TOKEN
+  # Canonical deployment uses an organization login here.
   owner: $SYMPHONY_GITHUB_OWNER
+  # Repository webhooks should be installed for this repository.
   repo: $SYMPHONY_GITHUB_REPO
+  # Canonical deployment uses an organization-owned Project v2 here.
   project_v2_number: $SYMPHONY_GITHUB_PROJECT_NUMBER
   project_url: $SYMPHONY_GITHUB_PROJECT_URL
   status_source:
@@ -25,8 +28,11 @@ tracker:
     - Duplicate
     - Done
 polling:
+  # Webhooks are the primary trigger path; polling is the recovery path.
   interval_ms: 60000
 webhooks:
+  # Repository webhooks should target this endpoint for issue/PR/review/check events.
+  # Organization webhooks should target the same endpoint for Project v2 events.
   listen: $SYMPHONY_WEBHOOK_LISTEN
   path: $SYMPHONY_WEBHOOK_PATH
   secret: $GITHUB_WEBHOOK_SECRET
@@ -143,6 +149,13 @@ Work only in the provided repository copy. Do not touch any other path.
 ## Prerequisite: GitHub tracker tools are available
 
 The agent should be able to talk to GitHub through the injected `github_graphql` and `github_rest` tools. If those tools are unavailable, stop and report the blocker.
+
+## Deployment assumptions
+
+- The canonical GitHub deployment uses an organization-owned GitHub Project as the dashboard.
+- Repository webhooks cover issue, comment, PR, review, and check activity for the working repository.
+- Organization webhooks cover Project v2 dashboard changes.
+- Periodic polling is a recovery path for missed deliveries and drift correction, not the primary trigger path.
 
 ## Default posture
 

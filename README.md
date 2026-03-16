@@ -29,7 +29,9 @@ Tell your favorite coding agent to build Symphony in a programming language of y
 
 Check out [rust/README.md](rust/README.md) for setup and run instructions for the current
 GitHub-oriented Symphony implementation. It uses GitHub Issues and Projects v2, treats a GitHub
-Project as the primary dashboard when configured, and runs Codex through the app-server protocol.
+Project as the primary dashboard when configured, targets organization-owned Projects plus
+repository and organization webhooks as the canonical deployment model, and runs Codex through the
+app-server protocol.
 You can also ask your favorite coding agent to help with the setup:
 
 > Set up Symphony for my repository based on

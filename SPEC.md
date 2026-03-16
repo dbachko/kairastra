@@ -36,7 +36,8 @@ Important boundary:
 
 ### 2.1 Goals
 
-- Poll the issue tracker on a fixed cadence and dispatch work with bounded concurrency.
+- Reconcile tracker state on a configurable cadence and/or external wake signals, and dispatch work
+  with bounded concurrency.
 - Maintain a single authoritative orchestrator state for dispatch, retries, and reconciliation.
 - Create deterministic per-issue workspaces and preserve them across runs.
 - Stop active runs when issue state changes make them ineligible.
@@ -77,7 +78,7 @@ Important boundary:
    - Normalizes tracker payloads into a stable issue model.
 
 4. `Orchestrator`
-   - Owns the poll tick.
+   - Owns reconciliation scheduling and external wake handling.
    - Owns the in-memory runtime state.
    - Decides which issues to dispatch, retry, stop, or release.
    - Tracks session metrics and retry queue state.
@@ -98,7 +99,12 @@ Important boundary:
    - Presents human-readable runtime status (for example terminal output, dashboard, or other
      operator-facing view).
 
-8. `Logging`
+8. `Event Intake` (optional in core, primary in the GitHub profile)
+   - Accepts external wake signals such as webhook deliveries.
+   - Verifies source authenticity where required.
+   - Triggers reconciliation without mutating orchestration policy directly.
+
+9. `Logging`
    - Emits structured runtime logs to one or more configured sinks.
 
 ### 3.2 Abstraction Levels
@@ -114,7 +120,7 @@ Symphony is easiest to port when kept in these layers:
    - Handles defaults, environment tokens, and path normalization.
 
 3. `Coordination Layer` (orchestrator)
-   - Polling loop, issue eligibility, concurrency, retries, reconciliation.
+   - Reconciliation loop, issue eligibility, concurrency, retries, external wake handling.
 
 4. `Execution Layer` (workspace + agent subprocess)
    - Filesystem lifecycle, workspace preparation, coding-agent protocol.
@@ -324,6 +330,7 @@ Top-level keys:
 
 - `tracker`
 - `polling`
+- `webhooks`
 - `workspace`
 - `hooks`
 - `agent`
@@ -360,12 +367,15 @@ Fields:
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
 - `owner` (string)
   - Required for dispatch when `tracker.kind == "github"`.
+  - In the primary GitHub deployment profile, this should be an organization login.
 - `repo` (string, optional)
   - Required when `tracker.mode == "issues_only"`.
-  - Recommended for `projects_v2` when prompts, hooks, or runtime heuristics need a canonical
-    repository.
+  - Recommended for `projects_v2`.
+  - In the primary GitHub deployment profile, this is the repository that receives issue/PR/check
+    repository webhooks.
 - `project_v2_number` (integer)
   - Required when `tracker.mode == "projects_v2"`.
+  - In the primary GitHub deployment profile, this points to an organization-owned Project v2.
 - `project_url` (string, optional)
   - Recommended when the exact dashboard URL should be surfaced to prompts and operator logs.
 - `active_states` (list of strings)
@@ -386,9 +396,30 @@ Fields:
 
 - `interval_ms` (integer or string integer)
   - Default: `30000`
-  - Changes should be re-applied at runtime and affect future tick scheduling without restart.
+  - Changes should be re-applied at runtime and affect future reconciliation scheduling without
+    restart.
 
-#### 5.3.3 `workspace` (object)
+#### 5.3.3 `webhooks` (object)
+
+Fields:
+
+- `listen` (address string, optional)
+  - Enables the built-in webhook listener when set.
+- `path` (HTTP path string, optional)
+  - Default: `/github/webhook`
+- `secret` (string or `$VAR`, optional)
+  - Required when `listen` is set.
+  - In the GitHub profile, this is the shared secret used to verify `X-Hub-Signature-256`.
+
+Primary GitHub deployment profile:
+
+- Repository webhooks should deliver issue/PR/review/check events for the configured repository.
+- Organization webhooks should deliver Project v2 events for the configured organization-owned
+  project.
+- Webhooks are the primary event trigger path in the GitHub profile; polling remains the recovery
+  and drift-correction path.
+
+#### 5.3.4 `workspace` (object)
 
 Fields:
 
@@ -398,7 +429,7 @@ Fields:
   - Bare strings without path separators are preserved as-is (relative roots are allowed but
     discouraged).
 
-#### 5.3.4 `hooks` (object)
+#### 5.3.5 `hooks` (object)
 
 Fields:
 
@@ -422,7 +453,7 @@ Fields:
   - Non-positive values should be treated as invalid and fall back to the default.
   - Changes should be re-applied at runtime for future hook executions.
 
-#### 5.3.5 `agent` (object)
+#### 5.3.6 `agent` (object)
 
 Fields:
 
@@ -442,7 +473,7 @@ Fields:
   - State keys are normalized (`lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
 
-#### 5.3.6 `codex` (object)
+#### 5.3.7 `codex` (object)
 
 Fields:
 
@@ -719,16 +750,21 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - Restart recovery is tracker-driven and filesystem-driven (no durable orchestrator DB required).
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 
-## 8. Polling, Scheduling, and Reconciliation
+## 8. Eventing, Scheduling, and Reconciliation
 
-### 8.1 Poll Loop
+### 8.1 Reconciliation Loop
 
-At startup, the service validates config, performs startup cleanup, schedules an immediate tick, and
-then repeats every `polling.interval_ms`.
+At startup, the service validates config, performs startup cleanup, schedules an immediate
+reconciliation pass, and then continues reconciliation according to the configured scheduling mode.
+
+Recommended scheduling model:
+
+- external wake signals (for example webhooks) trigger immediate reconciliation
+- periodic reconciliation still runs every `polling.interval_ms` as a recovery path
 
 The effective poll interval should be updated when workflow config changes are re-applied.
 
-Tick sequence:
+Reconciliation sequence:
 
 1. Reconcile running issues.
 2. Run dispatch preflight validation.
@@ -737,7 +773,7 @@ Tick sequence:
 5. Dispatch eligible issues while slots remain.
 6. Notify observability/status consumers of state changes.
 
-If per-tick validation fails, dispatch is skipped for that tick, but reconciliation still happens
+If per-pass validation fails, dispatch is skipped for that pass, but reconciliation still happens
 first.
 
 ### 8.2 Candidate Selection Rules
@@ -1232,7 +1268,20 @@ An implementation must support these tracker adapter operations:
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
 
-### 11.2 Query Semantics (GitHub)
+### 11.2 Primary GitHub Deployment Profile
+
+The primary GitHub profile assumes:
+
+- an organization-owned Project v2 is the canonical dashboard
+- repository webhooks are installed for the working repository
+- organization webhooks are installed for the project-owning organization
+- polling remains enabled at a relatively slow interval for recovery, missed deliveries, and drift
+  correction
+
+User-owned Projects v2 may be supported as a compatibility mode, but they are not the canonical
+GitHub deployment model in this specification version.
+
+### 11.3 Query Semantics (GitHub)
 
 GitHub-specific requirements for `tracker.kind == "github"`:
 
@@ -1240,9 +1289,11 @@ GitHub-specific requirements for `tracker.kind == "github"`:
 - GraphQL endpoint default: `https://api.github.com/graphql`
 - REST endpoint default: `https://api.github.com`
 - Auth token sent in `Authorization` header
-- `tracker.owner` identifies the GitHub organization or user that owns the project or repository
+- `tracker.owner` identifies the GitHub organization that owns the primary Project v2 dashboard in
+  the primary deployment profile
 - `tracker.mode == "projects_v2"`:
   - `tracker.project_v2_number` selects the GitHub Project v2 board
+  - the primary deployment profile uses an organization-owned Project v2
   - candidate issue query paginates project items and normalizes only items whose content is an
     issue
   - the default workflow-state source is a Project field named `Status`
@@ -1265,7 +1316,24 @@ Important:
 A non-GitHub implementation may change transport details, but the normalized outputs must match the
 domain model in Section 4.
 
-### 11.3 Normalization Rules
+### 11.4 Eventing Semantics (GitHub)
+
+The GitHub profile supports two complementary trigger paths:
+
+1. Webhook-triggered reconciliation
+   - Organization webhooks should be used for Project v2 events such as `projects_v2` and
+     `projects_v2_item`.
+   - Repository webhooks should be used for issue, comment, PR, review, and check events.
+   - Webhook deliveries are wake/reconcile triggers by default; implementations may additionally do
+     targeted reconciliation when payload routing is available.
+
+2. Periodic reconciliation
+   - Periodic tracker reconciliation must remain available for recovery from missed webhook
+     deliveries, endpoint downtime, or manual drift.
+   - In the primary GitHub profile, periodic reconciliation is a recovery path rather than the
+     primary trigger path.
+
+### 11.5 Normalization Rules
 
 Candidate issue normalization should produce fields listed in Section 4.1.1.
 
@@ -1282,7 +1350,7 @@ Additional normalization details:
     such as `Done`, surface the terminal project state
   - otherwise, a closed GitHub issue should normalize to `Closed`
 
-### 11.4 Error Handling Contract
+### 11.6 Error Handling Contract
 
 Recommended error categories:
 
@@ -1304,14 +1372,18 @@ Orchestrator behavior on tracker errors:
 - Running-state refresh failure: log and keep active workers running.
 - Startup terminal cleanup failure: log warning and continue startup.
 
-### 11.5 Tracker Writes (Important Boundary)
+### 11.7 Tracker Writes (Important Boundary)
 
 Symphony does not require general-purpose tracker write APIs in the orchestrator, but limited
-runtime-owned workflow transitions are allowed.
+runtime-owned workflow transitions are allowed and should be explicit.
 
-- Ticket mutations such as workpad comments, issue body edits, PR linkage, and most workflow notes
-  are typically handled by the coding agent using tools defined by the workflow prompt.
+- Ticket mutations such as workpad planning content, issue body edits, PR linkage, and most
+  workflow notes are typically handled by the coding agent using tools defined by the workflow
+  prompt.
 - The service remains primarily a scheduler/runner and tracker reader.
+- The recommended ownership split is hybrid:
+  - the coding agent owns task-progress content
+  - the runtime owns narrow mechanical transitions and machine-observed status facts
 - Implementations may own narrow workflow-state transitions when that improves correctness or
   prevents stuck queues.
 - The current GitHub implementation owns these minimal transitions:
@@ -1602,8 +1674,8 @@ Minimum endpoints:
     example `{\"error\":{\"code\":\"issue_not_found\",\"message\":\"...\"}}`).
 
 - `POST /api/v1/refresh`
-  - Queues an immediate tracker poll + reconciliation cycle (best-effort trigger; implementations
-    may coalesce repeated requests).
+  - Queues an immediate tracker reconciliation cycle (best-effort trigger; implementations may
+    coalesce repeated requests).
   - Suggested request body: empty body or `{}`.
   - Suggested response (`202 Accepted`) shape:
 
@@ -1612,7 +1684,7 @@ Minimum endpoints:
       "queued": true,
       "coalesced": false,
       "requested_at": "2026-02-24T20:15:30Z",
-      "operations": ["poll", "reconcile"]
+      "operations": ["reconcile"]
     }
     ```
 
@@ -1634,6 +1706,7 @@ API design notes:
    - Missing `WORKFLOW.md`
    - Invalid YAML front matter
    - Unsupported tracker kind or missing tracker credentials/project slug
+   - Invalid webhook listener configuration or missing webhook secret
    - Missing coding-agent executable
 
 2. `Workspace Failures`
@@ -1655,6 +1728,7 @@ API design notes:
    - Non-200 status
    - GraphQL errors
    - malformed payloads
+   - missed or failed webhook deliveries requiring recovery reconciliation
 
 5. `Observability Failures`
    - Snapshot timeout
@@ -2087,6 +2161,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 - Candidate issue fetch uses configured active states and tracker scope
 - `projects_v2` mode uses the configured project number and status field
+- Primary GitHub profile uses an organization-owned Project v2
 - `issues_only` mode uses the configured repository and excludes pull requests
 - Empty `fetch_issues_by_states([])` returns empty without API call
 - Pagination preserves order across multiple pages
@@ -2111,6 +2186,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   the workpad shows non-bootstrap progress, and GitHub Actions / required PR checks are green
 - Runtime-owned terminal cleanup moves a closed issue to project `Done` before workspace removal
   when that behavior is implemented
+- Webhook-triggered reconciliation wakes the orchestrator immediately when configured
+- Periodic reconciliation remains available even when webhooks are enabled
+- If targeted webhook routing is implemented, webhook-triggered reconciliation affects only the
+  relevant issue/project subset
 - Reconciliation with no running issues is a no-op
 - Normal worker exit schedules a short continuation retry only when the issue remains active
 - Abnormal worker exit increments retries with 10s-based exponential backoff
@@ -2144,6 +2223,14 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   telemetry are accepted when they preserve the same logical meaning
 - If optional client-side tools are implemented, the startup handshake advertises the supported tool
   specs required for discovery by the targeted app-server version
+
+### 17.6 Webhook Intake
+
+- Shared-secret verification rejects invalid webhook signatures
+- Supported repository events trigger orchestration wakeups
+- Supported organization Project events trigger orchestration wakeups in the primary GitHub profile
+- Unsupported events are ignored without failing the listener
+- Listener health endpoint responds independently of orchestration state
 - If the optional `github_graphql` client-side tool extension is implemented:
   - the tool is advertised to the session
   - valid `query` / `variables` inputs execute against configured GitHub auth
