@@ -206,6 +206,17 @@ hooks:
       git config http.https://github.com/.extraheader "Authorization: Basic ${auth_header}"
     }
 
+    adopt_seed_repo_origin() {
+      if [ -z "${SYMPHONY_SEED_REPO:-}" ] || [ ! -d "$SYMPHONY_SEED_REPO/.git" ]; then
+        return 0
+      fi
+      source_remote="$(git -C "$SYMPHONY_SEED_REPO" config --get remote.origin.url || true)"
+      current_remote="$(git config --get remote.origin.url || true)"
+      if [ -n "$source_remote" ] && { [ "$current_remote" = "$SYMPHONY_SEED_REPO" ] || [ -z "$current_remote" ]; }; then
+        git remote set-url origin "$source_remote"
+      fi
+    }
+
     require_workspace_support_dirs
     adopt_seed_repo_origin
 

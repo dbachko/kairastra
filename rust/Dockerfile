@@ -8,7 +8,7 @@ COPY rust/README.md ./README.md
 
 RUN cargo build --locked --release
 
-FROM node:20-bookworm-slim AS runtime
+FROM node:24-bookworm-slim AS runtime
 
 ARG CODEX_CLI_VERSION=0.114.0
 
