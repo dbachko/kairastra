@@ -78,6 +78,7 @@ Recommended classic PAT scopes for Symphony:
 
 - `project`
 - `repo` if the target repository is private
+- `workflow` if agent branches may add or edit files under `.github/workflows/`
 
 Minimum classic PAT scopes for read-only diagnostics:
 
@@ -99,11 +100,13 @@ Creation flow:
 4. Select:
    - `project` for full Symphony project-state automation
    - `repo` if the repository is private
+   - `workflow` if you want agent runs to be able to push workflow-file changes
 
 Notes:
 
 - If you only want to test read-only project access, `read:project` can replace `project`.
 - Symphony moves issues between project states, so `project` is the practical choice for end-to-end use.
+- Without `workflow`, pushes that modify `.github/workflows/*` will be rejected by GitHub even if normal code pushes succeed.
 - If you are accessing org resources protected by SSO, GitHub may require SSO authorization for the token after creation.
 
 References:
