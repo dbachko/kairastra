@@ -731,6 +731,12 @@ fn is_noisy_codex_stderr(line: &str) -> bool {
         || line.contains("tool_name=")
         || line.contains("codex_core::file_watcher")
         || line.contains("codex_core::analytics_client: events failed with status 403 Forbidden")
+        || line.contains("codex_core::shell_snapshot: Failed to delete shell snapshot")
+        || line.starts_with("- Treat a top-level `errors` array as a failed operation")
+        || line.contains("If the failure is a non-fast-forward or sync problem, run the `pull`")
+        || line.contains("If the failure is due to auth, permissions, or workflow restrictions on")
+        || line == "the configured remote, stop and surface the exact error instead of"
+        || line.starts_with("To see what failed, try: gh run view ")
         || line.contains("No watch was found")
         || line.contains("channel closed")
         || line.contains("processor task exited")
@@ -1249,6 +1255,15 @@ done
         ));
         assert!(super::is_noisy_codex_stderr(
             "WARN codex_core::analytics_client: events failed with status 403 Forbidden: <!DOCTYPE html><html><title>Just a moment...</title>"
+        ));
+        assert!(super::is_noisy_codex_stderr(
+            "WARN session_init:shell_snapshot{thread_id=abc}: codex_core::shell_snapshot: Failed to delete shell snapshot at \"/root/.codex/shell_snapshots/x\": Os { code: 2, kind: NotFound, message: \"No such file or directory\" }"
+        ));
+        assert!(super::is_noisy_codex_stderr(
+            "- If the failure is a non-fast-forward or sync problem, run the `pull`"
+        ));
+        assert!(super::is_noisy_codex_stderr(
+            "To see what failed, try: gh run view 23131072410 --log-failed"
         ));
     }
 

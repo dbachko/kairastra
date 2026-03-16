@@ -114,7 +114,8 @@ hooks:
         return 0
       fi
       source_remote="$(git -C "$SYMPHONY_SEED_REPO" config --get remote.origin.url || true)"
-      if [ -n "$source_remote" ]; then
+      current_remote="$(git config --get remote.origin.url || true)"
+      if [ -n "$source_remote" ] && { [ "$current_remote" = "$SYMPHONY_SEED_REPO" ] || [ -z "$current_remote" ]; }; then
         git remote set-url origin "$source_remote"
       fi
     }
@@ -206,6 +207,7 @@ hooks:
     }
 
     require_workspace_support_dirs
+    adopt_seed_repo_origin
 
     if [ -n "${SYMPHONY_GIT_PUSH_URL:-}" ]; then
       git remote set-url --push origin "$SYMPHONY_GIT_PUSH_URL"
