@@ -32,4 +32,8 @@ case "$auth_mode" in
     ;;
 esac
 
+if [[ $# -eq 0 ]]; then
+  set -- run
+fi
+
 exec symphony-rust "$@"

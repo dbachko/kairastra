@@ -1,175 +1,434 @@
 # Symphony Rust
 
-This directory contains the current Symphony implementation for this repo. It is oriented around
-GitHub Issues and Projects v2, following [`SPEC.md`](../SPEC.md) and the GitHub design notes in
-`syphony-gh.md`.
+This directory contains the current Rust implementation of Symphony for GitHub Issues and Projects
+v2. It is the operator-facing runtime in this repo: it loads `WORKFLOW.md`, polls GitHub, creates
+per-issue workspaces, launches Codex via the app-server protocol, and keeps the issue lifecycle in
+sync with the runtime.
 
-## What is implemented
+Use this README as the practical setup and operations guide. The normative behavior still lives in
+[`SPEC.md`](../SPEC.md).
 
-- `WORKFLOW.md` loader with YAML front matter, prompt body parsing, and last-known-good reload behavior.
-- Typed runtime config for `tracker.kind: github`.
-- GitHub tracker adapter with `projects_v2` as the primary mode and `issues_only` as a fallback.
-- GitHub Project dashboard URL support via `tracker.project_url` and derived fallback URLs.
-- Per-issue workspace creation, deterministic workspace keys, and lifecycle hooks.
-- Liquid prompt rendering.
-- Codex app-server client with v2 `thread/start -> turn/start` support plus legacy
-  `newConversation -> addConversationListener -> sendUserTurn` fallback for older local Codex
-  runtimes, including legacy sandbox-policy translation and injected `GITHUB_TOKEN` / `GH_TOKEN`
-  env vars so GitHub mutations still work through `gh`.
-- Polling orchestrator with in-memory claims, reconciliation, continuation retries, and exponential backoff retries.
+## What it does
 
-## Run
+- Loads `WORKFLOW.md` front matter plus prompt template and keeps the last known good config on reload errors.
+- Talks to GitHub through GraphQL and REST using a typed `tracker.kind: github` config.
+- Supports `projects_v2` as the primary tracker mode and `issues_only` as a fallback.
+- Creates deterministic per-issue workspaces and runs lifecycle hooks around them.
+- Starts Codex through the current app-server v2 protocol.
+- Tracks retries, continuation turns, backoff, and reconciliation in a single orchestrator loop.
+- Exposes operator commands for setup, doctor checks, and Codex auth management.
+
+## Requirements
+
+At minimum:
+
+- Rust toolchain
+- current `codex` CLI available in `PATH` with app-server v2 support
+- GitHub token with access to the target repo and project
+- A `WORKFLOW.md` file or a generated equivalent
+
+For native VPS mode:
+
+- Linux host with `systemd`
+- A stable path to the built `symphony-rust` binary
+
+For Docker mode:
+
+- Docker and Compose
+- `rust/.env` populated from `rust/.env.example`
+
+## CLI overview
+
+The binary uses explicit subcommands:
+
+```bash
+cargo run -- run /path/to/WORKFLOW.md
+cargo run -- setup
+cargo run -- doctor
+cargo run -- auth status
+cargo run -- auth login --mode chatgpt
+cargo run -- auth login --mode api-key
+```
+
+What each command does:
+
+- `run`: start the orchestrator loop. `--once` runs a single scheduling tick.
+- `setup`: guided first-run flow for native VPS or Docker.
+- `doctor`: validate local prerequisites, workflow loading, GitHub connectivity, and Codex auth state.
+- `auth status`: print the current Codex auth state as JSON.
+- `auth login`: run either ChatGPT subscription/device login or API-key bootstrap through the local Codex CLI.
+
+## Quick start
+
+## GitHub token requirements
+
+For `tracker.mode: projects_v2`, Symphony needs a GitHub token that can read and usually mutate the
+target Project v2.
+
+For a user-owned Project v2 like `https://github.com/users/<user>/projects/<number>`:
+
+- Use a personal access token (classic)
+- Do not use a fine-grained personal access token
+
+The reason is GitHub does not support fine-grained PATs for Projects owned by a user account, and
+the Projects API docs require `read:project` for queries or `project` for queries plus mutations.
+GitHub also documents `repo` for command-line repository access.
+
+Recommended classic PAT scopes for Symphony:
+
+- `project`
+- `repo` if the target repository is private
+- `workflow` if agent branches may add or edit files under `.github/workflows/`
+
+Minimum classic PAT scopes for read-only diagnostics:
+
+- `read:project`
+- `repo` if the target repository is private
+
+How to create it:
+
+Direct links:
+
+- Token settings: https://github.com/settings/tokens
+- Classic token creation: https://github.com/settings/tokens/new
+
+Creation flow:
+
+1. Open `https://github.com/settings/tokens`
+2. Open `Tokens (classic)`
+3. Click `Generate new token (classic)`
+4. Select:
+   - `project` for full Symphony project-state automation
+   - `repo` if the repository is private
+   - `workflow` if you want agent runs to be able to push workflow-file changes
+
+Notes:
+
+- If you only want to test read-only project access, `read:project` can replace `project`.
+- Symphony moves issues between project states, so `project` is the practical choice for end-to-end use.
+- Without `workflow`, pushes that modify `.github/workflows/*` will be rejected by GitHub even if normal code pushes succeed.
+- If you are accessing org resources protected by SSO, GitHub may require SSO authorization for the token after creation.
+
+References:
+
+- GitHub Projects API auth requirements: https://docs.github.com/en/enterprise-server%403.20/issues/planning-and-tracking-with-projects/automating-your-project/using-the-api-to-manage-projects
+- GitHub token creation and `repo` scope guidance: https://docs.github.com/en/enterprise-server%403.19/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
+- GitHub note that fine-grained PATs do not support user-owned Projects: https://docs.github.com/ko/enterprise-server%403.14/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
+
+Symphony currently assumes a classic PAT for user-owned Project v2 workflows. If you want to stay
+on a fine-grained PAT, use `issues_only` mode or move the project to an organization and verify the
+token policy there.
+
+### Native VPS
+
+1. Build the binary.
+2. Run the setup wizard.
+3. Review the generated workflow, env file, and `systemd` unit.
+4. Run doctor against those generated files.
+5. Install and start the service.
+
+Example:
 
 ```bash
 cd rust
-cargo test
-cargo fmt --check
-cargo run -- /path/to/WORKFLOW.md
+cargo build
+cargo run -- setup --mode native
+cargo run -- doctor --workflow ../WORKFLOW.generated.md --env-file ../symphony.env
 ```
 
-Use `cargo run -- --once /path/to/WORKFLOW.md` to execute a single orchestration tick.
+If you use ChatGPT subscription auth:
 
-You can also set `WORKFLOW_PATH=/path/to/WORKFLOW.md` instead of passing a positional CLI argument.
+```bash
+cargo run -- auth login --mode chatgpt
+cargo run -- auth status
+```
 
-## Docker
+If you use API-key auth:
 
-Use the Make targets for the container flow:
+```bash
+export OPENAI_API_KEY=...
+cargo run -- auth login --mode api-key
+```
+
+### Docker
+
+1. Copy `rust/.env.example` to `rust/.env`.
+2. Fill in `GITHUB_TOKEN` and the workflow-related `SYMPHONY_*` values.
+3. Point `WORKFLOW_FILE` at the workflow you want mounted.
+4. Start the stack.
+5. If you use ChatGPT/device auth, run the Docker login helper once.
+
+Example:
 
 ```bash
 cd rust
 cp .env.example .env
 make docker-build
 make docker-up
+make docker-login
 ```
 
-Available targets:
+`make docker-login` uses Codex device auth inside the container, which avoids the broken
+`localhost` browser-callback flow for containerized logins.
+Docker also sets `SYMPHONY_DEPLOY_MODE=docker`, so `doctor` inside the container validates Docker
+prerequisites instead of looking for `systemctl`.
 
-- `make docker-build`: build the `symphony-rust` image from `rust/compose.yml`.
-- `make docker-up`: start the stack in detached mode with rebuild.
-- `make docker-down`: stop and remove the stack.
-- `make docker-logs`: follow service logs.
-- `make docker-login`: run interactive `codex login` in the running container.
+## Guided setup
 
-`docker-login` is for ChatGPT subscription/device-auth flows (`CODEX_AUTH_MODE=chatgpt` or `auto` without `OPENAI_API_KEY`). Run it after `make docker-up` so auth state is stored in the persisted `/root/.codex` volume.
+The setup flow is intentionally narrow: it does not try to turn a VPS into a full workstation. It
+collects only the information needed to run Symphony safely.
 
-Files added for the container flow:
+Interactive mode:
+
+```bash
+cargo run -- setup
+```
+
+Non-interactive mode:
+
+```bash
+cargo run -- setup --mode native --non-interactive
+cargo run -- setup --mode docker --non-interactive
+```
+
+Optional flags:
+
+```text
+--mode native|docker
+--workflow <PATH>
+--env-file <PATH>
+--service-unit <PATH>
+--binary-path <PATH>
+--non-interactive
+```
+
+What setup asks for:
+
+- GitHub Project URL, with owner and Project v2 number auto-derived when possible
+- GitHub repo, either as a repo name or a full GitHub repo URL
+- workspace root
+- seed repo path
+- optional canonical clone URL
+- optional assignee login filter
+- concurrency and turn limits
+- optional Codex model override
+- optional Codex thinking effort override: `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`
+- whether to force Codex fast mode on
+- Codex auth path to optimize for
+
+What setup writes:
+
+- workflow file
+- env file
+- native `systemd` unit when `--mode native`
+
+Default output behavior:
+
+- If `WORKFLOW.md` already exists, setup writes `WORKFLOW.generated.md` by default.
+- Native mode writes `symphony.env` and `symphony.service` by default.
+- Docker mode writes `rust/.env.generated` when `rust/.env` already exists; otherwise it writes `rust/.env`.
+- Native mode auto-detects the systemd binary path. If the current executable is clearly a cargo
+  build artifact under `target/debug` or `target/release`, setup falls back to
+  `/usr/local/bin/symphony-rust`. Override with `--binary-path` or `SYMPHONY_BINARY_PATH` when needed.
+- Setup now detects whether you launched it from the repo root or from `rust/` and writes Docker
+  env files to the Compose directory either way.
+
+## Doctor checks
+
+Run doctor before enabling the service, after changing auth, or when a deployment is behaving
+strangely.
+
+Examples:
+
+```bash
+cargo run -- doctor
+cargo run -- doctor --workflow /path/to/WORKFLOW.md --env-file /path/to/envfile
+cargo run -- doctor --mode docker --format json
+```
+
+Doctor currently checks:
+
+- presence of required local commands such as `codex`, `gh`, and `docker` or `systemctl`
+- Codex auth state
+- workflow load/validation
+- GitHub tracker connectivity using the configured token
+- workspace root existence or whether its parent exists
+
+Expected behavior:
+
+- Native mode on macOS or other non-`systemd` hosts will warn or fail on the `systemctl` check.
+- A workflow that still references missing env vars will fail validation until the env file or shell exports are present.
+
+## Codex auth model
+
+Supported runtime modes:
+
+- `auto`: if `OPENAI_API_KEY` is present, prefer API-key bootstrap; otherwise rely on persisted login state
+- `api_key`: require `OPENAI_API_KEY`
+- `chatgpt`: use persisted ChatGPT/device-auth login state only
+
+Status command:
+
+```bash
+cargo run -- auth status
+```
+
+This reports:
+
+- configured auth mode
+- inferred auth mode
+- whether `codex` is available locally
+- whether a local `~/.codex/auth.json` file exists
+- whether `OPENAI_API_KEY` is set
+- a reminder that Docker persists auth in the `symphony_rust_codex` volume at `/root/.codex` inside the container
+
+Login commands:
+
+```bash
+cargo run -- auth login --mode chatgpt
+cargo run -- auth login --mode api-key
+```
+
+Use `chatgpt` for device/browser login and `api-key` when `OPENAI_API_KEY` is already set in the
+current shell.
+
+## Docker deployment details
+
+Compose files:
 
 - `rust/Dockerfile`
 - `rust/compose.yml`
 - `rust/.env.example`
 
-Important notes:
+Important details:
 
-- Fill in `GITHUB_TOKEN` in `rust/.env`.
-- Set `WORKFLOW_FILE` in `rust/.env` to the host path of the workflow file you want mounted into the container.
-- Set `SEED_REPO_PATH` in `rust/.env` to the host path of the repository copy that should be cloned into per-issue workspaces. The default `..` works when you run Compose from `rust/` inside this repo.
-- Your workflow should usually use `workspace.root: $SYMPHONY_WORKSPACE_ROOT` so the same file works inside Docker.
-- The Compose setup mounts the seed repo at `/seed-repo`, and the checked-in `WORKFLOW.md` prefers cloning from that local mount before falling back to GitHub.
-- `CODEX_AUTH_MODE` controls Codex auth bootstrap in the container:
-  - `auto` (default): if `OPENAI_API_KEY` is set, bootstrap API-key login; otherwise rely on persisted login state.
-  - `api_key`: bootstrap from `OPENAI_API_KEY` only.
-  - `chatgpt`: skip API-key bootstrap and use persisted Codex login state only.
-- Compose persists `/root/.codex` with the `symphony_rust_codex` volume so login survives restarts.
-- The runtime image installs `codex`, `gh`, `make`, `docker`, and `docker-compose`, and it reuses the Rust toolchain from the builder stage so workspace `cargo` commands match the app build toolchain.
-- Agent turns and workspace hooks use a workspace-local `.cargo-home` cache so sandboxed `cargo` commands do not try to write into the read-only toolchain image path.
-- `docker compose ...` inside the container is shimmed to Debian's `docker-compose` binary. That is enough for config-oriented validation; mount the host Docker socket separately if you want worker turns to build or run sibling containers.
+- `WORKFLOW_FILE` is mounted read-only at `/config/WORKFLOW.md`.
+- `SEED_REPO_PATH` is mounted read-only at `/seed-repo`.
+- workspaces live in the `symphony_rust_workspaces` volume.
+- Codex auth persists in the `symphony_rust_codex` volume.
+- Compose now passes through the workflow-related `SYMPHONY_*` variables so env-backed workflow
+  fields resolve inside the container at runtime.
+- `CODEX_AUTH_MODE=chatgpt` plus `make docker-login` is the intended subscription/device-auth path.
+- `CODEX_AUTH_MODE=api_key` plus `OPENAI_API_KEY` is the intended API-key path.
 
-### Headless device-auth (Docker ChatGPT subscription mode)
+Available make targets:
 
-1. Set `CODEX_AUTH_MODE=chatgpt` (or `auto` with no `OPENAI_API_KEY`) in `rust/.env`.
-2. Start the stack once: `make -C rust docker-up`.
-3. Run device login inside the running container: `make -C rust docker-login`.
-4. Complete the device code flow from a browser.
-5. Restart normally; Compose keeps `/root/.codex` persisted.
+- `make docker-build`
+- `make docker-up`
+- `make docker-down`
+- `make docker-logs`
+- `make docker-login` runs `codex login --device-auth`
 
-### Headless device-auth (VPS without Docker)
+## Native VPS deployment details
 
-1. SSH to the VPS and run `codex login`.
-2. Complete the device code flow in your browser.
-3. Start Symphony Rust on the VPS; Codex uses the saved login from `~/.codex`.
+Setup can generate a `systemd` unit, but it does not install it automatically. That is deliberate:
+the wizard writes artifacts, and the operator chooses when to promote them into the live system.
 
-### API-key mode
+Typical flow:
 
-- Set `OPENAI_API_KEY` and use `CODEX_AUTH_MODE=api_key` (or `auto`).
-- On first start, the container runs `codex login --with-api-key` and stores auth under `/root/.codex`.
-
-## Minimal GitHub workflow
-
-```md
----
-tracker:
-  kind: github
-  api_key: $GITHUB_TOKEN
-  mode: projects_v2
-  owner: $SYMPHONY_GITHUB_OWNER
-  repo: $SYMPHONY_GITHUB_REPO
-  project_v2_number: $SYMPHONY_GITHUB_PROJECT_NUMBER
-  project_url: $SYMPHONY_GITHUB_PROJECT_URL
-  active_states: ["Todo", "In Progress", "Merging", "Rework"]
-  terminal_states: ["Done", "Closed", "Cancelled", "Duplicate"]
-  status_source:
-    type: project_field
-    name: Status
-  priority_source:
-    type: project_field
-    name: Priority
-workspace:
-  root: $SYMPHONY_WORKSPACE_ROOT
-hooks:
-  after_create: |
-    git clone "$SYMPHONY_GIT_CLONE_URL" .
-    rsync -a --delete --exclude '.git' "$SYMPHONY_SEED_REPO"/ ./
-agent:
-  max_concurrent_agents: 4
-  max_turns: 20
-  assignee_login: $SYMPHONY_AGENT_ASSIGNEE
-codex:
-  command: codex app-server
----
-
-You are working on {{ issue.identifier }}.
-
-Title: {{ issue.title }}
-{% if issue.description %}
-Body:
-{{ issue.description }}
-{% endif %}
+```bash
+sudo cp symphony.service /etc/systemd/system/symphony.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now symphony.service
+sudo systemctl status symphony.service
+journalctl -u symphony.service -f
 ```
 
-## Bootstrap GitHub Project metadata
+The generated unit references:
 
-From the repo root, use the bootstrap script to converge a GitHub Project and repo onto the Symphony workflow shape:
+- the env file through `EnvironmentFile=...`
+- the current working directory as `WorkingDirectory=...`
+- the auto-detected or overridden binary path via `ExecStart=<binary> run <workflow>`
+
+If your installed binary lives somewhere non-standard, pass `--binary-path /absolute/path/to/symphony-rust`
+to setup or export `SYMPHONY_BINARY_PATH` before running it.
+
+## Workflow and env files
+
+The recommended workflow keeps secrets and machine-specific values outside the file by referencing
+environment variables such as:
+
+- `GITHUB_TOKEN`
+- `SYMPHONY_GITHUB_OWNER`
+- `SYMPHONY_GITHUB_REPO`
+- `SYMPHONY_GITHUB_PROJECT_NUMBER`
+- `SYMPHONY_GITHUB_PROJECT_URL`
+- `SYMPHONY_WORKSPACE_ROOT`
+- `SYMPHONY_GIT_CLONE_URL`
+- `SYMPHONY_SEED_REPO`
+- `SYMPHONY_AGENT_ASSIGNEE`
+- `SYMPHONY_CODEX_MODEL`
+- `SYMPHONY_CODEX_REASONING_EFFORT`
+- `SYMPHONY_CODEX_FAST`
+
+If you provide `SYMPHONY_GITHUB_PROJECT_URL` in the setup flow, Symphony can derive the GitHub
+owner and Project v2 number automatically for URLs like
+`https://github.com/users/<owner>/projects/<number>` and
+`https://github.com/orgs/<owner>/projects/<number>`.
+
+The generated workflow also includes an `after_create` hook that:
+
+- clones the canonical repo when `SYMPHONY_GIT_CLONE_URL` is set
+- overlays `SYMPHONY_SEED_REPO` on top when present
+- sets the git author identity
+
+The checked-in [WORKFLOW.md](../WORKFLOW.md) remains a good reference for the richer review/handoff
+prompt used in this repo.
+
+Codex runtime controls:
+
+- `codex.model` sets the model Symphony requests for the thread and subsequent turns.
+- `codex.reasoning_effort` controls thinking depth. Valid values are `none`, `minimal`, `low`,
+  `medium`, `high`, and `xhigh`.
+- `codex.fast` is a boolean. `true` maps to Codex `serviceTier=fast`; `false` maps to
+  `serviceTier=flex`.
+
+## GitHub bootstrap helper
+
+From the repo root, `scripts/bootstrap_github_project.py` can converge a GitHub Project and repo
+toward the Symphony workflow shape:
 
 ```bash
 python3 scripts/bootstrap_github_project.py --dry-run
 python3 scripts/bootstrap_github_project.py
 ```
 
-The script expects these env vars, or equivalent CLI flags:
+It expects:
 
 - `SYMPHONY_GITHUB_OWNER`
 - `SYMPHONY_GITHUB_REPO`
 - `SYMPHONY_GITHUB_PROJECT_NUMBER`
 
-What it ensures:
+It ensures:
 
-- Project `Status` options: `Backlog`, `Todo`, `In Progress`, `Human Review`, `Merging`, `Rework`, `Done`, `Cancelled`, `Duplicate`
-- Project `Priority` numeric field
-- A small default repo label pack for Symphony-oriented filtering
+- the expected `Status` options
+- a numeric `Priority` field
+- a default label pack for Symphony-oriented filtering
 
-Important distinction:
+## Day-2 operations
 
-- The Project `Status` field should contain the full workflow vocabulary, including non-dispatch states like `Backlog` and `Human Review`.
-- The workflow `active_states` remain narrower and should contain only the states Symphony is allowed to actively dispatch, such as `Todo`, `In Progress`, `Merging`, and `Rework`.
+Useful commands once Symphony is running:
 
-## Notes
+```bash
+cargo run -- doctor --workflow /path/to/WORKFLOW.md --env-file /path/to/envfile
+cargo run -- auth status
+make -C rust docker-logs
+journalctl -u symphony.service -f
+```
 
-- The current code targets local workers only.
+If you are already inside the `rust/` directory, drop the `-C rust` prefix and run `make docker-logs`,
+`make docker-up`, or `make docker-login` directly.
+
+Common failure modes:
+
+- missing `GITHUB_TOKEN`: workflow validation fails and GitHub connectivity checks fail
+- missing workflow env vars: the workflow loads only after the env file is applied
+- missing Codex auth: `auth status` shows no local auth file and no API key
+- wrong binary path in native mode: `systemd` starts but fails immediately
+
+## Current limitations
+
+- The current implementation targets local workers only.
 - GitHub dynamic tools are limited to `github_graphql` and a small `github_rest` allow-list.
-- `tracker.project_url` is optional but recommended when you want the prompt/runtime to surface the exact GitHub Project dashboard URL, especially for org-owned projects where the canonical URL cannot be derived locally.
-- The checked-in [WORKFLOW.md](../WORKFLOW.md) is a generic GitHub Projects workflow. Parameterize it with `SYMPHONY_GITHUB_OWNER`, `SYMPHONY_GITHUB_REPO`, `SYMPHONY_GITHUB_PROJECT_NUMBER`, `SYMPHONY_GITHUB_PROJECT_URL`, and `SYMPHONY_GIT_CLONE_URL`.
-- When both `SYMPHONY_GIT_CLONE_URL` and `SYMPHONY_SEED_REPO` are set, Symphony clones the canonical remote history first and then overlays the local seed contents on top. That preserves a merge base with `origin/main` while still letting workers start from a dirty local checkout for live testing.
-- The checked-in workflow assumes a review handoff model with `Todo`, `In Progress`, `Human Review`, `Merging`, `Rework`, and `Done` statuses, while only `Todo`, `In Progress`, `Merging`, and `Rework` are active dispatch states.
-- Runtime-owned review handoff keeps issues in `In Progress` until a PR exists, the workpad is reconciled beyond bootstrap state, and GitHub Actions / required PR checks are green.
-- Set `agent.assignee_login` when you want a worker to claim only issues assigned to a specific GitHub login.
-- Progress tracking in the checked-in workflow happens in one persistent `## Codex Workpad` issue comment, with fallback to the issue body only if comment editing is unavailable.
+- The operator UX is terminal-first; there is no web onboarding flow here.
+- The setup wizard writes artifacts and validates them, but does not install system packages or mutate the host beyond those generated files.
