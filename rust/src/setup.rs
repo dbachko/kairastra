@@ -170,12 +170,7 @@ fn resolve_workflow_path(layout: &SetupLayout, explicit: Option<&PathBuf>) -> Pa
         return path.clone();
     }
 
-    let default = layout.repo_root.join("WORKFLOW.md");
-    if default.exists() {
-        layout.repo_root.join("WORKFLOW.generated.md")
-    } else {
-        default
-    }
+    layout.repo_root.join("WORKFLOW.md")
 }
 
 fn resolve_env_file_path(
@@ -999,5 +994,16 @@ mod tests {
         let from_rust = super::detect_layout(&rust_dir);
         assert_eq!(from_rust.repo_root, dir.path());
         assert_eq!(from_rust.rust_dir, rust_dir);
+    }
+
+    #[test]
+    fn workflow_path_defaults_to_workflow_md_even_when_existing() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("WORKFLOW.md"), "existing").unwrap();
+
+        let layout = super::detect_layout(dir.path());
+        let path = super::resolve_workflow_path(&layout, None);
+
+        assert_eq!(path, dir.path().join("WORKFLOW.md"));
     }
 }

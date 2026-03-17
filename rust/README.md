@@ -133,7 +133,7 @@ Example:
 cd rust
 cargo build
 cargo run -- setup --mode native
-cargo run -- doctor --workflow ../WORKFLOW.generated.md --env-file ../symphony.env
+cargo run -- doctor --workflow ../WORKFLOW.md --env-file ../symphony.env
 ```
 
 If you use ChatGPT subscription auth:
@@ -224,7 +224,7 @@ What setup writes:
 
 Default output behavior:
 
-- If `WORKFLOW.md` already exists, setup writes `WORKFLOW.generated.md` by default.
+- Setup writes `WORKFLOW.md` by default unless `--workflow` is provided.
 - Native mode writes `symphony.env` and `symphony.service` by default.
 - Docker mode writes `rust/.env.generated` when `rust/.env` already exists; otherwise it writes `rust/.env`.
 - Native mode auto-detects the systemd binary path. If the current executable is clearly a cargo

@@ -10,7 +10,9 @@ use crate::agent::AgentEvent;
 use crate::github::{GitHubTracker, OpenPullRequest, PullRequestChecksSummary, Tracker};
 use crate::model::Issue;
 use crate::prompt::{build_prompt, continuation_prompt};
-use crate::providers::{self, AGENT_BOOTSTRAP_NOTE, AGENT_WORKPAD_HEADER};
+use crate::providers::{
+    self, is_bootstrap_workpad, is_workpad_comment, AGENT_BOOTSTRAP_NOTE, AGENT_WORKPAD_HEADER,
+};
 use crate::workflow::WorkflowSnapshot;
 use crate::workspace;
 
@@ -275,9 +277,7 @@ fn workpad_has_progress(issue: &Issue) -> bool {
         return false;
     };
 
-    body.contains(AGENT_WORKPAD_HEADER)
-        && body.contains("[x]")
-        && !body.contains(AGENT_BOOTSTRAP_NOTE)
+    is_workpad_comment(body) && body.contains("[x]") && !is_bootstrap_workpad(body)
 }
 
 const RUNTIME_STATUS_START: &str = "<!-- symphony-runtime-status:start -->";
@@ -416,6 +416,22 @@ mod tests {
             "## Agent Workpad\n\n### Plan\n\n- [x] 1. Done\n\n### Notes\n\n- Updated by the agent.\n",
         ));
         assert!(workpad_has_progress(&issue));
+    }
+
+    #[test]
+    fn legacy_checked_workpad_counts_as_progress() {
+        let issue = issue_with_workpad(Some(
+            "## Codex Workpad\n\n### Plan\n\n- [x] 1. Done\n\n### Notes\n\n- Updated by Codex.\n",
+        ));
+        assert!(workpad_has_progress(&issue));
+    }
+
+    #[test]
+    fn legacy_bootstrap_workpad_does_not_count_as_progress() {
+        let issue = issue_with_workpad(Some(
+            "## Codex Workpad\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- Bootstrap created by Symphony runtime before the first Codex turn.\n",
+        ));
+        assert!(!workpad_has_progress(&issue));
     }
 
     #[test]
