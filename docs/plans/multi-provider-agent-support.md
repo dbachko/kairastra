@@ -29,7 +29,7 @@ Provider-agnostic pieces:
 
 Codex-specific pieces:
 
-- `rust/src/agent/codex.rs` launches `codex app-server` and speaks the Codex app-server protocol.
+- `rust/src/providers/codex/runtime.rs` launches `codex app-server` and speaks the Codex app-server protocol.
 - `rust/src/config.rs` stores provider settings under `agent.provider` and `providers.codex`.
 - `rust/src/doctor.rs` and `rust/src/auth.rs` still only validate or bootstrap Codex tooling/auth.
 - `rust/src/setup.rs` emits provider-aware generated workflow and env values, defaulting to Codex.

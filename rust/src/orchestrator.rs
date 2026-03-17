@@ -264,6 +264,7 @@ impl Orchestrator {
             .into_iter()
             .map(|issue| (issue.id.clone(), issue))
             .collect();
+        let stall_timeout_ms = providers::stall_timeout_ms(&snapshot.settings)?;
 
         let mut remove_ids = Vec::new();
         let mut retries = Vec::new();
@@ -273,7 +274,6 @@ impl Orchestrator {
                 continue;
             };
 
-            let stall_timeout_ms = providers::stall_timeout_ms(&snapshot.settings)?;
             if stall_timeout_ms > 0
                 && running.last_agent_timestamp.elapsed() >= Duration::from_millis(stall_timeout_ms)
             {

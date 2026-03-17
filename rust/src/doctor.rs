@@ -104,7 +104,10 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
                         status: DoctorStatus::Pass,
                         detail: format!("loaded {}", path.display()),
                     });
-                    provider_command_check = check_command(provider_command_name(&settings)?);
+                    provider_command_check = check_named_command(
+                        "agent_provider_command",
+                        provider_command_name(&settings)?,
+                    );
                     provider_auth_check = check_auth_status(&settings);
                     tracker_check = check_github_tracker(&settings).await;
                     workspace_check = check_workspace_root(&settings.workspace.root);
@@ -189,16 +192,20 @@ fn infer_mode() -> DeployMode {
 }
 
 fn check_command(name: &'static str) -> DoctorCheck {
-    match find_command(name) {
+    check_named_command(name, name)
+}
+
+fn check_named_command(check_name: &'static str, command_name: &'static str) -> DoctorCheck {
+    match find_command(command_name) {
         Some(path) => DoctorCheck {
-            name,
+            name: check_name,
             status: DoctorStatus::Pass,
-            detail: format!("found at {}", path.display()),
+            detail: format!("command={} found at {}", command_name, path.display()),
         },
         None => DoctorCheck {
-            name,
+            name: check_name,
             status: DoctorStatus::Fail,
-            detail: "not found in PATH".to_string(),
+            detail: format!("command={} not found in PATH", command_name),
         },
     }
 }
