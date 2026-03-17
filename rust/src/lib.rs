@@ -1,4 +1,4 @@
-pub mod app_server;
+pub mod agent;
 pub mod auth;
 pub mod config;
 pub mod deploy;
@@ -8,6 +8,7 @@ pub mod github;
 pub mod model;
 pub mod orchestrator;
 pub mod prompt;
+pub mod providers;
 pub mod runner;
 pub mod setup;
 pub mod workflow;

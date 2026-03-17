@@ -10,7 +10,7 @@ coding-agent backends instead of only Codex. The initial target providers are:
 - Gemini CLI
 
 Recommendation: do not bolt Claude or Gemini directly onto the existing Codex-specific
-`AppServerSession`. First extract a provider-neutral runner interface, move the current Codex
+`CodexSession`. First extract a provider-neutral runner interface, move the current Codex
 implementation behind it, and then add Claude and Gemini backends behind the same contract.
 
 That path keeps the orchestrator stable while isolating provider-specific session, streaming,
@@ -29,10 +29,10 @@ Provider-agnostic pieces:
 
 Codex-specific pieces:
 
-- `rust/src/app_server.rs` launches `codex app-server` and speaks the Codex app-server protocol.
-- `rust/src/config.rs` stores provider settings under the `codex` config namespace.
-- `rust/src/doctor.rs` and `rust/src/auth.rs` only validate or bootstrap Codex tooling/auth.
-- `rust/src/setup.rs` emits Codex-specific generated workflow and env values.
+- `rust/src/providers/codex/runtime.rs` launches `codex app-server` and speaks the Codex app-server protocol.
+- `rust/src/config.rs` stores provider settings under `agent.provider` and `providers.codex`.
+- `rust/src/doctor.rs` and `rust/src/auth.rs` still only validate or bootstrap Codex tooling/auth.
+- `rust/src/setup.rs` emits provider-aware generated workflow and env values, defaulting to Codex.
 
 This means the system is not far from supporting multiple providers, but the current boundaries are
 wrong for it.
@@ -91,7 +91,7 @@ pub trait AgentSession: Send {
 ```
 
 The exact shape may differ, but the core requirement is stable: `runner.rs` should depend on a
-provider-neutral session interface, not on `AppServerSession`.
+provider-neutral session interface, not on `CodexSession`.
 
 ### Decision 2: Keep the orchestrator unchanged
 
@@ -140,7 +140,7 @@ Do not teach the orchestrator or generic runner about provider-specific wire for
 Implementation shape:
 
 - Point the existing `codex.command` at `claude` or `gemini`.
-- Reuse `rust/src/app_server.rs` unchanged.
+- Reuse `rust/src/agent/codex.rs` unchanged.
 
 Pros:
 
@@ -154,7 +154,7 @@ Cons:
 
 Verdict: reject.
 
-### Option B: Add provider-specific branches throughout `runner.rs` and `app_server.rs`
+### Option B: Add provider-specific branches throughout `runner.rs` and `agent/codex.rs`
 
 Implementation shape:
 
@@ -196,7 +196,7 @@ Verdict: recommended.
 
 ## Proposed Architecture
 
-### 1. Replace `AppServerSession` as the runner dependency
+### 1. Replace `CodexSession` as the runner dependency
 
 Refactor `rust/src/runner.rs` so it depends on a provider-neutral session interface. The runner
 still owns:
@@ -219,7 +219,7 @@ The backend owns:
 ### 2. Normalize runtime events
 
 Introduce a provider-neutral event enum, likely by renaming or generalizing the current
-`AppServerEvent` and `AppServerEventKind`.
+`AgentEvent` and `AgentEventKind`.
 
 Candidate shape:
 
@@ -311,7 +311,7 @@ Recommended module layout:
 - `rust/src/agent/claude.rs`
 - `rust/src/agent/gemini.rs`
 
-The existing `rust/src/app_server.rs` can be renamed or folded into `rust/src/agent/codex.rs`.
+`rust/src/agent/codex.rs` is the Codex reference implementation of the backend contract.
 
 ## Provider-Specific Strategy
 
@@ -501,7 +501,7 @@ and how much feature parity is required with Codex.
 ## Recommended First Milestone
 
 The first milestone should be a no-behavior-change Codex refactor that introduces the backend
-interface and proves the runner can operate without depending directly on `AppServerSession`.
+interface and proves the runner can operate without depending directly on `CodexSession`.
 
 That milestone reduces the risk of every later provider addition and gives a clean seam for Claude
 and Gemini without destabilizing the orchestrator.

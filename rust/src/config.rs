@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use serde_json::{json, Value as JsonValue};
+use serde_yaml::Value as YamlValue;
 
 use crate::model::WorkflowDefinition;
 
@@ -14,10 +14,6 @@ const DEFAULT_HOOK_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_CONCURRENT_AGENTS: usize = 10;
 const DEFAULT_MAX_TURNS: usize = 20;
 const DEFAULT_MAX_RETRY_BACKOFF_MS: u64 = 300_000;
-const DEFAULT_CODEX_COMMAND: &str = "codex app-server";
-const DEFAULT_READ_TIMEOUT_MS: u64 = 5_000;
-const DEFAULT_TURN_TIMEOUT_MS: u64 = 3_600_000;
-const DEFAULT_STALL_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -26,7 +22,7 @@ pub struct Settings {
     pub workspace: WorkspaceSettings,
     pub hooks: HookSettings,
     pub agent: AgentSettings,
-    pub codex: CodexSettings,
+    pub providers: ProviderSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +63,7 @@ pub struct HookSettings {
 
 #[derive(Debug, Clone)]
 pub struct AgentSettings {
+    pub provider: ProviderId,
     pub max_concurrent_agents: usize,
     pub max_turns: usize,
     pub max_retry_backoff_ms: u64,
@@ -75,17 +72,33 @@ pub struct AgentSettings {
 }
 
 #[derive(Debug, Clone)]
-pub struct CodexSettings {
-    pub command: String,
-    pub model: Option<String>,
-    pub reasoning_effort: Option<String>,
-    pub fast: Option<bool>,
-    pub approval_policy: JsonValue,
-    pub thread_sandbox: String,
-    pub turn_sandbox_policy: Option<JsonValue>,
-    pub read_timeout_ms: u64,
-    pub turn_timeout_ms: u64,
-    pub stall_timeout_ms: u64,
+pub struct ProviderSettings {
+    raw: HashMap<String, YamlValue>,
+}
+
+impl ProviderSettings {
+    pub fn get(&self, provider: &ProviderId) -> Option<&YamlValue> {
+        self.raw.get(provider.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderId(String);
+
+impl ProviderId {
+    pub fn parse(raw: String) -> Result<Self> {
+        let normalized = raw.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Err(anyhow!(
+                "invalid_workflow_config: agent.provider is required"
+            ));
+        }
+        Ok(Self(normalized))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -125,7 +138,7 @@ struct RawSettings {
     workspace: RawWorkspace,
     hooks: RawHooks,
     agent: RawAgent,
-    codex: RawCodex,
+    providers: HashMap<String, YamlValue>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -171,6 +184,7 @@ struct RawHooks {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 struct RawAgent {
+    provider: Option<String>,
     max_concurrent_agents: Option<IntOrString>,
     max_turns: Option<IntOrString>,
     max_retry_backoff_ms: Option<IntOrString>,
@@ -178,37 +192,24 @@ struct RawAgent {
     max_concurrent_agents_by_state: HashMap<String, IntOrString>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-struct RawCodex {
-    command: Option<String>,
-    model: Option<String>,
-    reasoning_effort: Option<String>,
-    fast: Option<BoolOrString>,
-    approval_policy: Option<JsonValue>,
-    thread_sandbox: Option<String>,
-    turn_sandbox_policy: Option<JsonValue>,
-    read_timeout_ms: Option<IntOrString>,
-    turn_timeout_ms: Option<IntOrString>,
-    stall_timeout_ms: Option<IntOrString>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-enum IntOrString {
+pub(crate) enum IntOrString {
     Int(u64),
     String(String),
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-enum BoolOrString {
+pub(crate) enum BoolOrString {
     Bool(bool),
     String(String),
 }
 
 impl Settings {
     pub fn from_workflow(workflow: &WorkflowDefinition) -> Result<Self> {
+        reject_legacy_codex_block(&workflow.config)?;
+
         let raw = serde_yaml::from_value::<RawSettings>(workflow.config.clone())
             .map_err(|error| anyhow!("invalid_workflow_config: {error}"))?;
 
@@ -272,6 +273,7 @@ impl Settings {
             DEFAULT_MAX_RETRY_BACKOFF_MS,
             "agent.max_retry_backoff_ms",
         )?;
+        let provider = resolve_provider_id(raw.agent.provider)?;
 
         let mut state_limits = HashMap::new();
         for (state, limit) in raw.agent.max_concurrent_agents_by_state {
@@ -284,45 +286,6 @@ impl Settings {
             }
         }
 
-        let reasoning_effort = resolve_optional_string(raw.codex.reasoning_effort);
-        if let Some(value) = reasoning_effort.as_deref() {
-            validate_reasoning_effort(value)?;
-        }
-
-        let codex = CodexSettings {
-            command: raw
-                .codex
-                .command
-                .unwrap_or_else(|| DEFAULT_CODEX_COMMAND.to_string()),
-            model: resolve_optional_string(raw.codex.model),
-            reasoning_effort,
-            fast: resolve_optional_bool(raw.codex.fast, "codex.fast")?,
-            approval_policy: raw
-                .codex
-                .approval_policy
-                .unwrap_or_else(default_approval_policy),
-            thread_sandbox: raw
-                .codex
-                .thread_sandbox
-                .unwrap_or_else(|| "workspace-write".to_string()),
-            turn_sandbox_policy: raw.codex.turn_sandbox_policy,
-            read_timeout_ms: resolve_u64(
-                raw.codex.read_timeout_ms,
-                DEFAULT_READ_TIMEOUT_MS,
-                "codex.read_timeout_ms",
-            )?,
-            turn_timeout_ms: resolve_u64(
-                raw.codex.turn_timeout_ms,
-                DEFAULT_TURN_TIMEOUT_MS,
-                "codex.turn_timeout_ms",
-            )?,
-            stall_timeout_ms: resolve_optional_u64(
-                raw.codex.stall_timeout_ms,
-                "codex.stall_timeout_ms",
-            )?
-            .unwrap_or(DEFAULT_STALL_TIMEOUT_MS),
-        };
-
         if max_concurrent_agents == 0 {
             return Err(anyhow!(
                 "invalid_workflow_config: agent.max_concurrent_agents must be > 0"
@@ -333,9 +296,16 @@ impl Settings {
                 "invalid_workflow_config: agent.max_turns must be > 0"
             ));
         }
-        if codex.command.is_empty() {
+        let Some(selected_provider_config) = raw.providers.get(provider.as_str()) else {
             return Err(anyhow!(
-                "invalid_workflow_config: codex.command must not be empty"
+                "invalid_workflow_config: providers.{} is required",
+                provider.as_str()
+            ));
+        };
+        if !matches!(selected_provider_config, YamlValue::Mapping(_)) {
+            return Err(anyhow!(
+                "invalid_workflow_config: providers.{} must be a mapping",
+                provider.as_str()
             ));
         }
 
@@ -381,6 +351,7 @@ impl Settings {
             },
             hooks,
             agent: AgentSettings {
+                provider,
                 max_concurrent_agents,
                 max_turns,
                 max_retry_backoff_ms,
@@ -388,7 +359,7 @@ impl Settings {
                     .map(|value| value.to_lowercase()),
                 max_concurrent_agents_by_state: state_limits,
             },
-            codex,
+            providers: ProviderSettings { raw: raw.providers },
         })
     }
 
@@ -449,43 +420,27 @@ impl Settings {
             .copied()
             .unwrap_or(self.agent.max_concurrent_agents)
     }
-
-    pub fn turn_sandbox_policy(&self, workspace: &Path) -> JsonValue {
-        let workspace_root = workspace.to_string_lossy().to_string();
-
-        match self.codex.turn_sandbox_policy.clone() {
-            Some(mut policy) => {
-                if let Some(object) = policy.as_object_mut() {
-                    let is_workspace_write = object
-                        .get("type")
-                        .and_then(JsonValue::as_str)
-                        .map(|value| value == "workspaceWrite")
-                        .unwrap_or(false);
-                    let missing_writable_roots = object
-                        .get("writableRoots")
-                        .map(|value| value.is_null())
-                        .unwrap_or(true);
-
-                    if is_workspace_write && missing_writable_roots {
-                        object.insert("writableRoots".to_string(), json!([workspace_root]));
-                    }
-                }
-
-                policy
-            }
-            None => json!({
-                "type": "workspaceWrite",
-                "writableRoots": [workspace_root]
-            }),
-        }
-    }
 }
 
 pub fn normalize_issue_state(state: &str) -> String {
     state.trim().to_lowercase()
 }
 
-fn resolve_required_string(raw: Option<String>, field_name: &str) -> Result<String> {
+fn reject_legacy_codex_block(config: &serde_yaml::Value) -> Result<()> {
+    if config.get("codex").is_some() {
+        return Err(anyhow!(
+            "invalid_workflow_config: top-level `codex` is no longer supported; use agent.provider plus providers.codex"
+        ));
+    }
+
+    Ok(())
+}
+
+fn resolve_provider_id(raw: Option<String>) -> Result<ProviderId> {
+    ProviderId::parse(resolve_required_string(raw, "agent.provider")?)
+}
+
+pub(crate) fn resolve_required_string(raw: Option<String>, field_name: &str) -> Result<String> {
     resolve_optional_string(raw)
         .ok_or_else(|| anyhow!("invalid_workflow_config: {field_name} is required"))
 }
@@ -502,7 +457,7 @@ fn resolve_secret(raw: Option<String>, fallback_envs: &[&str]) -> Option<String>
     }
 }
 
-fn expand_path(raw: &str) -> Result<PathBuf> {
+pub(crate) fn expand_path(raw: &str) -> Result<PathBuf> {
     let value = if raw.starts_with('$') && !raw.contains('/') {
         env::var(raw.trim_start_matches('$'))
             .with_context(|| format!("environment variable {raw} is not set"))?
@@ -524,14 +479,18 @@ fn expand_path(raw: &str) -> Result<PathBuf> {
     Ok(expanded)
 }
 
-fn resolve_u32(value: Option<IntOrString>, field_name: &str) -> Result<Option<u32>> {
+pub(crate) fn resolve_u32(value: Option<IntOrString>, field_name: &str) -> Result<Option<u32>> {
     Ok(resolve_optional_u64(value, field_name)?
         .map(|value| u32::try_from(value))
         .transpose()
         .map_err(|_| anyhow!("invalid_workflow_config: {field_name} is out of range"))?)
 }
 
-fn resolve_usize(value: Option<IntOrString>, default: usize, field_name: &str) -> Result<usize> {
+pub(crate) fn resolve_usize(
+    value: Option<IntOrString>,
+    default: usize,
+    field_name: &str,
+) -> Result<usize> {
     match resolve_optional_u64(value, field_name)? {
         Some(value) => usize::try_from(value)
             .map_err(|_| anyhow!("invalid_workflow_config: {field_name} is out of range")),
@@ -539,11 +498,18 @@ fn resolve_usize(value: Option<IntOrString>, default: usize, field_name: &str) -
     }
 }
 
-fn resolve_u64(value: Option<IntOrString>, default: u64, field_name: &str) -> Result<u64> {
+pub(crate) fn resolve_u64(
+    value: Option<IntOrString>,
+    default: u64,
+    field_name: &str,
+) -> Result<u64> {
     Ok(resolve_optional_u64(value, field_name)?.unwrap_or(default))
 }
 
-fn resolve_optional_u64(value: Option<IntOrString>, field_name: &str) -> Result<Option<u64>> {
+pub(crate) fn resolve_optional_u64(
+    value: Option<IntOrString>,
+    field_name: &str,
+) -> Result<Option<u64>> {
     match value {
         Some(IntOrString::Int(value)) => Ok(Some(value)),
         Some(IntOrString::String(value)) => {
@@ -564,7 +530,7 @@ fn resolve_optional_u64(value: Option<IntOrString>, field_name: &str) -> Result<
     }
 }
 
-fn resolve_optional_string(raw: Option<String>) -> Option<String> {
+pub(crate) fn resolve_optional_string(raw: Option<String>) -> Option<String> {
     match raw {
         Some(value) if value.starts_with('$') && !value.contains('/') => {
             env::var(value.trim_start_matches('$'))
@@ -576,7 +542,10 @@ fn resolve_optional_string(raw: Option<String>) -> Option<String> {
     }
 }
 
-fn resolve_optional_bool(value: Option<BoolOrString>, field_name: &str) -> Result<Option<bool>> {
+pub(crate) fn resolve_optional_bool(
+    value: Option<BoolOrString>,
+    field_name: &str,
+) -> Result<Option<bool>> {
     match value {
         Some(BoolOrString::Bool(value)) => Ok(Some(value)),
         Some(BoolOrString::String(value)) => {
@@ -601,29 +570,9 @@ fn resolve_optional_bool(value: Option<BoolOrString>, field_name: &str) -> Resul
     }
 }
 
-fn validate_reasoning_effort(value: &str) -> Result<()> {
-    match value {
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(()),
-        _ => Err(anyhow!(
-            "invalid_workflow_config: codex.reasoning_effort must be one of none, minimal, low, medium, high, xhigh"
-        )),
-    }
-}
-
-fn default_approval_policy() -> JsonValue {
-    json!({
-        "reject": {
-            "sandbox_approval": true,
-            "rules": true,
-            "mcp_elicitations": true
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::env;
-    use std::path::Path;
 
     use crate::model::WorkflowDefinition;
 
@@ -639,6 +588,10 @@ tracker:
   kind: github
   owner: openai
   project_v2_number: 7
+agent:
+  provider: codex
+providers:
+  codex: {}
 "#,
             )
             .unwrap(),
@@ -647,6 +600,83 @@ tracker:
 
         let settings = Settings::from_workflow(&definition).unwrap();
         assert_eq!(settings.tracker.api_key, "token-123");
+    }
+
+    #[test]
+    fn rejects_legacy_codex_block() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+agent:
+  provider: codex
+providers:
+  codex: {}
+codex:
+  command: codex app-server
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let error = Settings::from_workflow(&definition)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("top-level `codex` is no longer supported"));
+    }
+
+    #[test]
+    fn accepts_unknown_provider_when_selected_block_exists() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+agent:
+  provider: claude
+providers:
+  claude: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(settings.agent.provider.as_str(), "claude");
+        assert!(settings.providers.get(&settings.agent.provider).is_some());
+    }
+
+    #[test]
+    fn rejects_missing_selected_provider_block() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+agent:
+  provider: claude
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let error = Settings::from_workflow(&definition)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("providers.claude is required"));
     }
 
     #[test]
@@ -663,6 +693,10 @@ tracker:
   owner: $SYMPHONY_GITHUB_OWNER
   repo: $SYMPHONY_GITHUB_REPO
   project_v2_number: 7
+agent:
+  provider: codex
+providers:
+  codex: {}
 "#,
             )
             .unwrap(),
@@ -686,7 +720,10 @@ tracker:
   owner: openai
   project_v2_number: 7
 agent:
+  provider: codex
   assignee_login: $SYMPHONY_AGENT_ASSIGNEE
+providers:
+  codex: {}
 "#,
             )
             .unwrap(),
@@ -698,166 +735,8 @@ agent:
     }
 
     #[test]
-    fn resolves_env_backed_codex_model() {
-        env::set_var("GITHUB_TOKEN", "token-123");
-        env::set_var("SYMPHONY_CODEX_MODEL", "gpt-5.4");
-        let definition = WorkflowDefinition {
-            config: serde_yaml::from_str(
-                r#"
-tracker:
-  kind: github
-  owner: openai
-  project_v2_number: 7
-codex:
-  model: $SYMPHONY_CODEX_MODEL
-"#,
-            )
-            .unwrap(),
-            prompt_template: String::new(),
-        };
-
-        let settings = Settings::from_workflow(&definition).unwrap();
-        assert_eq!(settings.codex.model.as_deref(), Some("gpt-5.4"));
-    }
-
-    #[test]
-    fn resolves_env_backed_codex_reasoning_effort() {
-        env::set_var("GITHUB_TOKEN", "token-123");
-        env::set_var("SYMPHONY_CODEX_REASONING_EFFORT", "high");
-        let definition = WorkflowDefinition {
-            config: serde_yaml::from_str(
-                r#"
-tracker:
-  kind: github
-  owner: openai
-  project_v2_number: 7
-codex:
-  reasoning_effort: $SYMPHONY_CODEX_REASONING_EFFORT
-"#,
-            )
-            .unwrap(),
-            prompt_template: String::new(),
-        };
-
-        let settings = Settings::from_workflow(&definition).unwrap();
-        assert_eq!(settings.codex.reasoning_effort.as_deref(), Some("high"));
-    }
-
-    #[test]
-    fn resolves_env_backed_codex_fast_flag() {
-        env::set_var("GITHUB_TOKEN", "token-123");
-        env::set_var("SYMPHONY_CODEX_FAST", "true");
-        let definition = WorkflowDefinition {
-            config: serde_yaml::from_str(
-                r#"
-tracker:
-  kind: github
-  owner: openai
-  project_v2_number: 7
-codex:
-  fast: $SYMPHONY_CODEX_FAST
-"#,
-            )
-            .unwrap(),
-            prompt_template: String::new(),
-        };
-
-        let settings = Settings::from_workflow(&definition).unwrap();
-        assert_eq!(settings.codex.fast, Some(true));
-    }
-
-    #[test]
     fn normalizes_states_for_lookup() {
         assert_eq!(normalize_issue_state(" In Progress "), "in progress");
-    }
-
-    #[test]
-    fn default_turn_sandbox_policy_uses_workspace_root() {
-        env::set_var("GITHUB_TOKEN", "token-123");
-        let definition = WorkflowDefinition {
-            config: serde_yaml::from_str(
-                r#"
-tracker:
-  kind: github
-  owner: openai
-  project_v2_number: 7
-"#,
-            )
-            .unwrap(),
-            prompt_template: String::new(),
-        };
-
-        let settings = Settings::from_workflow(&definition).unwrap();
-        let policy = settings.turn_sandbox_policy(Path::new("/tmp/workspace"));
-
-        assert_eq!(policy["type"], "workspaceWrite");
-        assert_eq!(
-            policy["writableRoots"],
-            serde_json::json!(["/tmp/workspace"])
-        );
-    }
-
-    #[test]
-    fn explicit_workspace_write_policy_injects_workspace_root_when_missing() {
-        env::set_var("GITHUB_TOKEN", "token-123");
-        let definition = WorkflowDefinition {
-            config: serde_yaml::from_str(
-                r#"
-tracker:
-  kind: github
-  owner: openai
-  project_v2_number: 7
-codex:
-  turn_sandbox_policy:
-    type: workspaceWrite
-    networkAccess: true
-"#,
-            )
-            .unwrap(),
-            prompt_template: String::new(),
-        };
-
-        let settings = Settings::from_workflow(&definition).unwrap();
-        let policy = settings.turn_sandbox_policy(Path::new("/tmp/workspace"));
-
-        assert_eq!(policy["type"], "workspaceWrite");
-        assert_eq!(policy["networkAccess"], serde_json::json!(true));
-        assert_eq!(
-            policy["writableRoots"],
-            serde_json::json!(["/tmp/workspace"])
-        );
-    }
-
-    #[test]
-    fn explicit_writable_roots_are_preserved() {
-        env::set_var("GITHUB_TOKEN", "token-123");
-        let definition = WorkflowDefinition {
-            config: serde_yaml::from_str(
-                r#"
-tracker:
-  kind: github
-  owner: openai
-  project_v2_number: 7
-codex:
-  turn_sandbox_policy:
-    type: workspaceWrite
-    writableRoots:
-      - relative/path
-    networkAccess: true
-"#,
-            )
-            .unwrap(),
-            prompt_template: String::new(),
-        };
-
-        let settings = Settings::from_workflow(&definition).unwrap();
-        let policy = settings.turn_sandbox_policy(Path::new("/tmp/workspace"));
-
-        assert_eq!(
-            policy["writableRoots"],
-            serde_json::json!(["relative/path"])
-        );
-        assert_eq!(policy["networkAccess"], serde_json::json!(true));
     }
 
     #[test]
@@ -876,6 +755,10 @@ tracker:
   owner: dbachko
   project_v2_number: $SYMPHONY_PROJECT_NUMBER
   project_url: $SYMPHONY_PROJECT_URL
+agent:
+  provider: codex
+providers:
+  codex: {}
 "#,
             )
             .unwrap(),

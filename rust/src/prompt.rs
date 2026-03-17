@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use liquid::object;
 
 use crate::model::Issue;
+use crate::providers::is_bootstrap_workpad;
 use crate::workflow::WorkflowSnapshot;
 
 pub fn build_prompt(
@@ -69,7 +70,7 @@ pub fn build_prompt(
 
 pub fn continuation_prompt(issue: &Issue, turn_number: usize, max_turns: usize) -> String {
     let mut guidance = format!(
-        "Continuation guidance:\n\n- The previous Codex turn completed normally, but GitHub issue `{}` is still in active state `{}`.\n- This is continuation turn #{turn_number} of {max_turns} for the current agent run.\n- Resume from the current workspace and workpad state instead of restarting from scratch.\n- The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.\n- Focus on the remaining issue work and do not end the turn while the issue stays active unless you are truly blocked.\n",
+        "Continuation guidance:\n\n- The previous agent turn completed normally, but GitHub issue `{}` is still in active state `{}`.\n- This is continuation turn #{turn_number} of {max_turns} for the current agent run.\n- Resume from the current workspace and workpad state instead of restarting from scratch.\n- The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.\n- Focus on the remaining issue work and do not end the turn while the issue stays active unless you are truly blocked.\n",
         issue.identifier, issue.state
     );
 
@@ -84,9 +85,7 @@ pub fn continuation_prompt(issue: &Issue, turn_number: usize, max_turns: usize) 
         guidance.push_str(body);
         guidance.push_str("\n```\n");
 
-        if body.contains("Bootstrap created by Symphony runtime before the first Codex turn.")
-            || !body.contains("[x]")
-        {
+        if is_bootstrap_workpad(body) || !body.contains("[x]") {
             guidance.push_str(
                 "\n- The workpad is still bootstrap-only or otherwise not reconciled. Your first action this turn must be to update that existing workpad comment with real plan/checklist progress before any further implementation or review handoff work.\n",
             );
@@ -100,6 +99,10 @@ pub fn continuation_prompt(issue: &Issue, turn_number: usize, max_turns: usize) 
 mod tests {
     use crate::config::Settings;
     use crate::model::{Issue, WorkflowDefinition};
+    use crate::providers::{
+        AGENT_BOOTSTRAP_NOTE, AGENT_WORKPAD_HEADER, LEGACY_CODEX_BOOTSTRAP_NOTE,
+        LEGACY_CODEX_WORKPAD_HEADER,
+    };
     use crate::workflow::WorkflowSnapshot;
 
     use super::{build_prompt, continuation_prompt};
@@ -114,6 +117,10 @@ tracker:
   owner: openai
   project_v2_number: 7
   api_key: fake
+agent:
+  provider: codex
+providers:
+  codex: {}
 "#,
             )
             .unwrap(),
@@ -161,6 +168,10 @@ tracker:
   project_v2_number: 7
   project_url: https://github.com/users/dbachko/projects/7
   api_key: fake
+agent:
+  provider: codex
+providers:
+  codex: {}
 "#,
             )
             .unwrap(),
@@ -217,14 +228,43 @@ tracker:
             workpad_comment_url: Some(
                 "https://github.com/dbachko/symphony-gh/issues/1#issuecomment-99".to_string(),
             ),
-            workpad_comment_body: Some(
-                "## Codex Workpad\n\n### Notes\n\n- Bootstrap created by Symphony runtime before the first Codex turn.\n"
-                    .to_string(),
-            ),
+            workpad_comment_body: Some(format!(
+                "{AGENT_WORKPAD_HEADER}\n\n### Notes\n\n- {AGENT_BOOTSTRAP_NOTE}\n"
+            )),
         };
 
         let prompt = continuation_prompt(&issue, 2, 20);
         assert!(prompt.contains("first action this turn must be to update"));
         assert!(prompt.contains("issuecomment-99"));
+    }
+
+    #[test]
+    fn continuation_prompt_recognizes_legacy_bootstrap_workpad() {
+        let issue = Issue {
+            id: "1".to_string(),
+            project_item_id: None,
+            identifier: "dbachko/symphony-gh#1".to_string(),
+            title: "Continuation".to_string(),
+            description: None,
+            priority: None,
+            state: "In Progress".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/dbachko/symphony-gh/issues/1".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: Some(99),
+            workpad_comment_url: Some(
+                "https://github.com/dbachko/symphony-gh/issues/1#issuecomment-99".to_string(),
+            ),
+            workpad_comment_body: Some(format!(
+                "{LEGACY_CODEX_WORKPAD_HEADER}\n\n### Notes\n\n- {LEGACY_CODEX_BOOTSTRAP_NOTE}\n"
+            )),
+        };
+
+        let prompt = continuation_prompt(&issue, 2, 20);
+        assert!(prompt.contains("first action this turn must be to update"));
     }
 }

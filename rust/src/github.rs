@@ -13,6 +13,7 @@ use tracing::debug;
 
 use crate::config::{FieldSourceType, GitHubMode, TrackerSettings};
 use crate::model::{BlockerRef, Issue};
+use crate::providers::is_workpad_comment;
 
 #[async_trait]
 pub trait Tracker: Send + Sync {
@@ -614,7 +615,7 @@ mutation SymphonyUpdateProjectItemStatus(
         if let Some(comment) = comments
             .into_iter()
             .rev()
-            .find(|comment| comment.body.contains("## Codex Workpad"))
+            .find(|comment| is_workpad_comment(&comment.body))
         {
             let mut updated = issue.clone();
             updated.workpad_comment_id = Some(comment.id);
@@ -647,7 +648,7 @@ mutation SymphonyUpdateProjectItemStatus(
         if let Some(comment) = comments
             .into_iter()
             .rev()
-            .find(|comment| comment.body.contains("## Codex Workpad"))
+            .find(|comment| is_workpad_comment(&comment.body))
         {
             updated.workpad_comment_id = Some(comment.id);
             updated.workpad_comment_url = comment.html_url;
@@ -1492,8 +1493,18 @@ mod tests {
     use super::{is_rate_limited_error, GitHubTracker, PullRequestChecksState, Tracker};
 
     fn settings(yaml: &str) -> Settings {
+        let yaml = if yaml.contains("\nagent:") || yaml.starts_with("agent:") {
+            yaml.to_string()
+        } else {
+            format!("{yaml}\nagent:\n  provider: codex\n")
+        };
+        let yaml = if yaml.contains("\nproviders:") || yaml.starts_with("providers:") {
+            yaml
+        } else {
+            format!("{yaml}providers:\n  codex: {{}}\n")
+        };
         let definition = WorkflowDefinition {
-            config: serde_yaml::from_str(yaml).unwrap(),
+            config: serde_yaml::from_str(&yaml).unwrap(),
             prompt_template: String::new(),
         };
         Settings::from_workflow(&definition).unwrap()
@@ -2264,6 +2275,72 @@ mod tests {
                 },
                 {
                     "id": 9,
+                    "body": "## Agent Workpad\n\nexisting",
+                    "html_url": "https://github.com/openai/symphony/issues/42#issuecomment-9"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  repo: symphony
+  mode: issues_only
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issue = Issue {
+            id: "issue-node-42".to_string(),
+            project_item_id: None,
+            identifier: "openai/symphony#42".to_string(),
+            title: "Issue".to_string(),
+            description: None,
+            priority: None,
+            state: "Todo".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/symphony/issues/42".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let updated = tracker
+            .ensure_workpad_comment(&issue, "## Agent Workpad\n\nnew")
+            .await
+            .unwrap();
+
+        assert_eq!(updated.workpad_comment_id, Some(9));
+        assert_eq!(
+            updated.workpad_comment_url.as_deref(),
+            Some("https://github.com/openai/symphony/issues/42#issuecomment-9")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_workpad_comment_reuses_legacy_codex_comment() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/symphony/issues/42/comments"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 9,
                     "body": "## Codex Workpad\n\nexisting",
                     "html_url": "https://github.com/openai/symphony/issues/42#issuecomment-9"
                 }
@@ -2309,7 +2386,7 @@ mod tests {
         };
 
         let updated = tracker
-            .ensure_workpad_comment(&issue, "## Codex Workpad\n\nnew")
+            .ensure_workpad_comment(&issue, "## Agent Workpad\n\nnew")
             .await
             .unwrap();
 
@@ -2317,6 +2394,10 @@ mod tests {
         assert_eq!(
             updated.workpad_comment_url.as_deref(),
             Some("https://github.com/openai/symphony/issues/42#issuecomment-9")
+        );
+        assert_eq!(
+            updated.workpad_comment_body.as_deref(),
+            Some("## Codex Workpad\n\nexisting")
         );
     }
 
@@ -2333,10 +2414,10 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/repos/openai/symphony/issues/42/comments"))
-            .and(body_string_contains("## Codex Workpad"))
+            .and(body_string_contains("## Agent Workpad"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": 11,
-                "body": "## Codex Workpad\n\ncreated",
+                "body": "## Agent Workpad\n\ncreated",
                 "html_url": "https://github.com/openai/symphony/issues/42#issuecomment-11"
             })))
             .mount(&server)
@@ -2380,7 +2461,7 @@ mod tests {
         };
 
         let updated = tracker
-            .ensure_workpad_comment(&issue, "## Codex Workpad\n\ncreated")
+            .ensure_workpad_comment(&issue, "## Agent Workpad\n\ncreated")
             .await
             .unwrap();
 

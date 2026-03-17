@@ -77,6 +77,9 @@ struct DoctorArgs {
 
 #[derive(Debug, Args)]
 struct AuthArgs {
+    #[arg(long, default_value = "codex")]
+    provider: String,
+
     #[command(subcommand)]
     command: AuthCommand,
 }
@@ -139,15 +142,17 @@ async fn main() -> Result<()> {
         .await
         .map(|_| ()),
         Command::Auth(AuthArgs {
+            provider,
             command: AuthCommand::Status,
         }) => {
-            let status = inspect_status();
+            let status = inspect_status(&provider)?;
             println!("{}", serde_json::to_string_pretty(&status)?);
             Ok(())
         }
         Command::Auth(AuthArgs {
+            provider,
             command: AuthCommand::Login(args),
-        }) => run_login(args.mode.into()),
+        }) => run_login(&provider, args.mode.into()),
     }
 }
 

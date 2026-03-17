@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use chrono::Utc;
 use reqwest::Method;
 use serde_json::{json, Value as JsonValue};
@@ -13,9 +14,12 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
+use crate::agent::{AgentBackend, AgentEvent, AgentEventKind, AgentSession, TurnResult};
 use crate::config::Settings;
 use crate::github::GitHubTracker;
 use crate::model::Issue;
+
+use super::config::CodexConfig;
 
 const INITIALIZE_ID: u64 = 1;
 const THREAD_START_ID: u64 = 2;
@@ -24,41 +28,24 @@ const NON_INTERACTIVE_TOOL_INPUT_ANSWER: &str =
     "This is a non-interactive session. Operator input is unavailable.";
 
 #[derive(Debug, Clone)]
-pub struct AppServerEvent {
-    pub event: AppServerEventKind,
-    pub timestamp: chrono::DateTime<Utc>,
-    pub payload: JsonValue,
-    pub session_id: Option<String>,
-    pub codex_app_server_pid: Option<String>,
+pub struct CodexBackend;
+
+#[async_trait]
+impl AgentBackend for CodexBackend {
+    async fn start_session(
+        &self,
+        settings: &Settings,
+        tracker: Arc<GitHubTracker>,
+        workspace: &Path,
+    ) -> Result<Box<dyn AgentSession>> {
+        Ok(Box::new(
+            CodexSession::start(settings, tracker, workspace).await?,
+        ))
+    }
 }
 
-#[derive(Debug, Clone)]
-pub enum AppServerEventKind {
-    SessionStarted,
-    Notification,
-    TurnCompleted,
-    TurnFailed,
-    TurnCancelled,
-    TurnInputRequired,
-    ApprovalAutoApproved,
-    ApprovalRequired,
-    ToolCallCompleted,
-    ToolCallFailed,
-    UnsupportedToolCall,
-    ToolInputAutoAnswered,
-    Malformed,
-    OtherMessage,
-    TurnEndedWithError,
-}
-
-#[derive(Debug, Clone)]
-pub struct TurnResult {
-    pub session_id: String,
-    pub thread_id: String,
-    pub turn_id: String,
-}
-
-pub struct AppServerSession {
+pub struct CodexSession {
+    config: CodexConfig,
     child: Child,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
@@ -70,13 +57,34 @@ pub struct AppServerSession {
     tracker: Arc<GitHubTracker>,
 }
 
-impl AppServerSession {
+#[async_trait]
+impl AgentSession for CodexSession {
+    async fn run_turn(
+        &mut self,
+        issue: &Issue,
+        prompt: &str,
+        on_event: &UnboundedSender<AgentEvent>,
+    ) -> Result<TurnResult> {
+        self.run_turn_internal(issue, prompt, on_event).await
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        self.stop_internal().await
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        self.process_id_internal()
+    }
+}
+
+impl CodexSession {
     pub async fn start(
         settings: &Settings,
         tracker: Arc<GitHubTracker>,
         workspace: &Path,
     ) -> Result<Self> {
         validate_workspace_cwd(&settings.workspace.root, workspace)?;
+        let config = super::config::load(settings)?;
 
         let cargo_home = workspace.join(".cargo-home");
         tokio::fs::create_dir_all(&cargo_home)
@@ -84,7 +92,7 @@ impl AppServerSession {
             .context("failed to create workspace cargo home")?;
 
         let mut command = Command::new("bash");
-        command.arg("-lc").arg(&settings.codex.command);
+        command.arg("-lc").arg(&config.command);
         command.current_dir(workspace);
         command.env("CARGO_HOME", &cargo_home);
         command.env("GITHUB_TOKEN", tracker.settings().api_key.as_str());
@@ -110,12 +118,13 @@ impl AppServerSession {
         }
 
         let workspace_path = workspace.to_path_buf();
-        let approval_policy = settings.codex.approval_policy.clone();
-        let turn_sandbox_policy = settings.turn_sandbox_policy(workspace);
+        let approval_policy = config.approval_policy.clone();
+        let turn_sandbox_policy = config.turn_sandbox_policy(workspace);
         let auto_approve_requests =
             matches!(&approval_policy, JsonValue::String(value) if value == "never");
 
         let mut session = Self {
+            config,
             child,
             stdin,
             stdout: BufReader::new(stdout).lines(),
@@ -127,28 +136,47 @@ impl AppServerSession {
             tracker,
         };
 
-        session.send_initialize(settings).await?;
-        session.thread_id = session.start_thread(settings).await?;
+        session.send_initialize().await?;
+        session.thread_id = session.start_thread().await?;
         Ok(session)
     }
 
     pub fn process_id(&self) -> Option<u32> {
-        self.child.id()
+        self.process_id_internal()
     }
 
     pub async fn run_turn(
         &mut self,
-        settings: &Settings,
         issue: &Issue,
         prompt: &str,
-        on_event: &UnboundedSender<AppServerEvent>,
+        on_event: &UnboundedSender<AgentEvent>,
     ) -> Result<TurnResult> {
-        let turn_id = self.start_turn(settings, issue, prompt).await?;
-        emit_session_started(on_event, self.process_id(), &self.thread_id, &turn_id);
+        self.run_turn_internal(issue, prompt, on_event).await
+    }
 
-        let turn_id = self
-            .await_turn_completion(settings, Some(turn_id), on_event)
-            .await?;
+    pub async fn stop(&mut self) -> Result<()> {
+        self.stop_internal().await
+    }
+
+    fn process_id_internal(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    async fn run_turn_internal(
+        &mut self,
+        issue: &Issue,
+        prompt: &str,
+        on_event: &UnboundedSender<AgentEvent>,
+    ) -> Result<TurnResult> {
+        let turn_id = self.start_turn(issue, prompt).await?;
+        emit_session_started(
+            on_event,
+            self.process_id_internal(),
+            &self.thread_id,
+            &turn_id,
+        );
+
+        let turn_id = self.await_turn_completion(Some(turn_id), on_event).await?;
         let session_id = format!("{}-{turn_id}", self.thread_id);
 
         Ok(TurnResult {
@@ -158,7 +186,7 @@ impl AppServerSession {
         })
     }
 
-    pub async fn stop(&mut self) -> Result<()> {
+    async fn stop_internal(&mut self) -> Result<()> {
         if let Some(status) = self.child.try_wait()? {
             debug!(?status, "app-server already exited");
             return Ok(());
@@ -171,7 +199,7 @@ impl AppServerSession {
         Ok(())
     }
 
-    async fn send_initialize(&mut self, settings: &Settings) -> Result<()> {
+    async fn send_initialize(&mut self) -> Result<()> {
         self.write_message(json!({
             "method": "initialize",
             "id": INITIALIZE_ID,
@@ -189,7 +217,7 @@ impl AppServerSession {
         .await?;
 
         let _ = self
-            .await_response(INITIALIZE_ID, settings.codex.read_timeout_ms)
+            .await_response(INITIALIZE_ID, self.config.read_timeout_ms)
             .await?;
         self.write_message(json!({
             "method": "initialized",
@@ -199,23 +227,23 @@ impl AppServerSession {
         Ok(())
     }
 
-    async fn start_thread(&mut self, settings: &Settings) -> Result<String> {
+    async fn start_thread(&mut self) -> Result<String> {
         self.write_message(json!({
             "method": "thread/start",
             "id": THREAD_START_ID,
             "params": {
                 "approvalPolicy": self.approval_policy,
-                "sandbox": settings.codex.thread_sandbox,
+                "sandbox": self.config.thread_sandbox,
                 "cwd": self.workspace.to_string_lossy(),
                 "dynamicTools": dynamic_tool_specs(),
-                "model": settings.codex.model,
-                "serviceTier": service_tier(&settings.codex),
+                "model": self.config.model,
+                "serviceTier": self.config.service_tier(),
             }
         }))
         .await?;
 
         let payload = self
-            .await_response(THREAD_START_ID, settings.codex.read_timeout_ms)
+            .await_response(THREAD_START_ID, self.config.read_timeout_ms)
             .await?;
         payload
             .get("thread")
@@ -225,12 +253,7 @@ impl AppServerSession {
             .ok_or_else(|| anyhow!("invalid_thread_payload"))
     }
 
-    async fn start_turn(
-        &mut self,
-        settings: &Settings,
-        issue: &Issue,
-        prompt: &str,
-    ) -> Result<String> {
+    async fn start_turn(&mut self, issue: &Issue, prompt: &str) -> Result<String> {
         self.write_message(json!({
             "method": "turn/start",
             "id": TURN_START_ID,
@@ -246,9 +269,9 @@ impl AppServerSession {
                 "title": format!("{}: {}", issue.identifier, issue.title),
                 "approvalPolicy": self.approval_policy,
                 "sandboxPolicy": self.turn_sandbox_policy,
-                "model": settings.codex.model,
-                "effort": settings.codex.reasoning_effort,
-                "serviceTier": service_tier(&settings.codex),
+                "model": self.config.model,
+                "effort": self.config.reasoning_effort,
+                "serviceTier": self.config.service_tier(),
             }
         }))
         .await?;
@@ -298,37 +321,36 @@ impl AppServerSession {
 
     async fn await_turn_completion(
         &mut self,
-        settings: &Settings,
         initial_turn_id: Option<String>,
-        on_event: &UnboundedSender<AppServerEvent>,
+        on_event: &UnboundedSender<AgentEvent>,
     ) -> Result<String> {
         let turn_started = Instant::now();
         let mut last_event_at = Instant::now();
         let turn_id = initial_turn_id;
 
         loop {
-            if settings.codex.turn_timeout_ms > 0
-                && turn_started.elapsed() >= Duration::from_millis(settings.codex.turn_timeout_ms)
+            if self.config.turn_timeout_ms > 0
+                && turn_started.elapsed() >= Duration::from_millis(self.config.turn_timeout_ms)
             {
                 return Err(anyhow!("turn_timeout"));
             }
 
-            if settings.codex.stall_timeout_ms > 0
-                && last_event_at.elapsed() >= Duration::from_millis(settings.codex.stall_timeout_ms)
+            if self.config.stall_timeout_ms > 0
+                && last_event_at.elapsed() >= Duration::from_millis(self.config.stall_timeout_ms)
             {
                 return Err(anyhow!("turn_stalled"));
             }
 
-            let remaining_turn = if settings.codex.turn_timeout_ms == 0 {
+            let remaining_turn = if self.config.turn_timeout_ms == 0 {
                 Duration::from_secs(3600)
             } else {
-                Duration::from_millis(settings.codex.turn_timeout_ms)
+                Duration::from_millis(self.config.turn_timeout_ms)
                     .saturating_sub(turn_started.elapsed())
             };
-            let remaining_stall = if settings.codex.stall_timeout_ms == 0 {
+            let remaining_stall = if self.config.stall_timeout_ms == 0 {
                 Duration::from_secs(3600)
             } else {
-                Duration::from_millis(settings.codex.stall_timeout_ms)
+                Duration::from_millis(self.config.stall_timeout_ms)
                     .saturating_sub(last_event_at.elapsed())
             };
             let wait_for = remaining_turn.min(remaining_stall);
@@ -336,9 +358,9 @@ impl AppServerSession {
             let line = timeout(wait_for, self.stdout.next_line())
                 .await
                 .map_err(|_| {
-                    if settings.codex.stall_timeout_ms > 0
+                    if self.config.stall_timeout_ms > 0
                         && last_event_at.elapsed()
-                            >= Duration::from_millis(settings.codex.stall_timeout_ms)
+                            >= Duration::from_millis(self.config.stall_timeout_ms)
                     {
                         anyhow!("turn_stalled")
                     } else {
@@ -358,24 +380,24 @@ impl AppServerSession {
             let payload: JsonValue = match serde_json::from_str(&line) {
                 Ok(payload) => payload,
                 Err(_) => {
-                    let _ = on_event.send(AppServerEvent {
-                        event: AppServerEventKind::Malformed,
+                    let _ = on_event.send(AgentEvent {
+                        event: AgentEventKind::Malformed,
                         timestamp: now,
                         payload: json!({ "raw": line }),
                         session_id: current_session_id(&self.thread_id, turn_id.as_deref()),
-                        codex_app_server_pid: self.process_id().map(|value| value.to_string()),
+                        agent_process_pid: self.process_id().map(|value| value.to_string()),
                     });
                     continue;
                 }
             };
 
             let Some(method) = payload.get("method").and_then(JsonValue::as_str) else {
-                let _ = on_event.send(AppServerEvent {
-                    event: AppServerEventKind::OtherMessage,
+                let _ = on_event.send(AgentEvent {
+                    event: AgentEventKind::OtherMessage,
                     timestamp: now,
                     payload,
                     session_id: current_session_id(&self.thread_id, turn_id.as_deref()),
-                    codex_app_server_pid: self.process_id().map(|value| value.to_string()),
+                    agent_process_pid: self.process_id().map(|value| value.to_string()),
                 });
                 continue;
             };
@@ -394,48 +416,48 @@ impl AppServerSession {
                         })
                         .unwrap_or_else(|| "turn".to_string());
                     let session_id = format!("{}-{resolved_turn_id}", self.thread_id);
-                    let _ = on_event.send(AppServerEvent {
-                        event: AppServerEventKind::TurnCompleted,
+                    let _ = on_event.send(AgentEvent {
+                        event: AgentEventKind::TurnCompleted,
                         timestamp: now,
                         payload,
                         session_id: Some(session_id),
-                        codex_app_server_pid: self.process_id().map(|value| value.to_string()),
+                        agent_process_pid: self.process_id().map(|value| value.to_string()),
                     });
                     return Ok(resolved_turn_id);
                 }
                 "turn/failed" => {
                     let resolved_turn_id = turn_id.clone().unwrap_or_else(|| "turn".to_string());
                     let session_id = format!("{}-{resolved_turn_id}", self.thread_id);
-                    let _ = on_event.send(AppServerEvent {
-                        event: AppServerEventKind::TurnFailed,
+                    let _ = on_event.send(AgentEvent {
+                        event: AgentEventKind::TurnFailed,
                         timestamp: now,
                         payload: payload.clone(),
                         session_id: Some(session_id),
-                        codex_app_server_pid: self.process_id().map(|value| value.to_string()),
+                        agent_process_pid: self.process_id().map(|value| value.to_string()),
                     });
                     return Err(anyhow!("turn_failed: {}", payload));
                 }
                 "turn/cancelled" => {
                     let resolved_turn_id = turn_id.clone().unwrap_or_else(|| "turn".to_string());
                     let session_id = format!("{}-{resolved_turn_id}", self.thread_id);
-                    let _ = on_event.send(AppServerEvent {
-                        event: AppServerEventKind::TurnCancelled,
+                    let _ = on_event.send(AgentEvent {
+                        event: AgentEventKind::TurnCancelled,
                         timestamp: now,
                         payload: payload.clone(),
                         session_id: Some(session_id),
-                        codex_app_server_pid: self.process_id().map(|value| value.to_string()),
+                        agent_process_pid: self.process_id().map(|value| value.to_string()),
                     });
                     return Err(anyhow!("turn_cancelled: {}", payload));
                 }
                 "turn/input_required" => {
                     let resolved_turn_id = turn_id.clone().unwrap_or_else(|| "turn".to_string());
                     let session_id = format!("{}-{resolved_turn_id}", self.thread_id);
-                    let _ = on_event.send(AppServerEvent {
-                        event: AppServerEventKind::TurnInputRequired,
+                    let _ = on_event.send(AgentEvent {
+                        event: AgentEventKind::TurnInputRequired,
                         timestamp: now,
                         payload: payload.clone(),
                         session_id: Some(session_id),
-                        codex_app_server_pid: self.process_id().map(|value| value.to_string()),
+                        agent_process_pid: self.process_id().map(|value| value.to_string()),
                     });
                     return Err(anyhow!("turn_input_required: {}", payload));
                 }
@@ -448,23 +470,23 @@ impl AppServerSession {
                         let session_id = turn_id
                             .as_ref()
                             .map(|value| format!("{}-{value}", self.thread_id));
-                        let _ = on_event.send(AppServerEvent {
-                            event: AppServerEventKind::ApprovalAutoApproved,
+                        let _ = on_event.send(AgentEvent {
+                            event: AgentEventKind::ApprovalAutoApproved,
                             timestamp: now,
                             payload,
                             session_id,
-                            codex_app_server_pid: self.process_id().map(|value| value.to_string()),
+                            agent_process_pid: self.process_id().map(|value| value.to_string()),
                         });
                     } else {
                         let session_id = turn_id
                             .as_ref()
                             .map(|value| format!("{}-{value}", self.thread_id));
-                        let _ = on_event.send(AppServerEvent {
-                            event: AppServerEventKind::ApprovalRequired,
+                        let _ = on_event.send(AgentEvent {
+                            event: AgentEventKind::ApprovalRequired,
                             timestamp: now,
                             payload: payload.clone(),
                             session_id,
-                            codex_app_server_pid: self.process_id().map(|value| value.to_string()),
+                            agent_process_pid: self.process_id().map(|value| value.to_string()),
                         });
                         return Err(anyhow!("approval_required: {}", payload));
                     }
@@ -474,22 +496,22 @@ impl AppServerSession {
                     let session_id = turn_id
                         .as_ref()
                         .map(|value| format!("{}-{value}", self.thread_id));
-                    let _ = on_event.send(AppServerEvent {
+                    let _ = on_event.send(AgentEvent {
                         event: if success {
-                            AppServerEventKind::ToolCallCompleted
+                            AgentEventKind::ToolCallCompleted
                         } else if payload
                             .get("params")
                             .and_then(|params| params.get("tool").or_else(|| params.get("name")))
                             .is_none()
                         {
-                            AppServerEventKind::UnsupportedToolCall
+                            AgentEventKind::UnsupportedToolCall
                         } else {
-                            AppServerEventKind::ToolCallFailed
+                            AgentEventKind::ToolCallFailed
                         },
                         timestamp: now,
                         payload,
                         session_id,
-                        codex_app_server_pid: self.process_id().map(|value| value.to_string()),
+                        agent_process_pid: self.process_id().map(|value| value.to_string()),
                     });
                 }
                 "item/tool/requestUserInput" => {
@@ -497,12 +519,12 @@ impl AppServerSession {
                     let session_id = turn_id
                         .as_ref()
                         .map(|value| format!("{}-{value}", self.thread_id));
-                    let _ = on_event.send(AppServerEvent {
-                        event: AppServerEventKind::ToolInputAutoAnswered,
+                    let _ = on_event.send(AgentEvent {
+                        event: AgentEventKind::ToolInputAutoAnswered,
                         timestamp: now,
                         payload,
                         session_id,
-                        codex_app_server_pid: self.process_id().map(|value| value.to_string()),
+                        agent_process_pid: self.process_id().map(|value| value.to_string()),
                     });
                 }
                 other => {
@@ -510,12 +532,12 @@ impl AppServerSession {
                         let session_id = turn_id
                             .as_ref()
                             .map(|value| format!("{}-{value}", self.thread_id));
-                        let _ = on_event.send(AppServerEvent {
-                            event: AppServerEventKind::TurnInputRequired,
+                        let _ = on_event.send(AgentEvent {
+                            event: AgentEventKind::TurnInputRequired,
                             timestamp: now,
                             payload: payload.clone(),
                             session_id,
-                            codex_app_server_pid: self.process_id().map(|value| value.to_string()),
+                            agent_process_pid: self.process_id().map(|value| value.to_string()),
                         });
                         return Err(anyhow!("turn_input_required: {}", payload));
                     }
@@ -523,12 +545,12 @@ impl AppServerSession {
                     let session_id = turn_id
                         .as_ref()
                         .map(|value| format!("{}-{value}", self.thread_id));
-                    let _ = on_event.send(AppServerEvent {
-                        event: AppServerEventKind::Notification,
+                    let _ = on_event.send(AgentEvent {
+                        event: AgentEventKind::Notification,
                         timestamp: now,
                         payload,
                         session_id,
-                        codex_app_server_pid: self.process_id().map(|value| value.to_string()),
+                        agent_process_pid: self.process_id().map(|value| value.to_string()),
                     });
                 }
             }
@@ -694,14 +716,6 @@ fn validate_workspace_cwd(root: &Path, workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-fn service_tier(codex: &crate::config::CodexSettings) -> Option<&'static str> {
-    match codex.fast {
-        Some(true) => Some("fast"),
-        Some(false) => Some("flex"),
-        None => None,
-    }
-}
-
 async fn log_stderr(stderr: ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -790,14 +804,14 @@ fn strip_ansi_sequences(input: &str) -> String {
 }
 
 fn emit_session_started(
-    on_event: &UnboundedSender<AppServerEvent>,
+    on_event: &UnboundedSender<AgentEvent>,
     process_id: Option<u32>,
     thread_id: &str,
     turn_id: &str,
 ) {
     let session_id = format!("{thread_id}-{turn_id}");
-    let _ = on_event.send(AppServerEvent {
-        event: AppServerEventKind::SessionStarted,
+    let _ = on_event.send(AgentEvent {
+        event: AgentEventKind::SessionStarted,
         timestamp: Utc::now(),
         payload: json!({
             "session_id": session_id,
@@ -805,7 +819,7 @@ fn emit_session_started(
             "turn_id": turn_id,
         }),
         session_id: Some(session_id),
-        codex_app_server_pid: process_id.map(|value| value.to_string()),
+        agent_process_pid: process_id.map(|value| value.to_string()),
     });
 }
 
@@ -976,7 +990,7 @@ mod tests {
     use crate::github::GitHubTracker;
     use crate::model::{Issue, WorkflowDefinition};
 
-    use super::{AppServerEventKind, AppServerSession};
+    use super::{AgentEventKind, CodexSession};
 
     fn issue(identifier: &str) -> Issue {
         Issue {
@@ -1004,7 +1018,7 @@ mod tests {
         workspace_root: &std::path::Path,
         command: &str,
         tracker_extra: &str,
-        codex_extra: &str,
+        provider_extra: &str,
     ) -> Settings {
         let definition = WorkflowDefinition {
             config: serde_yaml::from_str(&format!(
@@ -1017,17 +1031,39 @@ tracker:
 {tracker_extra}
 workspace:
   root: {}
-codex:
-  command: "{}"
-{codex_extra}
+agent:
+  provider: codex
+providers:
+  codex:
+    command: "{}"
+{}
 "#,
                 workspace_root.display(),
                 command.replace('"', "\\\""),
+                indent_provider_extra(provider_extra),
             ))
             .unwrap(),
             prompt_template: "Prompt".to_string(),
         };
         Settings::from_workflow(&definition).unwrap()
+    }
+
+    fn indent_provider_extra(extra: &str) -> String {
+        if extra.trim().is_empty() {
+            String::new()
+        } else {
+            extra
+                .lines()
+                .map(|line| {
+                    if line.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("    {}", line.trim_start())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
     }
 
     fn tracker(settings: &Settings) -> Arc<GitHubTracker> {
@@ -1040,7 +1076,7 @@ codex:
         let settings = settings_with_command(dir.path(), "printf ''", "", "");
         let tracker = tracker(&settings);
 
-        let error = AppServerSession::start(&settings, tracker, dir.path())
+        let error = CodexSession::start(&settings, tracker, dir.path())
             .await
             .err()
             .expect("workspace root should be rejected")
@@ -1097,13 +1133,13 @@ done
     networkAccess: true"#,
         );
         let tracker = tracker(&settings);
-        let mut session = AppServerSession::start(&settings, tracker, &workspace)
+        let mut session = CodexSession::start(&settings, tracker, &workspace)
             .await
             .unwrap();
         let (tx, mut rx) = unbounded_channel();
 
         let error = session
-            .run_turn(&settings, &issue("ISSUE-1"), "prompt", &tx)
+            .run_turn(&issue("ISSUE-1"), "prompt", &tx)
             .await
             .unwrap_err()
             .to_string();
@@ -1111,7 +1147,7 @@ done
         assert!(error.contains("turn_input_required"));
         let mut saw_input_required = false;
         while let Ok(event) = rx.try_recv() {
-            if matches!(event.event, AppServerEventKind::TurnInputRequired) {
+            if matches!(event.event, AgentEventKind::TurnInputRequired) {
                 saw_input_required = true;
             }
         }
@@ -1153,13 +1189,13 @@ done
         let settings =
             settings_with_command(&workspace_root, &script.display().to_string(), "", "");
         let tracker = tracker(&settings);
-        let mut session = AppServerSession::start(&settings, tracker, &workspace)
+        let mut session = CodexSession::start(&settings, tracker, &workspace)
             .await
             .unwrap();
         let (tx, _rx) = unbounded_channel();
 
         let error = session
-            .run_turn(&settings, &issue("ISSUE-2"), "prompt", &tx)
+            .run_turn(&issue("ISSUE-2"), "prompt", &tx)
             .await
             .unwrap_err()
             .to_string();
@@ -1215,13 +1251,13 @@ done
   fast: true"#,
         );
         let tracker = tracker(&settings);
-        let mut session = AppServerSession::start(&settings, tracker, &workspace)
+        let mut session = CodexSession::start(&settings, tracker, &workspace)
             .await
             .unwrap();
         let (tx, _rx) = unbounded_channel();
 
         let result = session
-            .run_turn(&settings, &issue("ISSUE-3"), "prompt", &tx)
+            .run_turn(&issue("ISSUE-3"), "prompt", &tx)
             .await
             .unwrap();
         assert_eq!(result.turn_id, "turn-3");
@@ -1316,13 +1352,13 @@ done
         let settings =
             settings_with_command(&workspace_root, &script.display().to_string(), "", "");
         let tracker = tracker(&settings);
-        let mut session = AppServerSession::start(&settings, tracker, &workspace)
+        let mut session = CodexSession::start(&settings, tracker, &workspace)
             .await
             .unwrap();
         let (tx, _rx) = unbounded_channel();
 
         session
-            .run_turn(&settings, &issue("ISSUE-4"), "prompt", &tx)
+            .run_turn(&issue("ISSUE-4"), "prompt", &tx)
             .await
             .unwrap();
 
@@ -1391,13 +1427,13 @@ done
             "",
         );
         let tracker = tracker(&settings);
-        let mut session = AppServerSession::start(&settings, tracker, &workspace)
+        let mut session = CodexSession::start(&settings, tracker, &workspace)
             .await
             .unwrap();
         let (tx, _rx) = unbounded_channel();
 
         session
-            .run_turn(&settings, &issue("ISSUE-5"), "prompt", &tx)
+            .run_turn(&issue("ISSUE-5"), "prompt", &tx)
             .await
             .unwrap();
 

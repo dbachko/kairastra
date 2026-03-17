@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 
-use crate::auth::AuthMode;
 use crate::deploy::DeployMode;
 use crate::doctor::{self, DoctorFormat, DoctorOptions};
+use crate::providers::{self, ProviderSetupConfig};
 
 #[derive(Debug, Clone)]
 pub struct SetupOptions {
@@ -20,6 +20,7 @@ pub struct SetupOptions {
 
 #[derive(Debug, Clone)]
 struct SetupValues {
+    provider: String,
     github_owner: String,
     github_repo: String,
     github_project_number: String,
@@ -30,10 +31,7 @@ struct SetupValues {
     assignee_login: String,
     max_concurrent_agents: String,
     max_turns: String,
-    auth_mode: AuthMode,
-    codex_model: String,
-    codex_reasoning_effort: String,
-    codex_fast: bool,
+    provider_config: ProviderSetupConfig,
     github_token: String,
     openai_api_key: String,
     rust_log: String,
@@ -101,9 +99,11 @@ pub async fn run(options: SetupOptions) -> Result<()> {
             "2. Start Docker mode: {}",
             docker_make_command(&layout, "docker-up")
         );
-        if values.auth_mode == AuthMode::Chatgpt {
+        if providers::setup_auth_mode(&values.provider_config) == crate::auth::AuthMode::Chatgpt {
             println!(
-                "3. Initialize Codex auth in the container: {}",
+                "3. {}: {}",
+                providers::docker_login_message(&values.provider)
+                    .unwrap_or("Initialize provider auth in the container"),
                 docker_make_command(&layout, "docker-login")
             );
         }
@@ -170,12 +170,7 @@ fn resolve_workflow_path(layout: &SetupLayout, explicit: Option<&PathBuf>) -> Pa
         return path.clone();
     }
 
-    let default = layout.repo_root.join("WORKFLOW.md");
-    if default.exists() {
-        layout.repo_root.join("WORKFLOW.generated.md")
-    } else {
-        default
-    }
+    layout.repo_root.join("WORKFLOW.md")
 }
 
 fn resolve_env_file_path(
@@ -322,33 +317,15 @@ fn collect_values(
         non_interactive,
         false,
     )?;
-    let auth_mode = ask_auth_mode(&theme, non_interactive)?;
-    let codex_model = ask_string(
-        &theme,
-        "Codex model (optional)",
-        std::env::var("SYMPHONY_CODEX_MODEL").unwrap_or_default(),
-        non_interactive,
-        true,
-    )?;
-    let codex_reasoning_effort = ask_string(
-        &theme,
-        "Thinking effort (optional: none|minimal|low|medium|high|xhigh)",
-        std::env::var("SYMPHONY_CODEX_REASONING_EFFORT").unwrap_or_default(),
-        non_interactive,
-        true,
-    )?;
-    let codex_fast = ask_bool(
-        &theme,
-        "Enable Codex fast mode",
-        env_bool("SYMPHONY_CODEX_FAST").unwrap_or(false),
-        non_interactive,
-    )?;
+    let provider = providers::default_setup_provider().to_string();
+    let provider_config = providers::collect_setup_config(&provider, non_interactive)?;
     let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
     let openai_api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let binary_path = detect_binary_path(explicit_binary_path);
 
     Ok(SetupValues {
+        provider,
         github_owner,
         github_repo,
         github_project_number,
@@ -359,10 +336,7 @@ fn collect_values(
         assignee_login,
         max_concurrent_agents,
         max_turns,
-        auth_mode,
-        codex_model,
-        codex_reasoning_effort,
-        codex_fast,
+        provider_config,
         github_token,
         openai_api_key,
         rust_log,
@@ -482,30 +456,6 @@ fn parse_repo_input(value: &str) -> Option<ParsedRepoInput> {
     })
 }
 
-fn ask_auth_mode(theme: &ColorfulTheme, non_interactive: bool) -> Result<AuthMode> {
-    if non_interactive {
-        return Ok(AuthMode::from_env());
-    }
-
-    let items = [
-        "ChatGPT subscription / device login",
-        "OpenAI API key bootstrap",
-    ];
-    let default = match AuthMode::from_env() {
-        AuthMode::ApiKey => 1,
-        _ => 0,
-    };
-    let selection = Select::with_theme(theme)
-        .with_prompt("Codex auth flow")
-        .items(&items)
-        .default(default)
-        .interact()?;
-    Ok(match selection {
-        1 => AuthMode::ApiKey,
-        _ => AuthMode::Chatgpt,
-    })
-}
-
 fn ask_string(
     theme: &ColorfulTheme,
     prompt: &str,
@@ -524,32 +474,6 @@ fn ask_string(
         Ok(value.trim().to_string())
     } else {
         Ok(default)
-    }
-}
-
-fn ask_bool(
-    theme: &ColorfulTheme,
-    prompt: &str,
-    default: bool,
-    non_interactive: bool,
-) -> Result<bool> {
-    if non_interactive {
-        return Ok(default);
-    }
-
-    Confirm::with_theme(theme)
-        .with_prompt(prompt)
-        .default(default)
-        .interact()
-        .map_err(Into::into)
-}
-
-fn env_bool(name: &str) -> Option<bool> {
-    let value = std::env::var(name).ok()?;
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Some(true),
-        "false" | "0" | "no" | "off" => Some(false),
-        _ => None,
     }
 }
 
@@ -583,6 +507,7 @@ fn render_workflow(values: &SetupValues) -> String {
     } else {
         "  assignee_login: $SYMPHONY_AGENT_ASSIGNEE\n".to_string()
     };
+    let provider_section = providers::render_workflow_provider_section(&values.provider_config);
 
     format!(
         r#"---
@@ -809,18 +734,10 @@ hooks:
     git config user.name "${{SYMPHONY_GIT_AUTHOR_NAME:-Symphony}}"
     git config user.email "${{SYMPHONY_GIT_AUTHOR_EMAIL:-symphony@users.noreply.github.com}}"
 agent:
+  provider: {provider}
   max_concurrent_agents: {max_concurrent_agents}
   max_turns: {max_turns}
-{assignee_line}codex:
-  command: codex app-server
-  model: $SYMPHONY_CODEX_MODEL
-  reasoning_effort: $SYMPHONY_CODEX_REASONING_EFFORT
-  fast: $SYMPHONY_CODEX_FAST
-  approval_policy: never
-  thread_sandbox: workspace-write
-  turn_sandbox_policy:
-    type: workspaceWrite
-    networkAccess: true
+{assignee_line}{provider_section}
 ---
 
 You are working on GitHub issue `{{{{ issue.identifier }}}}`.
@@ -838,21 +755,23 @@ Description:
 No description provided.
 {{% endif %}}
 "#,
+        provider = values.provider,
         max_concurrent_agents = values.max_concurrent_agents,
         max_turns = values.max_turns,
-        assignee_line = assignee_line
+        assignee_line = assignee_line,
+        provider_section = provider_section
     )
 }
 
 fn render_env_file(mode: DeployMode, values: &SetupValues, workflow_path: &Path) -> String {
     let workflow_abs = absolute_display_path(workflow_path);
+    let provider_env = providers::render_env_provider_section(mode, &values.provider_config);
     match mode {
         DeployMode::Native => format!(
             r#"# Generated by `symphony-rust setup`
 SYMPHONY_DEPLOY_MODE=native
 GITHUB_TOKEN={github_token}
 OPENAI_API_KEY={openai_api_key}
-CODEX_AUTH_MODE={auth_mode}
 WORKFLOW_PATH={workflow_path}
 SYMPHONY_WORKSPACE_ROOT={workspace_root}
 SYMPHONY_GITHUB_OWNER={github_owner}
@@ -862,14 +781,11 @@ SYMPHONY_GITHUB_PROJECT_URL={github_project_url}
 SYMPHONY_GIT_CLONE_URL={git_clone_url}
 SYMPHONY_SEED_REPO={seed_repo}
 SYMPHONY_AGENT_ASSIGNEE={assignee_login}
-SYMPHONY_CODEX_MODEL={codex_model}
-SYMPHONY_CODEX_REASONING_EFFORT={codex_reasoning_effort}
-SYMPHONY_CODEX_FAST={codex_fast}
+{provider_env}
 RUST_LOG={rust_log}
 "#,
             github_token = values.github_token,
             openai_api_key = values.openai_api_key,
-            auth_mode = values.auth_mode,
             workflow_path = workflow_abs,
             workspace_root = values.workspace_root,
             github_owner = values.github_owner,
@@ -879,9 +795,7 @@ RUST_LOG={rust_log}
             git_clone_url = values.git_clone_url,
             seed_repo = values.seed_repo,
             assignee_login = values.assignee_login,
-            codex_model = values.codex_model,
-            codex_reasoning_effort = values.codex_reasoning_effort,
-            codex_fast = values.codex_fast,
+            provider_env = provider_env,
             rust_log = values.rust_log,
         ),
         DeployMode::Docker => format!(
@@ -889,25 +803,20 @@ RUST_LOG={rust_log}
 SYMPHONY_DEPLOY_MODE=docker
 GITHUB_TOKEN={github_token}
 OPENAI_API_KEY={openai_api_key}
-CODEX_AUTH_MODE={auth_mode}
 WORKFLOW_FILE={workflow_path}
 SEED_REPO_PATH={seed_repo}
 SYMPHONY_WORKSPACE_ROOT={workspace_root}
 RUST_LOG={rust_log}
-CODEX_CLI_VERSION=0.114.0
 SYMPHONY_GITHUB_OWNER={github_owner}
 SYMPHONY_GITHUB_REPO={github_repo}
 SYMPHONY_GITHUB_PROJECT_NUMBER={github_project_number}
 SYMPHONY_GITHUB_PROJECT_URL={github_project_url}
 SYMPHONY_GIT_CLONE_URL={git_clone_url}
 SYMPHONY_AGENT_ASSIGNEE={assignee_login}
-SYMPHONY_CODEX_MODEL={codex_model}
-SYMPHONY_CODEX_REASONING_EFFORT={codex_reasoning_effort}
-SYMPHONY_CODEX_FAST={codex_fast}
+{provider_env}
 "#,
             github_token = values.github_token,
             openai_api_key = values.openai_api_key,
-            auth_mode = values.auth_mode,
             workflow_path = workflow_abs,
             seed_repo = values.seed_repo,
             workspace_root = values.workspace_root,
@@ -918,9 +827,7 @@ SYMPHONY_CODEX_FAST={codex_fast}
             github_project_url = values.github_project_url,
             git_clone_url = values.git_clone_url,
             assignee_login = values.assignee_login,
-            codex_model = values.codex_model,
-            codex_reasoning_effort = values.codex_reasoning_effort,
-            codex_fast = values.codex_fast,
+            provider_env = provider_env,
         ),
     }
 }
@@ -962,14 +869,16 @@ fn absolute_display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{render_env_file, render_systemd_unit, render_workflow, SetupValues};
-    use crate::auth::AuthMode;
     use crate::deploy::DeployMode;
+    use crate::providers::codex::setup::CodexSetupConfig;
+    use crate::providers::ProviderSetupConfig;
     use std::fs;
     use std::path::Path;
     use tempfile::tempdir;
 
     fn sample_values() -> SetupValues {
         SetupValues {
+            provider: "codex".to_string(),
             github_owner: "openai".to_string(),
             github_repo: "symphony".to_string(),
             github_project_number: "7".to_string(),
@@ -980,10 +889,12 @@ mod tests {
             assignee_login: "codex-bot".to_string(),
             max_concurrent_agents: "4".to_string(),
             max_turns: "20".to_string(),
-            auth_mode: AuthMode::Chatgpt,
-            codex_model: "gpt-5.4".to_string(),
-            codex_reasoning_effort: "high".to_string(),
-            codex_fast: true,
+            provider_config: ProviderSetupConfig::Codex(CodexSetupConfig {
+                auth_mode: crate::auth::AuthMode::Chatgpt,
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: "high".to_string(),
+                fast: true,
+            }),
             github_token: String::new(),
             openai_api_key: String::new(),
             rust_log: "info".to_string(),
@@ -995,7 +906,9 @@ mod tests {
     fn workflow_template_uses_env_placeholders() {
         let rendered = render_workflow(&sample_values());
         assert!(rendered.contains("owner: $SYMPHONY_GITHUB_OWNER"));
+        assert!(rendered.contains("provider: codex"));
         assert!(rendered.contains("assignee_login: $SYMPHONY_AGENT_ASSIGNEE"));
+        assert!(rendered.contains("providers:"));
         assert!(rendered.contains("model: $SYMPHONY_CODEX_MODEL"));
         assert!(rendered.contains("reasoning_effort: $SYMPHONY_CODEX_REASONING_EFFORT"));
         assert!(rendered.contains("fast: $SYMPHONY_CODEX_FAST"));
@@ -1081,5 +994,16 @@ mod tests {
         let from_rust = super::detect_layout(&rust_dir);
         assert_eq!(from_rust.repo_root, dir.path());
         assert_eq!(from_rust.rust_dir, rust_dir);
+    }
+
+    #[test]
+    fn workflow_path_defaults_to_workflow_md_even_when_existing() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("WORKFLOW.md"), "existing").unwrap();
+
+        let layout = super::detect_layout(dir.path());
+        let path = super::resolve_workflow_path(&layout, None);
+
+        assert_eq!(path, dir.path().join("WORKFLOW.md"));
     }
 }

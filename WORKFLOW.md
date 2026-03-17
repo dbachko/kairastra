@@ -229,15 +229,17 @@ hooks:
     git config user.name "${SYMPHONY_GIT_AUTHOR_NAME:-Symphony}"
     git config user.email "${SYMPHONY_GIT_AUTHOR_EMAIL:-symphony@users.noreply.github.com}"
 agent:
+  provider: codex
   max_concurrent_agents: 10
   max_turns: 20
-codex:
-  command: codex app-server
-  approval_policy: never
-  thread_sandbox: workspace-write
-  turn_sandbox_policy:
-    type: workspaceWrite
-    networkAccess: true
+providers:
+  codex:
+    command: codex app-server
+    approval_policy: never
+    thread_sandbox: workspace-write
+    turn_sandbox_policy:
+      type: workspaceWrite
+      networkAccess: true
 ---
 
 You are working on GitHub issue `{{ issue.identifier }}`.

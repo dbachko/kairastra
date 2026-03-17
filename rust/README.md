@@ -54,9 +54,9 @@ What each command does:
 
 - `run`: start the orchestrator loop. `--once` runs a single scheduling tick.
 - `setup`: guided first-run flow for native VPS or Docker.
-- `doctor`: validate local prerequisites, workflow loading, GitHub connectivity, and Codex auth state.
-- `auth status`: print the current Codex auth state as JSON.
-- `auth login`: run either ChatGPT subscription/device login or API-key bootstrap through the local Codex CLI.
+- `doctor`: validate local prerequisites, workflow loading, GitHub connectivity, and the selected provider auth state.
+- `auth status`: print the current provider auth state as JSON. The default provider is `codex`.
+- `auth login`: run either ChatGPT subscription/device login or API-key bootstrap through the selected provider CLI.
 
 ## Quick start
 
@@ -133,7 +133,7 @@ Example:
 cd rust
 cargo build
 cargo run -- setup --mode native
-cargo run -- doctor --workflow ../WORKFLOW.generated.md --env-file ../symphony.env
+cargo run -- doctor --workflow ../WORKFLOW.md --env-file ../symphony.env
 ```
 
 If you use ChatGPT subscription auth:
@@ -224,7 +224,7 @@ What setup writes:
 
 Default output behavior:
 
-- If `WORKFLOW.md` already exists, setup writes `WORKFLOW.generated.md` by default.
+- Setup writes `WORKFLOW.md` by default unless `--workflow` is provided.
 - Native mode writes `symphony.env` and `symphony.service` by default.
 - Docker mode writes `rust/.env.generated` when `rust/.env` already exists; otherwise it writes `rust/.env`.
 - Native mode auto-detects the systemd binary path. If the current executable is clearly a cargo
@@ -275,9 +275,10 @@ cargo run -- auth status
 
 This reports:
 
+- selected auth provider
 - configured auth mode
 - inferred auth mode
-- whether `codex` is available locally
+- whether the provider CLI is available locally
 - whether a local `~/.codex/auth.json` file exists
 - whether `OPENAI_API_KEY` is set
 - a reminder that Docker persists auth in the `symphony_rust_codex` volume at `/root/.codex` inside the container
@@ -377,10 +378,11 @@ prompt used in this repo.
 
 Codex runtime controls:
 
-- `codex.model` sets the model Symphony requests for the thread and subsequent turns.
-- `codex.reasoning_effort` controls thinking depth. Valid values are `none`, `minimal`, `low`,
+- `agent.provider` selects the agent backend for the workflow. Today the supported value is `codex`.
+- `providers.codex.model` sets the model Symphony requests for the thread and subsequent turns.
+- `providers.codex.reasoning_effort` controls thinking depth. Valid values are `none`, `minimal`, `low`,
   `medium`, `high`, and `xhigh`.
-- `codex.fast` is a boolean. `true` maps to Codex `serviceTier=fast`; `false` maps to
+- `providers.codex.fast` is a boolean. `true` maps to Codex `serviceTier=fast`; `false` maps to
   `serviceTier=flex`.
 
 ## GitHub bootstrap helper
@@ -423,7 +425,7 @@ Common failure modes:
 
 - missing `GITHUB_TOKEN`: workflow validation fails and GitHub connectivity checks fail
 - missing workflow env vars: the workflow loads only after the env file is applied
-- missing Codex auth: `auth status` shows no local auth file and no API key
+- missing provider auth: `auth status` shows no local auth file and no API key
 - wrong binary path in native mode: `systemd` starts but fails immediately
 
 ## Current limitations

@@ -6,10 +6,13 @@ use chrono::Utc;
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app_server::{AppServerEvent, AppServerSession};
+use crate::agent::AgentEvent;
 use crate::github::{GitHubTracker, OpenPullRequest, PullRequestChecksSummary, Tracker};
 use crate::model::Issue;
 use crate::prompt::{build_prompt, continuation_prompt};
+use crate::providers::{
+    self, is_bootstrap_workpad, is_workpad_comment, AGENT_BOOTSTRAP_NOTE, AGENT_WORKPAD_HEADER,
+};
 use crate::workflow::WorkflowSnapshot;
 use crate::workspace;
 
@@ -28,7 +31,7 @@ pub enum WorkerMessage {
     },
     AppEvent {
         issue_id: String,
-        event: AppServerEvent,
+        event: AgentEvent,
     },
     Finished {
         issue_id: String,
@@ -60,7 +63,7 @@ pub async fn run_issue(
 
     let result = async {
         let mut session =
-            AppServerSession::start(&snapshot.settings, tracker.clone(), &workspace.path).await?;
+            providers::start_session(&snapshot.settings, tracker.clone(), &workspace.path).await?;
 
         let mut current_issue = issue.clone();
         let workpad_body = render_workpad_bootstrap(&workspace.path, &current_issue).await?;
@@ -79,7 +82,7 @@ pub async fn run_issue(
                 )
             };
 
-            let event_forwarder = tokio::sync::mpsc::unbounded_channel::<AppServerEvent>();
+            let event_forwarder = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
             let forward_tx = event_forwarder.0;
             let mut forward_rx = event_forwarder.1;
             let turn_tx = event_tx.clone();
@@ -95,12 +98,12 @@ pub async fn run_issue(
             });
 
             session
-                .run_turn(&snapshot.settings, &current_issue, &prompt, &forward_tx)
+                .run_turn(&current_issue, &prompt, &forward_tx)
                 .await?;
             drop(forward_tx);
             let _ = forwarder.await;
 
-            // Codex may have updated the persistent workpad comment during the turn.
+            // The selected agent may have updated the persistent workpad comment during the turn.
             // Refresh it before adding Symphony's runtime section so we never clobber
             // the latest plan/checklist content with a stale bootstrap copy.
             if current_issue.workpad_comment_id.is_some() {
@@ -274,9 +277,7 @@ fn workpad_has_progress(issue: &Issue) -> bool {
         return false;
     };
 
-    body.contains("## Codex Workpad")
-        && body.contains("[x]")
-        && !body.contains("Bootstrap created by Symphony runtime before the first Codex turn.")
+    is_workpad_comment(body) && body.contains("[x]") && !is_bootstrap_workpad(body)
 }
 
 const RUNTIME_STATUS_START: &str = "<!-- symphony-runtime-status:start -->";
@@ -404,7 +405,7 @@ mod tests {
     #[test]
     fn bootstrap_workpad_does_not_count_as_progress() {
         let issue = issue_with_workpad(Some(
-            "## Codex Workpad\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- Bootstrap created by Symphony runtime before the first Codex turn.\n",
+            "## Agent Workpad\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- Bootstrap created by Symphony runtime before the first agent turn.\n",
         ));
         assert!(!workpad_has_progress(&issue));
     }
@@ -412,14 +413,30 @@ mod tests {
     #[test]
     fn checked_workpad_without_bootstrap_note_counts_as_progress() {
         let issue = issue_with_workpad(Some(
+            "## Agent Workpad\n\n### Plan\n\n- [x] 1. Done\n\n### Notes\n\n- Updated by the agent.\n",
+        ));
+        assert!(workpad_has_progress(&issue));
+    }
+
+    #[test]
+    fn legacy_checked_workpad_counts_as_progress() {
+        let issue = issue_with_workpad(Some(
             "## Codex Workpad\n\n### Plan\n\n- [x] 1. Done\n\n### Notes\n\n- Updated by Codex.\n",
         ));
         assert!(workpad_has_progress(&issue));
     }
 
     #[test]
+    fn legacy_bootstrap_workpad_does_not_count_as_progress() {
+        let issue = issue_with_workpad(Some(
+            "## Codex Workpad\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- Bootstrap created by Symphony runtime before the first Codex turn.\n",
+        ));
+        assert!(!workpad_has_progress(&issue));
+    }
+
+    #[test]
     fn merge_runtime_status_appends_without_rewriting_plan() {
-        let original = "## Codex Workpad\n\n### Plan\n\n- [x] 1. Real plan item\n\n### Validation\n\n- [ ] `cargo test`\n";
+        let original = "## Agent Workpad\n\n### Plan\n\n- [x] 1. Real plan item\n\n### Validation\n\n- [ ] `cargo test`\n";
         let merged = merge_runtime_status_section(
             original,
             "<!-- symphony-runtime-status:start -->\n### Runtime Status\n\n- Branch: demo\n<!-- symphony-runtime-status:end -->",
@@ -434,7 +451,7 @@ mod tests {
     #[test]
     fn merge_runtime_status_replaces_existing_runtime_block_only() {
         let original = format!(
-            "## Codex Workpad\n\n### Plan\n\n- [x] 1. Real plan item\n\n{RUNTIME_STATUS_START}\n### Runtime Status\n\n- Branch: old\n{RUNTIME_STATUS_END}\n"
+            "## Agent Workpad\n\n### Plan\n\n- [x] 1. Real plan item\n\n{RUNTIME_STATUS_START}\n### Runtime Status\n\n- Branch: old\n{RUNTIME_STATUS_END}\n"
         );
         let merged = merge_runtime_status_section(
             &original,
@@ -486,7 +503,7 @@ fn render_workpad_bootstrap_sync(workspace: &std::path::Path, issue: &Issue, sha
     let issue_url = issue.url.clone().unwrap_or_default();
 
     format!(
-        "## Codex Workpad\n\n```text\nunknown-host:{}@{sha}\n```\n\n### Plan\n\n- [ ] 1\\. Reconcile tracker and repository state\n- [ ] 2\\. Implement the requested issue scope\n- [ ] 3\\. Run required validation\n- [ ] 4\\. Open or update the pull request and link it to the issue\n\n### Acceptance Criteria\n\n- [ ] The requested issue scope is implemented for {}.\n- [ ] Required validation from the issue is complete.\n- [ ] A pull request is opened and linked before review handoff.\n- [ ] GitHub Actions and required PR checks are green before review handoff.\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- Bootstrap created by Symphony runtime before the first Codex turn.\n- Issue: {}\n",
+        "{AGENT_WORKPAD_HEADER}\n\n```text\nunknown-host:{}@{sha}\n```\n\n### Plan\n\n- [ ] 1\\. Reconcile tracker and repository state\n- [ ] 2\\. Implement the requested issue scope\n- [ ] 3\\. Run required validation\n- [ ] 4\\. Open or update the pull request and link it to the issue\n\n### Acceptance Criteria\n\n- [ ] The requested issue scope is implemented for {}.\n- [ ] Required validation from the issue is complete.\n- [ ] A pull request is opened and linked before review handoff.\n- [ ] GitHub Actions and required PR checks are green before review handoff.\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- {AGENT_BOOTSTRAP_NOTE}\n- Issue: {}\n",
         workspace.display(),
         issue.identifier,
         issue_url

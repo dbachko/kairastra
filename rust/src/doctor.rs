@@ -4,11 +4,12 @@ use anyhow::{anyhow, Result};
 use clap::ValueEnum;
 use serde::Serialize;
 
-use crate::auth::{find_command, inspect_status};
+use crate::auth::find_command;
 use crate::config::Settings;
 use crate::deploy::DeployMode;
 use crate::envfile::{apply_env, load_env_file};
 use crate::github::GitHubTracker;
+use crate::providers;
 use crate::workflow::{default_workflow_path, load_definition};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -65,30 +66,10 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
     let mut checks = Vec::new();
     let mode = options.mode.unwrap_or_else(|| infer_mode());
 
-    checks.push(check_command("codex"));
     checks.push(check_command("gh"));
     checks.push(match mode {
         DeployMode::Docker => check_command("docker"),
         DeployMode::Native => check_command("systemctl"),
-    });
-
-    let auth_status = inspect_status();
-    checks.push(DoctorCheck {
-        name: "codex_auth",
-        status: if auth_status.openai_api_key_present || auth_status.auth_file_present {
-            DoctorStatus::Pass
-        } else {
-            DoctorStatus::Warn
-        },
-        detail: format!(
-            "configured={} inferred={} auth_file={} api_key_present={} local_auth_path={} docker_hint={}",
-            auth_status.configured_mode,
-            auth_status.inferred_mode,
-            auth_status.auth_file_present,
-            auth_status.openai_api_key_present,
-            auth_status.auth_file_path.display(),
-            auth_status.docker_volume_hint
-        ),
     });
 
     let mut tracker_check = DoctorCheck {
@@ -99,6 +80,16 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
 
     let mut workspace_check = DoctorCheck {
         name: "workspace_root",
+        status: DoctorStatus::Warn,
+        detail: "workflow not loaded".to_string(),
+    };
+    let mut provider_command_check = DoctorCheck {
+        name: "agent_provider_command",
+        status: DoctorStatus::Warn,
+        detail: "workflow not loaded".to_string(),
+    };
+    let mut provider_auth_check = DoctorCheck {
+        name: "agent_provider_auth",
         status: DoctorStatus::Warn,
         detail: "workflow not loaded".to_string(),
     };
@@ -113,6 +104,11 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
                         status: DoctorStatus::Pass,
                         detail: format!("loaded {}", path.display()),
                     });
+                    provider_command_check = check_named_command(
+                        "agent_provider_command",
+                        provider_command_name(&settings)?,
+                    );
+                    provider_auth_check = check_auth_status(&settings);
                     tracker_check = check_github_tracker(&settings).await;
                     workspace_check = check_workspace_root(&settings.workspace.root);
                 }
@@ -139,6 +135,8 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
         });
     }
 
+    checks.push(provider_command_check);
+    checks.push(provider_auth_check);
     checks.push(tracker_check);
     checks.push(workspace_check);
 
@@ -194,17 +192,56 @@ fn infer_mode() -> DeployMode {
 }
 
 fn check_command(name: &'static str) -> DoctorCheck {
-    match find_command(name) {
+    check_named_command(name, name)
+}
+
+fn check_named_command(check_name: &'static str, command_name: &'static str) -> DoctorCheck {
+    match find_command(command_name) {
         Some(path) => DoctorCheck {
-            name,
+            name: check_name,
             status: DoctorStatus::Pass,
-            detail: format!("found at {}", path.display()),
+            detail: format!("command={} found at {}", command_name, path.display()),
         },
         None => DoctorCheck {
-            name,
+            name: check_name,
             status: DoctorStatus::Fail,
-            detail: "not found in PATH".to_string(),
+            detail: format!("command={} not found in PATH", command_name),
         },
+    }
+}
+
+fn provider_command_name(settings: &Settings) -> Result<&'static str> {
+    providers::command_name(settings.agent.provider.as_str())
+}
+
+fn check_auth_status(settings: &Settings) -> DoctorCheck {
+    let auth_status = match providers::inspect_auth_status(settings.agent.provider.as_str()) {
+        Ok(status) => status,
+        Err(error) => {
+            return DoctorCheck {
+                name: "agent_provider_auth",
+                status: DoctorStatus::Fail,
+                detail: error.to_string(),
+            };
+        }
+    };
+    DoctorCheck {
+        name: "agent_provider_auth",
+        status: if auth_status.openai_api_key_present || auth_status.auth_file_present {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Warn
+        },
+        detail: format!(
+            "provider={} configured={} inferred={} auth_file={} api_key_present={} local_auth_path={} docker_hint={}",
+            auth_status.provider,
+            auth_status.configured_mode,
+            auth_status.inferred_mode,
+            auth_status.auth_file_present,
+            auth_status.openai_api_key_present,
+            auth_status.auth_file_path.display(),
+            auth_status.docker_volume_hint
+        ),
     }
 }
 

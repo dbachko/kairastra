@@ -235,6 +235,10 @@ tracker:
   owner: openai
   project_v2_number: 7
   api_key: fake
+agent:
+  provider: codex
+providers:
+  codex: {{}}
 workspace:
   root: {}
 "#,

@@ -1,10 +1,10 @@
 use std::fmt;
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use serde::Serialize;
+
+use crate::providers;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -15,8 +15,8 @@ pub enum AuthMode {
 }
 
 impl AuthMode {
-    pub fn from_env() -> Self {
-        match std::env::var("CODEX_AUTH_MODE")
+    pub fn from_env_var(name: &str) -> Self {
+        match std::env::var(name)
             .unwrap_or_else(|_| "auto".to_string())
             .trim()
             .to_lowercase()
@@ -45,85 +45,22 @@ impl fmt::Display for AuthMode {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthStatus {
+    pub provider: String,
     pub configured_mode: AuthMode,
     pub inferred_mode: AuthMode,
-    pub codex_available: bool,
+    pub provider_available: bool,
     pub auth_file_path: PathBuf,
     pub auth_file_present: bool,
     pub openai_api_key_present: bool,
     pub docker_volume_hint: &'static str,
 }
 
-pub fn inspect_status() -> AuthStatus {
-    let configured_mode = AuthMode::from_env();
-    let openai_api_key_present = std::env::var("OPENAI_API_KEY")
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    let auth_file_path = auth_file_path();
-    let auth_file_present = auth_file_path.is_file();
-
-    let inferred_mode = match configured_mode {
-        AuthMode::ApiKey => AuthMode::ApiKey,
-        AuthMode::Chatgpt => AuthMode::Chatgpt,
-        AuthMode::Auto => {
-            if openai_api_key_present {
-                AuthMode::ApiKey
-            } else {
-                AuthMode::Chatgpt
-            }
-        }
-    };
-
-    AuthStatus {
-        configured_mode,
-        inferred_mode,
-        codex_available: find_command("codex").is_some(),
-        auth_file_path,
-        auth_file_present,
-        openai_api_key_present,
-        docker_volume_hint: "Docker mode persists Codex auth inside the symphony_rust_codex volume mounted at /root/.codex in the container.",
-    }
+pub fn inspect_status(provider: &str) -> Result<AuthStatus> {
+    providers::inspect_auth_status(provider)
 }
 
-pub fn run_login(mode: AuthMode) -> Result<()> {
-    let codex = find_command("codex").ok_or_else(|| anyhow!("codex_not_found_in_path"))?;
-
-    match mode {
-        AuthMode::Chatgpt => {
-            let status = Command::new(codex)
-                .arg("login")
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-                .context("failed to launch `codex login`")?;
-            if !status.success() {
-                return Err(anyhow!("codex_login_failed"));
-            }
-        }
-        AuthMode::ApiKey => {
-            let key = std::env::var("OPENAI_API_KEY")
-                .context("OPENAI_API_KEY is required for api_key login mode")?;
-            let mut child = Command::new(codex)
-                .arg("login")
-                .arg("--with-api-key")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .context("failed to launch `codex login --with-api-key`")?;
-            if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(key.as_bytes())?;
-            }
-            let status = child.wait()?;
-            if !status.success() {
-                return Err(anyhow!("codex_api_key_login_failed"));
-            }
-        }
-        AuthMode::Auto => return Err(anyhow!("auth_login_requires_explicit_mode")),
-    }
-
-    Ok(())
+pub fn run_login(provider: &str, mode: AuthMode) -> Result<()> {
+    providers::run_login(provider, mode)
 }
 
 pub fn find_command(name: &str) -> Option<PathBuf> {
@@ -139,14 +76,6 @@ pub fn find_command(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn auth_file_path() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".codex").join("auth.json");
-    }
-
-    PathBuf::from(".codex").join("auth.json")
-}
-
 #[cfg(test)]
 mod tests {
     use super::{inspect_status, AuthMode};
@@ -155,7 +84,7 @@ mod tests {
     fn auto_mode_prefers_api_key_when_present() {
         std::env::set_var("CODEX_AUTH_MODE", "auto");
         std::env::set_var("OPENAI_API_KEY", "test-key");
-        let status = inspect_status();
+        let status = inspect_status("codex").unwrap();
         assert_eq!(status.inferred_mode, AuthMode::ApiKey);
         std::env::remove_var("OPENAI_API_KEY");
     }

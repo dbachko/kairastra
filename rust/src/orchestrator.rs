@@ -10,10 +10,11 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
-use crate::app_server::AppServerEventKind;
+use crate::agent::AgentEventKind;
 use crate::config::{normalize_issue_state, Settings};
 use crate::github::{is_rate_limited_error, GitHubTracker, Tracker};
 use crate::model::Issue;
+use crate::providers;
 use crate::runner::{run_issue, WorkerMessage, WorkerOutcome};
 use crate::workflow::{WorkflowSnapshot, WorkflowStore};
 use crate::workspace;
@@ -36,7 +37,7 @@ struct RunningEntry {
     identifier: String,
     issue: Issue,
     workspace_path: Option<PathBuf>,
-    last_codex_timestamp: Instant,
+    last_agent_timestamp: Instant,
     session_id: Option<String>,
     attempt: Option<u32>,
     handle: JoinHandle<()>,
@@ -263,6 +264,7 @@ impl Orchestrator {
             .into_iter()
             .map(|issue| (issue.id.clone(), issue))
             .collect();
+        let stall_timeout_ms = providers::stall_timeout_ms(&snapshot.settings)?;
 
         let mut remove_ids = Vec::new();
         let mut retries = Vec::new();
@@ -272,9 +274,8 @@ impl Orchestrator {
                 continue;
             };
 
-            if snapshot.settings.codex.stall_timeout_ms > 0
-                && running.last_codex_timestamp.elapsed()
-                    >= Duration::from_millis(snapshot.settings.codex.stall_timeout_ms)
+            if stall_timeout_ms > 0
+                && running.last_agent_timestamp.elapsed() >= Duration::from_millis(stall_timeout_ms)
             {
                 running.handle.abort();
                 retries.push((
@@ -406,7 +407,7 @@ impl Orchestrator {
                 identifier,
                 issue,
                 workspace_path: workspace_hint,
-                last_codex_timestamp: Instant::now(),
+                last_agent_timestamp: Instant::now(),
                 session_id: None,
                 attempt,
                 handle,
@@ -475,20 +476,20 @@ impl Orchestrator {
             }
             WorkerMessage::AppEvent { issue_id, event } => {
                 if let Some(running) = state.running.get_mut(&issue_id) {
-                    running.last_codex_timestamp = Instant::now();
+                    running.last_agent_timestamp = Instant::now();
                     match event.event {
-                        AppServerEventKind::SessionStarted => {
+                        AgentEventKind::SessionStarted => {
                             running.session_id = event
                                 .payload
                                 .get("session_id")
                                 .and_then(serde_json::Value::as_str)
                                 .map(ToString::to_string);
                         }
-                        AppServerEventKind::TurnFailed
-                        | AppServerEventKind::TurnCancelled
-                        | AppServerEventKind::TurnInputRequired
-                        | AppServerEventKind::ApprovalRequired
-                        | AppServerEventKind::TurnEndedWithError => {
+                        AgentEventKind::TurnFailed
+                        | AgentEventKind::TurnCancelled
+                        | AgentEventKind::TurnInputRequired
+                        | AgentEventKind::ApprovalRequired
+                        | AgentEventKind::TurnEndedWithError => {
                             warn!(
                                 issue_identifier = %running.identifier,
                                 payload = %event.payload,
@@ -724,9 +725,12 @@ tracker:
   active_states: ["Todo", "In Progress", "Merging", "Rework"]
   terminal_states: ["Done", "Closed"]
 agent:
+  provider: codex
   max_concurrent_agents: 10
   max_concurrent_agents_by_state:
     todo: 1
+providers:
+  codex: {}
 "#,
             )
             .unwrap(),
@@ -751,8 +755,11 @@ tracker:
   active_states: ["Todo", "In Progress", "Merging", "Rework"]
   terminal_states: ["Done", "Closed"]
 agent:
+  provider: codex
   max_concurrent_agents: 10
   assignee_login: {assignee_login}
+providers:
+  codex: {{}}
 "#
             ))
             .unwrap(),
