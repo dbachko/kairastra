@@ -11,7 +11,7 @@ use crate::providers;
 pub enum AuthMode {
     Auto,
     ApiKey,
-    Chatgpt,
+    Subscription,
 }
 
 impl AuthMode {
@@ -23,7 +23,7 @@ impl AuthMode {
             .as_str()
         {
             "api_key" => Self::ApiKey,
-            "chatgpt" => Self::Chatgpt,
+            "subscription" => Self::Subscription,
             _ => Self::Auto,
         }
     }
@@ -32,7 +32,7 @@ impl AuthMode {
         match self {
             Self::Auto => "auto",
             Self::ApiKey => "api_key",
-            Self::Chatgpt => "chatgpt",
+            Self::Subscription => "subscription",
         }
     }
 }
@@ -51,7 +51,8 @@ pub struct AuthStatus {
     pub provider_available: bool,
     pub auth_file_path: PathBuf,
     pub auth_file_present: bool,
-    pub openai_api_key_present: bool,
+    pub api_key_present: bool,
+    pub credentials_present: bool,
     pub docker_volume_hint: &'static str,
 }
 
@@ -86,6 +87,8 @@ mod tests {
         std::env::set_var("OPENAI_API_KEY", "test-key");
         let status = inspect_status("codex").unwrap();
         assert_eq!(status.inferred_mode, AuthMode::ApiKey);
+        assert!(status.api_key_present);
+        assert!(status.credentials_present);
         std::env::remove_var("OPENAI_API_KEY");
     }
 }

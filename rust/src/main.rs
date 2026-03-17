@@ -98,14 +98,14 @@ struct AuthLoginArgs {
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum AuthModeArg {
-    Chatgpt,
+    Subscription,
     ApiKey,
 }
 
 impl From<AuthModeArg> for AuthMode {
     fn from(value: AuthModeArg) -> Self {
         match value {
-            AuthModeArg::Chatgpt => AuthMode::Chatgpt,
+            AuthModeArg::Subscription => AuthMode::Subscription,
             AuthModeArg::ApiKey => AuthMode::ApiKey,
         }
     }

@@ -227,18 +227,19 @@ fn check_auth_status(settings: &Settings) -> DoctorCheck {
     };
     DoctorCheck {
         name: "agent_provider_auth",
-        status: if auth_status.openai_api_key_present || auth_status.auth_file_present {
+        status: if auth_status.credentials_present {
             DoctorStatus::Pass
         } else {
             DoctorStatus::Warn
         },
         detail: format!(
-            "provider={} configured={} inferred={} auth_file={} api_key_present={} local_auth_path={} docker_hint={}",
+            "provider={} configured={} inferred={} auth_file={} api_key_present={} credentials_present={} local_auth_path={} docker_hint={}",
             auth_status.provider,
             auth_status.configured_mode,
             auth_status.inferred_mode,
             auth_status.auth_file_present,
-            auth_status.openai_api_key_present,
+            auth_status.api_key_present,
+            auth_status.credentials_present,
             auth_status.auth_file_path.display(),
             auth_status.docker_volume_hint
         ),

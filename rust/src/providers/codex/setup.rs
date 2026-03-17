@@ -85,7 +85,7 @@ fn ask_auth_mode(theme: &ColorfulTheme, non_interactive: bool) -> Result<AuthMod
     }
 
     let items = [
-        "ChatGPT subscription / device login",
+        "OpenAI subscription / device login",
         "OpenAI API key bootstrap",
     ];
     let default = match AuthMode::from_env_var("CODEX_AUTH_MODE") {
@@ -99,7 +99,7 @@ fn ask_auth_mode(theme: &ColorfulTheme, non_interactive: bool) -> Result<AuthMod
         .interact()?;
     Ok(match selection {
         1 => AuthMode::ApiKey,
-        _ => AuthMode::Chatgpt,
+        _ => AuthMode::Subscription,
     })
 }
 

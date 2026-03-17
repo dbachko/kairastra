@@ -14,7 +14,7 @@ const DOCKER_VOLUME_HINT: &str =
 
 pub fn inspect_status() -> AuthStatus {
     let configured_mode = AuthMode::from_env_var(AUTH_MODE_ENV);
-    let openai_api_key_present = std::env::var("OPENAI_API_KEY")
+    let api_key_present = std::env::var("OPENAI_API_KEY")
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false);
     let auth_file_path = auth_file_path();
@@ -22,12 +22,12 @@ pub fn inspect_status() -> AuthStatus {
 
     let inferred_mode = match configured_mode {
         AuthMode::ApiKey => AuthMode::ApiKey,
-        AuthMode::Chatgpt => AuthMode::Chatgpt,
+        AuthMode::Subscription => AuthMode::Subscription,
         AuthMode::Auto => {
-            if openai_api_key_present {
+            if api_key_present {
                 AuthMode::ApiKey
             } else {
-                AuthMode::Chatgpt
+                AuthMode::Subscription
             }
         }
     };
@@ -39,7 +39,8 @@ pub fn inspect_status() -> AuthStatus {
         provider_available: crate::auth::find_command(COMMAND_NAME).is_some(),
         auth_file_path,
         auth_file_present,
-        openai_api_key_present,
+        api_key_present,
+        credentials_present: auth_file_present || api_key_present,
         docker_volume_hint: DOCKER_VOLUME_HINT,
     }
 }
@@ -49,7 +50,7 @@ pub fn run_login(mode: AuthMode) -> Result<()> {
         .ok_or_else(|| anyhow!("{}_not_found_in_path", COMMAND_NAME))?;
 
     match mode {
-        AuthMode::Chatgpt => {
+        AuthMode::Subscription => {
             let status = Command::new(command)
                 .arg("login")
                 .stdin(Stdio::inherit())
