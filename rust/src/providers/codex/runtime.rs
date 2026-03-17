@@ -14,12 +14,12 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
+use crate::agent::{AgentBackend, AgentEvent, AgentEventKind, AgentSession, TurnResult};
 use crate::config::Settings;
 use crate::github::GitHubTracker;
 use crate::model::Issue;
 
-use super::backend::{AgentBackend, AgentSession, TurnResult};
-use super::events::{AgentEvent, AgentEventKind};
+use super::config::CodexConfig;
 
 const INITIALIZE_ID: u64 = 1;
 const THREAD_START_ID: u64 = 2;
@@ -45,6 +45,7 @@ impl AgentBackend for CodexBackend {
 }
 
 pub struct CodexSession {
+    config: CodexConfig,
     child: Child,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
@@ -60,13 +61,11 @@ pub struct CodexSession {
 impl AgentSession for CodexSession {
     async fn run_turn(
         &mut self,
-        settings: &Settings,
         issue: &Issue,
         prompt: &str,
         on_event: &UnboundedSender<AgentEvent>,
     ) -> Result<TurnResult> {
-        self.run_turn_internal(settings, issue, prompt, on_event)
-            .await
+        self.run_turn_internal(issue, prompt, on_event).await
     }
 
     async fn stop(&mut self) -> Result<()> {
@@ -85,6 +84,7 @@ impl CodexSession {
         workspace: &Path,
     ) -> Result<Self> {
         validate_workspace_cwd(&settings.workspace.root, workspace)?;
+        let config = super::config::load(settings)?;
 
         let cargo_home = workspace.join(".cargo-home");
         tokio::fs::create_dir_all(&cargo_home)
@@ -92,7 +92,7 @@ impl CodexSession {
             .context("failed to create workspace cargo home")?;
 
         let mut command = Command::new("bash");
-        command.arg("-lc").arg(&settings.providers.codex.command);
+        command.arg("-lc").arg(&config.command);
         command.current_dir(workspace);
         command.env("CARGO_HOME", &cargo_home);
         command.env("GITHUB_TOKEN", tracker.settings().api_key.as_str());
@@ -118,12 +118,13 @@ impl CodexSession {
         }
 
         let workspace_path = workspace.to_path_buf();
-        let approval_policy = settings.providers.codex.approval_policy.clone();
-        let turn_sandbox_policy = settings.turn_sandbox_policy(workspace);
+        let approval_policy = config.approval_policy.clone();
+        let turn_sandbox_policy = config.turn_sandbox_policy(workspace);
         let auto_approve_requests =
             matches!(&approval_policy, JsonValue::String(value) if value == "never");
 
         let mut session = Self {
+            config,
             child,
             stdin,
             stdout: BufReader::new(stdout).lines(),
@@ -135,8 +136,8 @@ impl CodexSession {
             tracker,
         };
 
-        session.send_initialize(settings).await?;
-        session.thread_id = session.start_thread(settings).await?;
+        session.send_initialize().await?;
+        session.thread_id = session.start_thread().await?;
         Ok(session)
     }
 
@@ -146,13 +147,11 @@ impl CodexSession {
 
     pub async fn run_turn(
         &mut self,
-        settings: &Settings,
         issue: &Issue,
         prompt: &str,
         on_event: &UnboundedSender<AgentEvent>,
     ) -> Result<TurnResult> {
-        self.run_turn_internal(settings, issue, prompt, on_event)
-            .await
+        self.run_turn_internal(issue, prompt, on_event).await
     }
 
     pub async fn stop(&mut self) -> Result<()> {
@@ -165,12 +164,11 @@ impl CodexSession {
 
     async fn run_turn_internal(
         &mut self,
-        settings: &Settings,
         issue: &Issue,
         prompt: &str,
         on_event: &UnboundedSender<AgentEvent>,
     ) -> Result<TurnResult> {
-        let turn_id = self.start_turn(settings, issue, prompt).await?;
+        let turn_id = self.start_turn(issue, prompt).await?;
         emit_session_started(
             on_event,
             self.process_id_internal(),
@@ -178,9 +176,7 @@ impl CodexSession {
             &turn_id,
         );
 
-        let turn_id = self
-            .await_turn_completion(settings, Some(turn_id), on_event)
-            .await?;
+        let turn_id = self.await_turn_completion(Some(turn_id), on_event).await?;
         let session_id = format!("{}-{turn_id}", self.thread_id);
 
         Ok(TurnResult {
@@ -203,7 +199,7 @@ impl CodexSession {
         Ok(())
     }
 
-    async fn send_initialize(&mut self, settings: &Settings) -> Result<()> {
+    async fn send_initialize(&mut self) -> Result<()> {
         self.write_message(json!({
             "method": "initialize",
             "id": INITIALIZE_ID,
@@ -221,7 +217,7 @@ impl CodexSession {
         .await?;
 
         let _ = self
-            .await_response(INITIALIZE_ID, settings.providers.codex.read_timeout_ms)
+            .await_response(INITIALIZE_ID, self.config.read_timeout_ms)
             .await?;
         self.write_message(json!({
             "method": "initialized",
@@ -231,23 +227,23 @@ impl CodexSession {
         Ok(())
     }
 
-    async fn start_thread(&mut self, settings: &Settings) -> Result<String> {
+    async fn start_thread(&mut self) -> Result<String> {
         self.write_message(json!({
             "method": "thread/start",
             "id": THREAD_START_ID,
             "params": {
                 "approvalPolicy": self.approval_policy,
-                "sandbox": settings.providers.codex.thread_sandbox,
+                "sandbox": self.config.thread_sandbox,
                 "cwd": self.workspace.to_string_lossy(),
                 "dynamicTools": dynamic_tool_specs(),
-                "model": settings.providers.codex.model,
-                "serviceTier": service_tier(&settings.providers.codex),
+                "model": self.config.model,
+                "serviceTier": self.config.service_tier(),
             }
         }))
         .await?;
 
         let payload = self
-            .await_response(THREAD_START_ID, settings.providers.codex.read_timeout_ms)
+            .await_response(THREAD_START_ID, self.config.read_timeout_ms)
             .await?;
         payload
             .get("thread")
@@ -257,12 +253,7 @@ impl CodexSession {
             .ok_or_else(|| anyhow!("invalid_thread_payload"))
     }
 
-    async fn start_turn(
-        &mut self,
-        settings: &Settings,
-        issue: &Issue,
-        prompt: &str,
-    ) -> Result<String> {
+    async fn start_turn(&mut self, issue: &Issue, prompt: &str) -> Result<String> {
         self.write_message(json!({
             "method": "turn/start",
             "id": TURN_START_ID,
@@ -278,9 +269,9 @@ impl CodexSession {
                 "title": format!("{}: {}", issue.identifier, issue.title),
                 "approvalPolicy": self.approval_policy,
                 "sandboxPolicy": self.turn_sandbox_policy,
-                "model": settings.providers.codex.model,
-                "effort": settings.providers.codex.reasoning_effort,
-                "serviceTier": service_tier(&settings.providers.codex),
+                "model": self.config.model,
+                "effort": self.config.reasoning_effort,
+                "serviceTier": self.config.service_tier(),
             }
         }))
         .await?;
@@ -330,7 +321,6 @@ impl CodexSession {
 
     async fn await_turn_completion(
         &mut self,
-        settings: &Settings,
         initial_turn_id: Option<String>,
         on_event: &UnboundedSender<AgentEvent>,
     ) -> Result<String> {
@@ -339,30 +329,28 @@ impl CodexSession {
         let turn_id = initial_turn_id;
 
         loop {
-            if settings.providers.codex.turn_timeout_ms > 0
-                && turn_started.elapsed()
-                    >= Duration::from_millis(settings.providers.codex.turn_timeout_ms)
+            if self.config.turn_timeout_ms > 0
+                && turn_started.elapsed() >= Duration::from_millis(self.config.turn_timeout_ms)
             {
                 return Err(anyhow!("turn_timeout"));
             }
 
-            if settings.providers.codex.stall_timeout_ms > 0
-                && last_event_at.elapsed()
-                    >= Duration::from_millis(settings.providers.codex.stall_timeout_ms)
+            if self.config.stall_timeout_ms > 0
+                && last_event_at.elapsed() >= Duration::from_millis(self.config.stall_timeout_ms)
             {
                 return Err(anyhow!("turn_stalled"));
             }
 
-            let remaining_turn = if settings.providers.codex.turn_timeout_ms == 0 {
+            let remaining_turn = if self.config.turn_timeout_ms == 0 {
                 Duration::from_secs(3600)
             } else {
-                Duration::from_millis(settings.providers.codex.turn_timeout_ms)
+                Duration::from_millis(self.config.turn_timeout_ms)
                     .saturating_sub(turn_started.elapsed())
             };
-            let remaining_stall = if settings.providers.codex.stall_timeout_ms == 0 {
+            let remaining_stall = if self.config.stall_timeout_ms == 0 {
                 Duration::from_secs(3600)
             } else {
-                Duration::from_millis(settings.providers.codex.stall_timeout_ms)
+                Duration::from_millis(self.config.stall_timeout_ms)
                     .saturating_sub(last_event_at.elapsed())
             };
             let wait_for = remaining_turn.min(remaining_stall);
@@ -370,9 +358,9 @@ impl CodexSession {
             let line = timeout(wait_for, self.stdout.next_line())
                 .await
                 .map_err(|_| {
-                    if settings.providers.codex.stall_timeout_ms > 0
+                    if self.config.stall_timeout_ms > 0
                         && last_event_at.elapsed()
-                            >= Duration::from_millis(settings.providers.codex.stall_timeout_ms)
+                            >= Duration::from_millis(self.config.stall_timeout_ms)
                     {
                         anyhow!("turn_stalled")
                     } else {
@@ -726,14 +714,6 @@ fn validate_workspace_cwd(root: &Path, workspace: &Path) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn service_tier(provider: &crate::config::CodexProviderSettings) -> Option<&'static str> {
-    match provider.fast {
-        Some(true) => Some("fast"),
-        Some(false) => Some("flex"),
-        None => None,
-    }
 }
 
 async fn log_stderr(stderr: ChildStderr) {
@@ -1159,7 +1139,7 @@ done
         let (tx, mut rx) = unbounded_channel();
 
         let error = session
-            .run_turn(&settings, &issue("ISSUE-1"), "prompt", &tx)
+            .run_turn(&issue("ISSUE-1"), "prompt", &tx)
             .await
             .unwrap_err()
             .to_string();
@@ -1215,7 +1195,7 @@ done
         let (tx, _rx) = unbounded_channel();
 
         let error = session
-            .run_turn(&settings, &issue("ISSUE-2"), "prompt", &tx)
+            .run_turn(&issue("ISSUE-2"), "prompt", &tx)
             .await
             .unwrap_err()
             .to_string();
@@ -1277,7 +1257,7 @@ done
         let (tx, _rx) = unbounded_channel();
 
         let result = session
-            .run_turn(&settings, &issue("ISSUE-3"), "prompt", &tx)
+            .run_turn(&issue("ISSUE-3"), "prompt", &tx)
             .await
             .unwrap();
         assert_eq!(result.turn_id, "turn-3");
@@ -1378,7 +1358,7 @@ done
         let (tx, _rx) = unbounded_channel();
 
         session
-            .run_turn(&settings, &issue("ISSUE-4"), "prompt", &tx)
+            .run_turn(&issue("ISSUE-4"), "prompt", &tx)
             .await
             .unwrap();
 
@@ -1453,7 +1433,7 @@ done
         let (tx, _rx) = unbounded_channel();
 
         session
-            .run_turn(&settings, &issue("ISSUE-5"), "prompt", &tx)
+            .run_turn(&issue("ISSUE-5"), "prompt", &tx)
             .await
             .unwrap();
 

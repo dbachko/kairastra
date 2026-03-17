@@ -8,6 +8,7 @@ pub mod github;
 pub mod model;
 pub mod orchestrator;
 pub mod prompt;
+pub mod providers;
 pub mod runner;
 pub mod setup;
 pub mod workflow;

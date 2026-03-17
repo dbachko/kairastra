@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use symphony_rust::auth::{inspect_status, run_login, AuthMode, AuthProvider};
+use symphony_rust::auth::{inspect_status, run_login, AuthMode};
 use symphony_rust::deploy::DeployMode;
 use symphony_rust::doctor::{run as run_doctor, DoctorFormat, DoctorOptions};
 use symphony_rust::github::GitHubTracker;
@@ -77,8 +77,8 @@ struct DoctorArgs {
 
 #[derive(Debug, Args)]
 struct AuthArgs {
-    #[arg(long, value_enum, default_value_t = AuthProviderArg::Codex)]
-    provider: AuthProviderArg,
+    #[arg(long, default_value = "codex")]
+    provider: String,
 
     #[command(subcommand)]
     command: AuthCommand,
@@ -102,24 +102,11 @@ enum AuthModeArg {
     ApiKey,
 }
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum AuthProviderArg {
-    Codex,
-}
-
 impl From<AuthModeArg> for AuthMode {
     fn from(value: AuthModeArg) -> Self {
         match value {
             AuthModeArg::Chatgpt => AuthMode::Chatgpt,
             AuthModeArg::ApiKey => AuthMode::ApiKey,
-        }
-    }
-}
-
-impl From<AuthProviderArg> for AuthProvider {
-    fn from(value: AuthProviderArg) -> Self {
-        match value {
-            AuthProviderArg::Codex => AuthProvider::Codex,
         }
     }
 }
@@ -158,14 +145,14 @@ async fn main() -> Result<()> {
             provider,
             command: AuthCommand::Status,
         }) => {
-            let status = inspect_status(provider.into());
+            let status = inspect_status(&provider)?;
             println!("{}", serde_json::to_string_pretty(&status)?);
             Ok(())
         }
         Command::Auth(AuthArgs {
             provider,
             command: AuthCommand::Login(args),
-        }) => run_login(provider.into(), args.mode.into()),
+        }) => run_login(&provider, args.mode.into()),
     }
 }
 

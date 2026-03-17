@@ -4,11 +4,12 @@ use anyhow::{anyhow, Result};
 use clap::ValueEnum;
 use serde::Serialize;
 
-use crate::auth::{find_command, inspect_status, AuthProvider};
+use crate::auth::find_command;
 use crate::config::Settings;
 use crate::deploy::DeployMode;
 use crate::envfile::{apply_env, load_env_file};
 use crate::github::GitHubTracker;
+use crate::providers;
 use crate::workflow::{default_workflow_path, load_definition};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -103,7 +104,7 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
                         status: DoctorStatus::Pass,
                         detail: format!("loaded {}", path.display()),
                     });
-                    provider_command_check = check_command(provider_command_name(&settings));
+                    provider_command_check = check_command(provider_command_name(&settings)?);
                     provider_auth_check = check_auth_status(&settings);
                     tracker_check = check_github_tracker(&settings).await;
                     workspace_check = check_workspace_root(&settings.workspace.root);
@@ -202,17 +203,13 @@ fn check_command(name: &'static str) -> DoctorCheck {
     }
 }
 
-fn provider_command_name(settings: &Settings) -> &'static str {
-    match settings.agent.provider {
-        crate::config::AgentProvider::Codex => "codex",
-        crate::config::AgentProvider::Claude => "claude",
-        crate::config::AgentProvider::Gemini => "gemini",
-    }
+fn provider_command_name(settings: &Settings) -> Result<&'static str> {
+    providers::command_name(settings.agent.provider.as_str())
 }
 
 fn check_auth_status(settings: &Settings) -> DoctorCheck {
-    let provider = match AuthProvider::from_agent_provider(settings.agent.provider) {
-        Ok(provider) => provider,
+    let auth_status = match providers::inspect_auth_status(settings.agent.provider.as_str()) {
+        Ok(status) => status,
         Err(error) => {
             return DoctorCheck {
                 name: "agent_provider_auth",
@@ -221,7 +218,6 @@ fn check_auth_status(settings: &Settings) -> DoctorCheck {
             };
         }
     };
-    let auth_status = inspect_status(provider);
     DoctorCheck {
         name: "agent_provider_auth",
         status: if auth_status.openai_api_key_present || auth_status.auth_file_present {

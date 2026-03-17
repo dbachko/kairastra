@@ -14,6 +14,7 @@ use crate::agent::AgentEventKind;
 use crate::config::{normalize_issue_state, Settings};
 use crate::github::{is_rate_limited_error, GitHubTracker, Tracker};
 use crate::model::Issue;
+use crate::providers;
 use crate::runner::{run_issue, WorkerMessage, WorkerOutcome};
 use crate::workflow::{WorkflowSnapshot, WorkflowStore};
 use crate::workspace;
@@ -272,9 +273,9 @@ impl Orchestrator {
                 continue;
             };
 
-            if snapshot.settings.providers.codex.stall_timeout_ms > 0
-                && running.last_agent_timestamp.elapsed()
-                    >= Duration::from_millis(snapshot.settings.providers.codex.stall_timeout_ms)
+            let stall_timeout_ms = providers::stall_timeout_ms(&snapshot.settings)?;
+            if stall_timeout_ms > 0
+                && running.last_agent_timestamp.elapsed() >= Duration::from_millis(stall_timeout_ms)
             {
                 running.handle.abort();
                 retries.push((
@@ -728,6 +729,8 @@ agent:
   max_concurrent_agents: 10
   max_concurrent_agents_by_state:
     todo: 1
+providers:
+  codex: {}
 "#,
             )
             .unwrap(),
@@ -755,6 +758,8 @@ agent:
   provider: codex
   max_concurrent_agents: 10
   assignee_login: {assignee_login}
+providers:
+  codex: {{}}
 "#
             ))
             .unwrap(),

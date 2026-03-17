@@ -32,7 +32,6 @@ pub trait AgentBackend: Send + Sync {
 pub trait AgentSession: Send {
     async fn run_turn(
         &mut self,
-        settings: &Settings,
         issue: &Issue,
         prompt: &str,
         on_event: &UnboundedSender<AgentEvent>,

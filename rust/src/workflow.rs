@@ -202,6 +202,8 @@ tracker:
   api_key: fake
 agent:
   provider: codex
+providers:
+  codex: {}
 ---
 hello
 "#,
