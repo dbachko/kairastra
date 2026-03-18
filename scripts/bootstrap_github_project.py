@@ -72,6 +72,16 @@ DEFAULT_LABELS = [
         "description": "Assigned to Codex-driven automation.",
     },
     {
+        "name": "agent:claude",
+        "color": "8250df",
+        "description": "Assigned to Claude-driven automation.",
+    },
+    {
+        "name": "agent:gemini",
+        "color": "0e8a16",
+        "description": "Assigned to Gemini-driven automation.",
+    },
+    {
         "name": "blocked",
         "color": "d73a4a",
         "description": "Blocked on another task, dependency, or external input.",
