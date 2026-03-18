@@ -11,7 +11,7 @@ use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
 use crate::agent::AgentEventKind;
-use crate::config::{normalize_issue_state, Settings};
+use crate::config::{normalize_issue_state, ProviderId, Settings};
 use crate::github::{is_rate_limited_error, GitHubTracker, Tracker};
 use crate::model::Issue;
 use crate::providers;
@@ -21,6 +21,7 @@ use crate::workspace;
 
 const CONTINUATION_RETRY_DELAY_MS: u64 = 1_000;
 const FAILURE_RETRY_BASE_MS: u64 = 10_000;
+const ISSUE_AGENT_LABEL_PREFIX: &str = "agent:";
 
 pub struct Orchestrator {
     workflow_store: Arc<WorkflowStore>,
@@ -361,7 +362,7 @@ impl Orchestrator {
 
     async fn spawn_worker(
         &self,
-        snapshot: WorkflowSnapshot,
+        mut snapshot: WorkflowSnapshot,
         state: &mut RuntimeState,
         worker_tx: &tokio::sync::mpsc::UnboundedSender<WorkerMessage>,
         issue: Issue,
@@ -371,6 +372,16 @@ impl Orchestrator {
             return Ok(());
         }
 
+        let (provider, provider_warning) = issue_provider(&snapshot, &issue);
+        if let Some(warning) = provider_warning {
+            warn!(
+                issue_identifier = %issue.identifier,
+                provider = %provider.as_str(),
+                warning,
+                "falling back to default agent provider for issue"
+            );
+        }
+        snapshot.settings.agent.provider = provider;
         state.claimed.insert(issue.id.clone());
 
         let issue_id = issue.id.clone();
@@ -703,6 +714,59 @@ fn issue_sort_key(left: &Issue, right: &Issue) -> Ordering {
         .then_with(|| left.identifier.cmp(&right.identifier))
 }
 
+fn issue_provider(snapshot: &WorkflowSnapshot, issue: &Issue) -> (ProviderId, Option<String>) {
+    let default_provider = snapshot.settings.agent.provider.clone();
+
+    let requested = issue
+        .labels
+        .iter()
+        .filter_map(|label| label.strip_prefix(ISSUE_AGENT_LABEL_PREFIX))
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+
+    if requested.is_empty() {
+        return (default_provider, None);
+    }
+
+    let mut parsed = Vec::new();
+    for label in requested {
+        match ProviderId::parse(label.to_string()) {
+            Ok(provider) => parsed.push(provider),
+            Err(_) => {
+                return (
+                    default_provider,
+                    Some("invalid_issue_agent_label".to_string()),
+                );
+            }
+        }
+    }
+
+    parsed.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    parsed.dedup_by(|left, right| left.as_str() == right.as_str());
+
+    match parsed.len() {
+        0 => (default_provider, None),
+        1 => {
+            let provider = parsed.into_iter().next().expect("length checked");
+            if snapshot.settings.providers.get(&provider).is_none() {
+                return (
+                    default_provider,
+                    Some(format!(
+                        "issue_requested_provider_not_configured: {}",
+                        provider.as_str()
+                    )),
+                );
+            }
+            (provider, None)
+        }
+        _ => (
+            default_provider,
+            Some("multiple_issue_agent_labels".to_string()),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -710,7 +774,9 @@ mod tests {
     use crate::config::Settings;
     use crate::model::{BlockerRef, Issue, WorkflowDefinition};
 
-    use super::{issue_eligible, issue_sort_key, select_dispatchable, RuntimeState};
+    use super::{
+        issue_eligible, issue_provider, issue_sort_key, select_dispatchable, RuntimeState,
+    };
     use crate::workflow::WorkflowSnapshot;
 
     fn snapshot() -> WorkflowSnapshot {
@@ -762,6 +828,36 @@ providers:
   codex: {{}}
 "#
             ))
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+        let settings = Settings::from_workflow(&workflow).unwrap();
+        WorkflowSnapshot {
+            definition: workflow,
+            settings,
+        }
+    }
+
+    fn snapshot_with_provider_overrides() -> WorkflowSnapshot {
+        let workflow = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+  api_key: fake
+  active_states: ["Todo", "In Progress", "Merging", "Rework"]
+  terminal_states: ["Done", "Closed"]
+agent:
+  provider: codex
+  max_concurrent_agents: 10
+providers:
+  codex: {}
+  claude: {}
+  gemini: {}
+"#,
+            )
             .unwrap(),
             prompt_template: String::new(),
         };
@@ -905,5 +1001,41 @@ providers:
             &state,
             &HashMap::new()
         ));
+    }
+
+    #[test]
+    fn issue_agent_label_overrides_default_provider() {
+        let snapshot = snapshot_with_provider_overrides();
+        let mut issue = issue("1", "Todo", Some(1));
+        issue.labels = vec!["agent:claude".to_string()];
+
+        let (provider, warning) = issue_provider(&snapshot, &issue);
+        assert_eq!(provider.as_str(), "claude");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn issue_agent_label_falls_back_to_default_for_multiple_distinct_providers() {
+        let snapshot = snapshot_with_provider_overrides();
+        let mut issue = issue("1", "Todo", Some(1));
+        issue.labels = vec!["agent:claude".to_string(), "agent:gemini".to_string()];
+
+        let (provider, warning) = issue_provider(&snapshot, &issue);
+        assert_eq!(provider.as_str(), "codex");
+        assert_eq!(warning.as_deref(), Some("multiple_issue_agent_labels"));
+    }
+
+    #[test]
+    fn issue_agent_label_falls_back_to_default_when_provider_is_unconfigured() {
+        let snapshot = snapshot();
+        let mut issue = issue("1", "Todo", Some(1));
+        issue.labels = vec!["agent:claude".to_string()];
+
+        let (provider, warning) = issue_provider(&snapshot, &issue);
+        assert_eq!(provider.as_str(), "codex");
+        assert_eq!(
+            warning.as_deref(),
+            Some("issue_requested_provider_not_configured: claude")
+        );
     }
 }
