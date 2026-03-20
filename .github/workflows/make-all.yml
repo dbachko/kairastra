@@ -16,6 +16,8 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -29,3 +31,7 @@ jobs:
       - name: Run tests
         working-directory: rust
         run: cargo test
+
+      - name: Run clippy
+        working-directory: rust
+        run: cargo clippy --all-targets --all-features -- -D warnings

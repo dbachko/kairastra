@@ -20,4 +20,5 @@
 
 - [ ] `cargo fmt --check`
 - [ ] `cargo test`
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] <!-- Additional targeted checks (list below) -->

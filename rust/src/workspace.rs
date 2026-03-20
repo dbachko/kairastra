@@ -85,10 +85,15 @@ pub async fn run_before_run_hook(
     Ok(())
 }
 
-pub async fn run_after_run_hook(settings: &Settings, workspace: &Path, issue: &Issue) {
+pub async fn run_after_run_hook(
+    settings: &Settings,
+    workspace: &Path,
+    issue: &Issue,
+) -> Result<()> {
     if let Some(script) = settings.hooks.after_run.as_deref() {
-        let _ = run_hook(settings, "after_run", script, workspace, issue).await;
+        run_hook(settings, "after_run", script, workspace, issue).await?;
     }
+    Ok(())
 }
 
 pub async fn remove_issue_workspace(settings: &Settings, identifier: &str) -> Result<()> {
@@ -224,7 +229,10 @@ mod tests {
     use crate::config::Settings;
     use crate::model::{Issue, WorkflowDefinition};
 
-    use super::{ensure_workspace, remove_issue_workspace, run_hook, sanitize_workspace_key};
+    use super::{
+        ensure_workspace, remove_issue_workspace, run_after_run_hook, run_hook,
+        sanitize_workspace_key,
+    };
 
     fn test_settings(root: &Path) -> Settings {
         let definition = WorkflowDefinition {
@@ -323,5 +331,21 @@ workspace:
             fs::read_to_string(workspace.join("cargo-home-path.txt")).unwrap(),
             workspace.join(".cargo-home").display().to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn after_run_hook_errors_are_returned() {
+        let dir = tempdir().unwrap();
+        let mut settings = test_settings(dir.path());
+        settings.hooks.after_run = Some("exit 7".to_string());
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let error = run_after_run_hook(&settings, &workspace, &issue("MT-1"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("workspace_hook_failed: after_run"));
     }
 }

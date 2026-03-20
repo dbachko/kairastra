@@ -15,16 +15,13 @@ use crate::github::GitHubTracker;
 pub const AGENT_WORKPAD_HEADER: &str = "## Agent Workpad";
 pub const AGENT_BOOTSTRAP_NOTE: &str =
     "Bootstrap created by Symphony runtime before the first agent turn.";
-pub const LEGACY_CODEX_WORKPAD_HEADER: &str = "## Codex Workpad";
-pub const LEGACY_CODEX_BOOTSTRAP_NOTE: &str =
-    "Bootstrap created by Symphony runtime before the first Codex turn.";
 
 pub fn is_workpad_comment(body: &str) -> bool {
-    body.contains(AGENT_WORKPAD_HEADER) || body.contains(LEGACY_CODEX_WORKPAD_HEADER)
+    body.contains(AGENT_WORKPAD_HEADER)
 }
 
 pub fn is_bootstrap_workpad(body: &str) -> bool {
-    body.contains(AGENT_BOOTSTRAP_NOTE) || body.contains(LEGACY_CODEX_BOOTSTRAP_NOTE)
+    body.contains(AGENT_BOOTSTRAP_NOTE)
 }
 
 pub async fn start_session(

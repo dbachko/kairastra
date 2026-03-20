@@ -46,8 +46,7 @@ pub fn collect(non_interactive: bool) -> Result<CodexSetupConfig> {
 
 pub fn render_workflow_section(config: &CodexSetupConfig) -> String {
     let _ = config;
-    format!(
-        r#"providers:
+    r#"providers:
   codex:
     command: codex app-server
     model: $SYMPHONY_CODEX_MODEL
@@ -58,7 +57,7 @@ pub fn render_workflow_section(config: &CodexSetupConfig) -> String {
     turn_sandbox_policy:
       type: workspaceWrite
       networkAccess: true"#
-    )
+        .to_string()
 }
 
 pub fn render_env_section(mode: DeployMode, config: &CodexSetupConfig) -> String {

@@ -68,13 +68,14 @@ pub async fn run(options: SetupOptions) -> Result<()> {
         write_text_file(path, &unit, options.non_interactive)?;
     }
 
-    let _ = doctor::run(DoctorOptions {
+    doctor::run(DoctorOptions {
         workflow: Some(workflow_path.clone()),
         env_file: Some(env_file_path.clone()),
         mode: Some(mode),
         format: DoctorFormat::Text,
     })
-    .await;
+    .await
+    .context("generated files failed doctor validation")?;
 
     println!();
     println!("Generated:");

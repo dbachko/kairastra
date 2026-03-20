@@ -135,10 +135,10 @@ fn split_front_matter(content: &str) -> (String, Vec<String>) {
 }
 
 fn workflow_modified_time(path: &Path) -> Result<SystemTime> {
-    Ok(fs::metadata(path)
+    fs::metadata(path)
         .with_context(|| format!("missing_workflow_file: could not stat {}", path.display()))?
         .modified()
-        .context("workflow metadata missing modified time")?)
+        .context("workflow metadata missing modified time")
 }
 
 #[cfg(test)]
