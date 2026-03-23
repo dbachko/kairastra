@@ -182,11 +182,12 @@ cd rust
 cp .env.example .env
 make docker-build
 make docker-up
-make docker-login PROVIDER=codex
+make docker-login
 ```
 
-Use `make docker-login PROVIDER=codex` for Codex subscription auth or
-`make docker-login PROVIDER=claude` for Claude subscription auth.
+`make docker-login` opens a provider picker that shows which providers are already ready and which
+still need login. You can still skip the picker with `make docker-login PROVIDER=codex` or
+`make docker-login PROVIDER=claude`.
 Docker also sets `SYMPHONY_DEPLOY_MODE=docker`, so `doctor` inside the container validates Docker
 prerequisites instead of looking for `systemctl`.
 
@@ -311,6 +312,7 @@ cargo run -- auth login --mode subscription
 cargo run -- auth login --mode api-key
 cargo run -- auth --provider claude login --mode subscription
 cargo run -- auth --provider claude login --mode api-key
+cargo run -- auth menu
 ```
 
 Use `subscription` for device/browser or account login and `api-key` when the matching provider API
@@ -344,8 +346,9 @@ Available make targets:
 - `make docker-up`
 - `make docker-down`
 - `make docker-logs`
-- `make docker-login PROVIDER=codex` runs `codex login --device-auth`
-- `make docker-login PROVIDER=claude` runs `claude auth login`
+- `make docker-login` opens an interactive provider picker and then runs the matching login flow when needed
+- `make docker-login PROVIDER=codex` goes straight to the Codex login flow
+- `make docker-login PROVIDER=claude` goes straight to the Claude login flow
 
 ## Native VPS deployment details
 
@@ -451,7 +454,7 @@ journalctl -u symphony.service -f
 ```
 
 If you are already inside the `rust/` directory, drop the `-C rust` prefix and run `make docker-logs`,
-`make docker-up`, or `make docker-login PROVIDER=<codex|claude>` directly.
+`make docker-up`, or `make docker-login` directly.
 
 Common failure modes:
 

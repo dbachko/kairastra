@@ -1,7 +1,7 @@
 COMPOSE_FILE := compose.yml
 ENV_FILE := .env
 SERVICE := symphony-rust
-PROVIDER ?= codex
+PROVIDER ?=
 
 DOCKER_COMPOSE := docker compose -f $(COMPOSE_FILE) --env-file $(ENV_FILE)
 
@@ -20,11 +20,11 @@ docker-logs:
 	$(DOCKER_COMPOSE) logs -f $(SERVICE)
 
 docker-login:
-	@case "$(PROVIDER)" in \
-	  codex) $(DOCKER_COMPOSE) exec $(SERVICE) codex login --device-auth ;; \
-	  claude) $(DOCKER_COMPOSE) exec $(SERVICE) claude auth login ;; \
-	  *) echo "Unsupported PROVIDER=$(PROVIDER) (expected codex or claude)" >&2; exit 1 ;; \
-	esac
+	@provider_arg=""; \
+	if [ -n "$(PROVIDER)" ]; then \
+	  provider_arg="--provider $(PROVIDER)"; \
+	fi; \
+	$(DOCKER_COMPOSE) run --rm $(SERVICE) auth $$provider_arg menu
 
 docker-login-codex:
 	$(MAKE) docker-login PROVIDER=codex
