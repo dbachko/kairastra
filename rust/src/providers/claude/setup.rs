@@ -38,8 +38,7 @@ pub fn collect(non_interactive: bool) -> Result<ClaudeSetupConfig> {
 
 pub fn render_workflow_section(config: &ClaudeSetupConfig) -> String {
     let _ = config;
-    r#"providers:
-  claude:
+    r#"  claude:
     command: claude
     model: $SYMPHONY_CLAUDE_MODEL
     reasoning_effort: $SYMPHONY_CLAUDE_REASONING_EFFORT

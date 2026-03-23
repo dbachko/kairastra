@@ -23,6 +23,11 @@ const CONTINUATION_RETRY_DELAY_MS: u64 = 1_000;
 const FAILURE_RETRY_BASE_MS: u64 = 10_000;
 const ISSUE_AGENT_LABEL_PREFIX: &str = "agent:";
 
+enum IssueProviderSelection {
+    Selected(ProviderId),
+    Blocked(String),
+}
+
 pub struct Orchestrator {
     workflow_store: Arc<WorkflowStore>,
     tracker: Arc<GitHubTracker>,
@@ -209,9 +214,12 @@ impl Orchestrator {
                 continue;
             };
 
-            self.spawn_worker(snapshot.clone(), state, worker_tx, issue, None)
-                .await?;
-            dispatched += 1;
+            if self
+                .spawn_worker(snapshot.clone(), state, worker_tx, issue, None)
+                .await?
+            {
+                dispatched += 1;
+            }
         }
 
         Ok(())
@@ -253,14 +261,15 @@ impl Orchestrator {
                 .await?;
             match refreshed.into_iter().next() {
                 Some(issue) if snapshot.settings.active_state(&issue.state) => {
-                    self.spawn_worker(
-                        snapshot.clone(),
-                        state,
-                        worker_tx,
-                        issue,
-                        Some(retry.attempt),
-                    )
-                    .await?;
+                    let _ = self
+                        .spawn_worker(
+                            snapshot.clone(),
+                            state,
+                            worker_tx,
+                            issue,
+                            Some(retry.attempt),
+                        )
+                        .await?;
                 }
                 Some(issue) if snapshot.settings.terminal_state(&issue.state) => {
                     state.claimed.remove(&issue_id);
@@ -392,20 +401,22 @@ impl Orchestrator {
         worker_tx: &tokio::sync::mpsc::UnboundedSender<WorkerMessage>,
         issue: Issue,
         attempt: Option<u32>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if state.claimed.contains(&issue.id) || state.running.contains_key(&issue.id) {
-            return Ok(());
+            return Ok(false);
         }
 
-        let (provider, provider_warning) = issue_provider(&snapshot, &issue);
-        if let Some(warning) = provider_warning {
-            warn!(
-                issue_identifier = %issue.identifier,
-                provider = %provider.as_str(),
-                warning,
-                "falling back to default agent provider for issue"
-            );
-        }
+        let provider = match issue_provider(&snapshot, &issue) {
+            IssueProviderSelection::Selected(provider) => provider,
+            IssueProviderSelection::Blocked(warning) => {
+                warn!(
+                    issue_identifier = %issue.identifier,
+                    warning,
+                    "skipping issue because the requested agent provider is invalid or unavailable"
+                );
+                return Ok(false);
+            }
+        };
         snapshot.settings.agent.provider = provider;
         state.claimed.insert(issue.id.clone());
 
@@ -450,7 +461,7 @@ impl Orchestrator {
             },
         );
 
-        Ok(())
+        Ok(true)
     }
 
     async fn revalidate_dispatch_issue(
@@ -469,6 +480,15 @@ impl Orchestrator {
         if !snapshot.settings.active_state(&issue.state)
             || snapshot.settings.terminal_state(&issue.state)
         {
+            return Ok(None);
+        }
+
+        if let IssueProviderSelection::Blocked(warning) = issue_provider(snapshot, &issue) {
+            warn!(
+                issue_identifier = %issue.identifier,
+                warning,
+                "skipping issue because the requested agent provider is invalid or unavailable"
+            );
             return Ok(None);
         }
 
@@ -739,7 +759,7 @@ fn issue_sort_key(left: &Issue, right: &Issue) -> Ordering {
         .then_with(|| left.identifier.cmp(&right.identifier))
 }
 
-fn issue_provider(snapshot: &WorkflowSnapshot, issue: &Issue) -> (ProviderId, Option<String>) {
+fn issue_provider(snapshot: &WorkflowSnapshot, issue: &Issue) -> IssueProviderSelection {
     let default_provider = snapshot.settings.agent.provider.clone();
 
     let requested = issue
@@ -751,7 +771,7 @@ fn issue_provider(snapshot: &WorkflowSnapshot, issue: &Issue) -> (ProviderId, Op
         .collect::<Vec<_>>();
 
     if requested.is_empty() {
-        return (default_provider, None);
+        return IssueProviderSelection::Selected(default_provider);
     }
 
     let mut parsed = Vec::new();
@@ -759,10 +779,7 @@ fn issue_provider(snapshot: &WorkflowSnapshot, issue: &Issue) -> (ProviderId, Op
         match ProviderId::parse(label.to_string()) {
             Ok(provider) => parsed.push(provider),
             Err(_) => {
-                return (
-                    default_provider,
-                    Some("invalid_issue_agent_label".to_string()),
-                );
+                return IssueProviderSelection::Blocked("invalid_issue_agent_label".to_string());
             }
         }
     }
@@ -771,24 +788,18 @@ fn issue_provider(snapshot: &WorkflowSnapshot, issue: &Issue) -> (ProviderId, Op
     parsed.dedup_by(|left, right| left.as_str() == right.as_str());
 
     match parsed.len() {
-        0 => (default_provider, None),
+        0 => IssueProviderSelection::Selected(default_provider),
         1 => {
             let provider = parsed.into_iter().next().expect("length checked");
             if snapshot.settings.providers.get(&provider).is_none() {
-                return (
-                    default_provider,
-                    Some(format!(
-                        "issue_requested_provider_not_configured: {}",
-                        provider.as_str()
-                    )),
-                );
+                return IssueProviderSelection::Blocked(format!(
+                    "issue_requested_provider_not_configured: {}",
+                    provider.as_str()
+                ));
             }
-            (provider, None)
+            IssueProviderSelection::Selected(provider)
         }
-        _ => (
-            default_provider,
-            Some("multiple_issue_agent_labels".to_string()),
-        ),
+        _ => IssueProviderSelection::Blocked("multiple_issue_agent_labels".to_string()),
     }
 }
 
@@ -800,7 +811,8 @@ mod tests {
     use crate::model::{BlockerRef, Issue, WorkflowDefinition};
 
     use super::{
-        issue_eligible, issue_provider, issue_sort_key, select_dispatchable, RuntimeState,
+        issue_eligible, issue_provider, issue_sort_key, select_dispatchable,
+        IssueProviderSelection, RuntimeState,
     };
     use crate::workflow::WorkflowSnapshot;
 
@@ -1034,33 +1046,45 @@ providers:
         let mut issue = issue("1", "Todo", Some(1));
         issue.labels = vec!["agent:claude".to_string()];
 
-        let (provider, warning) = issue_provider(&snapshot, &issue);
-        assert_eq!(provider.as_str(), "claude");
-        assert!(warning.is_none());
+        match issue_provider(&snapshot, &issue) {
+            IssueProviderSelection::Selected(provider) => {
+                assert_eq!(provider.as_str(), "claude");
+            }
+            IssueProviderSelection::Blocked(warning) => {
+                panic!("expected provider selection, got warning: {warning}");
+            }
+        }
     }
 
     #[test]
-    fn issue_agent_label_falls_back_to_default_for_multiple_distinct_providers() {
+    fn issue_agent_label_blocks_dispatch_for_multiple_distinct_providers() {
         let snapshot = snapshot_with_provider_overrides();
         let mut issue = issue("1", "Todo", Some(1));
         issue.labels = vec!["agent:claude".to_string(), "agent:gemini".to_string()];
 
-        let (provider, warning) = issue_provider(&snapshot, &issue);
-        assert_eq!(provider.as_str(), "codex");
-        assert_eq!(warning.as_deref(), Some("multiple_issue_agent_labels"));
+        match issue_provider(&snapshot, &issue) {
+            IssueProviderSelection::Selected(provider) => {
+                panic!("expected provider warning, got {}", provider.as_str());
+            }
+            IssueProviderSelection::Blocked(warning) => {
+                assert_eq!(warning, "multiple_issue_agent_labels");
+            }
+        }
     }
 
     #[test]
-    fn issue_agent_label_falls_back_to_default_when_provider_is_unconfigured() {
+    fn issue_agent_label_blocks_dispatch_when_provider_is_unconfigured() {
         let snapshot = snapshot();
         let mut issue = issue("1", "Todo", Some(1));
         issue.labels = vec!["agent:claude".to_string()];
 
-        let (provider, warning) = issue_provider(&snapshot, &issue);
-        assert_eq!(provider.as_str(), "codex");
-        assert_eq!(
-            warning.as_deref(),
-            Some("issue_requested_provider_not_configured: claude")
-        );
+        match issue_provider(&snapshot, &issue) {
+            IssueProviderSelection::Selected(provider) => {
+                panic!("expected provider warning, got {}", provider.as_str());
+            }
+            IssueProviderSelection::Blocked(warning) => {
+                assert_eq!(warning, "issue_requested_provider_not_configured: claude");
+            }
+        }
     }
 }

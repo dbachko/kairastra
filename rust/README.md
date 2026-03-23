@@ -2,8 +2,8 @@
 
 This directory contains the current Rust implementation of Symphony for GitHub Issues and Projects
 v2. It is the operator-facing runtime in this repo: it loads `WORKFLOW.md`, polls GitHub, creates
-per-issue workspaces, launches Codex via the app-server protocol, and keeps the issue lifecycle in
-sync with the runtime.
+per-issue workspaces, launches the configured agent provider, and keeps the issue lifecycle in sync
+with the runtime.
 
 Use this README as the practical setup and operations guide. The normative behavior still lives in
 [`SPEC.md`](../SPEC.md).
@@ -14,16 +14,18 @@ Use this README as the practical setup and operations guide. The normative behav
 - Talks to GitHub through GraphQL and REST using a typed `tracker.kind: github` config.
 - Supports `projects_v2` as the primary tracker mode and `issues_only` as a fallback.
 - Creates deterministic per-issue workspaces and runs lifecycle hooks around them.
-- Starts Codex through the current app-server v2 protocol.
+- Starts the configured provider runtime for each issue.
 - Tracks retries, continuation turns, backoff, and reconciliation in a single orchestrator loop.
-- Exposes operator commands for setup, doctor checks, and Codex auth management.
+- Exposes operator commands for setup, doctor checks, and provider auth management.
 
 ## Requirements
 
 At minimum:
 
 - Rust toolchain
-- current `codex` CLI available in `PATH` with app-server v2 support
+- the provider CLI or CLIs you intend to route to available in `PATH`:
+  - `codex` for Codex
+  - `claude` for Claude Code
 - GitHub token with access to the target repo and project
 - A `WORKFLOW.md` file or a generated equivalent
 
@@ -56,7 +58,8 @@ What each command does:
   workers started in that pass to finish. Continuations and retries are deferred to the next run.
 - `setup`: guided first-run flow for native VPS or Docker.
 - `doctor`: validate local prerequisites, workflow loading, GitHub connectivity, and the selected provider auth state.
-- `auth status`: print the current provider auth state as JSON. The default provider is `codex`.
+- `auth status`: print the current provider auth state as JSON. The default provider is `codex`
+  unless you pass `--provider`.
 - `auth login`: run either subscription/device login or API-key bootstrap through the selected
   provider CLI.
 
@@ -149,6 +152,9 @@ If you use subscription auth:
 ```bash
 cargo run -- auth login --mode subscription
 cargo run -- auth status
+# For Claude instead:
+# cargo run -- auth --provider claude login --mode subscription
+# cargo run -- auth --provider claude status
 ```
 
 If you use API-key auth:
@@ -156,6 +162,9 @@ If you use API-key auth:
 ```bash
 export OPENAI_API_KEY=...
 cargo run -- auth login --mode api-key
+# For Claude instead:
+# export ANTHROPIC_API_KEY=...
+# cargo run -- auth --provider claude login --mode api-key
 ```
 
 ### Docker
@@ -173,11 +182,11 @@ cd rust
 cp .env.example .env
 make docker-build
 make docker-up
-make docker-login
+make docker-login PROVIDER=codex
 ```
 
-`make docker-login` uses Codex device auth inside the container, which avoids the broken
-`localhost` browser-callback flow for containerized logins.
+Use `make docker-login PROVIDER=codex` for Codex subscription auth or
+`make docker-login PROVIDER=claude` for Claude subscription auth.
 Docker also sets `SYMPHONY_DEPLOY_MODE=docker`, so `doctor` inside the container validates Docker
 prerequisites instead of looking for `systemctl`.
 
@@ -219,10 +228,13 @@ What setup asks for:
 - optional canonical clone URL
 - optional assignee login filter
 - concurrency and turn limits
+- default provider selection
+- provider auth path to optimize for
 - optional Codex model override
 - optional Codex thinking effort override: `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`
 - whether to force Codex fast mode on
-- Codex auth path to optimize for
+- optional Claude model override
+- optional Claude thinking effort override: `low`, `medium`, or `high`
 
 What setup writes:
 
@@ -256,8 +268,8 @@ cargo run -- doctor --mode docker --format json
 
 Doctor currently checks:
 
-- presence of required local commands such as `codex`, `gh`, and `docker` or `systemctl`
-- Codex auth state
+- presence of required local commands such as the selected provider CLI, `gh`, and `docker` or `systemctl`
+- selected provider auth state
 - workflow load/validation
 - GitHub tracker connectivity using the configured token
 - workspace root existence or whether its parent exists
@@ -267,18 +279,19 @@ Expected behavior:
 - Native mode on macOS or other non-`systemd` hosts will warn or fail on the `systemctl` check.
 - A workflow that still references missing env vars will fail validation until the env file or shell exports are present.
 
-## Codex auth model
+## Provider auth model
 
 Supported runtime modes:
 
-- `auto`: if `OPENAI_API_KEY` is present, prefer API-key bootstrap; otherwise rely on persisted login state
-- `api_key`: require `OPENAI_API_KEY`
-- `subscription`: use persisted device-auth login state only
+- `auto`: prefer the matching provider API key env var when present (`OPENAI_API_KEY` for Codex, `ANTHROPIC_API_KEY` for Claude); otherwise rely on persisted login state
+- `api_key`: require the matching provider API key env var
+- `subscription`: use persisted device-auth or account login state only
 
 Status command:
 
 ```bash
 cargo run -- auth status
+cargo run -- auth --provider claude status
 ```
 
 This reports:
@@ -287,19 +300,21 @@ This reports:
 - configured auth mode
 - inferred auth mode
 - whether the provider CLI is available locally
-- whether a local `~/.codex/auth.json` file exists
-- whether `OPENAI_API_KEY` is set
-- a reminder that Docker persists auth in the `symphony_rust_codex` volume at `/root/.codex` inside the container
+- whether the provider's local auth state exists (`~/.codex` or `~/.claude`)
+- whether the matching API key env var is set (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`)
+- a reminder about the matching Docker auth volume inside the container
 
 Login commands:
 
 ```bash
 cargo run -- auth login --mode subscription
 cargo run -- auth login --mode api-key
+cargo run -- auth --provider claude login --mode subscription
+cargo run -- auth --provider claude login --mode api-key
 ```
 
-Use `subscription` for device/browser login and `api-key` when `OPENAI_API_KEY` is already set in
-the current shell.
+Use `subscription` for device/browser or account login and `api-key` when the matching provider API
+key is already set in the current shell.
 
 ## Docker deployment details
 
@@ -315,10 +330,13 @@ Important details:
 - `SEED_REPO_PATH` is mounted read-only at `/seed-repo`.
 - workspaces live in the `symphony_rust_workspaces` volume.
 - Codex auth persists in the `symphony_rust_codex` volume.
+- Claude auth persists in the `symphony_rust_claude` volume.
 - Compose now passes through the workflow-related `SYMPHONY_*` variables so env-backed workflow
   fields resolve inside the container at runtime.
-- `CODEX_AUTH_MODE=subscription` plus `make docker-login` is the intended subscription/device-auth path.
+- `CODEX_AUTH_MODE=subscription` plus `make docker-login PROVIDER=codex` is the intended Codex subscription/device-auth path.
 - `CODEX_AUTH_MODE=api_key` plus `OPENAI_API_KEY` is the intended API-key path.
+- `CLAUDE_AUTH_MODE=subscription` plus `make docker-login PROVIDER=claude` is the intended Claude subscription path.
+- `CLAUDE_AUTH_MODE=api_key` plus `ANTHROPIC_API_KEY` is the intended Claude API-key path.
 
 Available make targets:
 
@@ -326,7 +344,8 @@ Available make targets:
 - `make docker-up`
 - `make docker-down`
 - `make docker-logs`
-- `make docker-login` runs `codex login --device-auth`
+- `make docker-login PROVIDER=codex` runs `codex login --device-auth`
+- `make docker-login PROVIDER=claude` runs `claude auth login`
 
 ## Native VPS deployment details
 
@@ -366,6 +385,8 @@ environment variables such as:
 - `SYMPHONY_GIT_CLONE_URL`
 - `SYMPHONY_SEED_REPO`
 - `SYMPHONY_AGENT_ASSIGNEE`
+- `SYMPHONY_CLAUDE_MODEL`
+- `SYMPHONY_CLAUDE_REASONING_EFFORT`
 - `SYMPHONY_CODEX_MODEL`
 - `SYMPHONY_CODEX_REASONING_EFFORT`
 - `SYMPHONY_CODEX_FAST`
@@ -384,14 +405,17 @@ The generated workflow also includes an `after_create` hook that:
 The checked-in [WORKFLOW.md](../WORKFLOW.md) remains a good reference for the richer review/handoff
 prompt used in this repo.
 
-Codex runtime controls:
+Provider runtime controls:
 
-- `agent.provider` selects the agent backend for the workflow. Today the supported value is `codex`.
+- `agent.provider` selects the default agent backend for the workflow. Supported values are
+  `codex` and `claude`.
+- label overrides such as `agent:claude` can route individual issues to a different configured provider.
 - `providers.codex.model` sets the model Symphony requests for the thread and subsequent turns.
 - `providers.codex.reasoning_effort` controls thinking depth. Valid values are `none`, `minimal`, `low`,
   `medium`, `high`, and `xhigh`.
 - `providers.codex.fast` is a boolean. `true` maps to Codex `serviceTier=fast`; `false` maps to
   `serviceTier=flex`.
+- `providers.claude.model` and `providers.claude.reasoning_effort` control Claude Code selection and depth.
 
 ## GitHub bootstrap helper
 
@@ -427,7 +451,7 @@ journalctl -u symphony.service -f
 ```
 
 If you are already inside the `rust/` directory, drop the `-C rust` prefix and run `make docker-logs`,
-`make docker-up`, or `make docker-login` directly.
+`make docker-up`, or `make docker-login PROVIDER=<codex|claude>` directly.
 
 Common failure modes:
 

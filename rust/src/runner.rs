@@ -12,7 +12,7 @@ use crate::github::{GitHubTracker, OpenPullRequest, PullRequestChecksSummary, Tr
 use crate::model::Issue;
 use crate::prompt::{build_prompt, continuation_prompt};
 use crate::providers::{
-    self, is_bootstrap_workpad, is_workpad_comment, AGENT_BOOTSTRAP_NOTE, AGENT_WORKPAD_HEADER,
+    self, is_bootstrap_workpad, is_workpad_comment, workpad_header, AGENT_BOOTSTRAP_NOTE,
 };
 use crate::workflow::WorkflowSnapshot;
 use crate::workspace;
@@ -67,7 +67,12 @@ pub async fn run_issue(
             providers::start_session(&snapshot.settings, tracker.clone(), &workspace.path).await?;
 
         let mut current_issue = issue.clone();
-        let workpad_body = render_workpad_bootstrap(&workspace.path, &current_issue).await?;
+        let workpad_body = render_workpad_bootstrap(
+            &workspace.path,
+            &current_issue,
+            snapshot.settings.agent.provider.as_str(),
+        )
+        .await?;
         current_issue = tracker
             .ensure_workpad_comment(&current_issue, &workpad_body)
             .await?;
@@ -135,6 +140,7 @@ pub async fn run_issue(
             let workpad_body = synthesize_runtime_workpad(
                 &workspace.path,
                 &current_issue,
+                snapshot.settings.agent.provider.as_str(),
                 turn_number,
                 branch.as_deref(),
                 open_pr.as_ref(),
@@ -298,6 +304,7 @@ const RUNTIME_STATUS_END: &str = "<!-- symphony-runtime-status:end -->";
 async fn synthesize_runtime_workpad(
     workspace: &std::path::Path,
     issue: &Issue,
+    provider: &str,
     turn_number: usize,
     branch: Option<&str>,
     open_pr: Option<&OpenPullRequest>,
@@ -310,7 +317,7 @@ async fn synthesize_runtime_workpad(
     let base_body = issue
         .workpad_comment_body
         .clone()
-        .unwrap_or_else(|| render_workpad_bootstrap_sync(workspace, issue, &sha));
+        .unwrap_or_else(|| render_workpad_bootstrap_sync(workspace, issue, provider, &sha));
     let runtime_section =
         render_runtime_status_section(turn_number, branch, &sha, &status_lines, open_pr, pr_checks);
     Ok(merge_runtime_status_section(&base_body, &runtime_section))
@@ -381,13 +388,17 @@ fn merge_runtime_status_section(existing_body: &str, runtime_section: &str) -> S
     }
 }
 
-async fn render_workpad_bootstrap(workspace: &std::path::Path, issue: &Issue) -> Result<String> {
+async fn render_workpad_bootstrap(
+    workspace: &std::path::Path,
+    issue: &Issue,
+    provider: &str,
+) -> Result<String> {
     let hostname = runtime_hostname().await?;
     let sha = current_head_short_sha(workspace)
         .await?
         .unwrap_or_else(|| "unknown".to_string());
     Ok(
-        render_workpad_bootstrap_sync(workspace, issue, &sha).replacen(
+        render_workpad_bootstrap_sync(workspace, issue, provider, &sha).replacen(
             "unknown-host",
             &hostname,
             1,
@@ -395,11 +406,17 @@ async fn render_workpad_bootstrap(workspace: &std::path::Path, issue: &Issue) ->
     )
 }
 
-fn render_workpad_bootstrap_sync(workspace: &std::path::Path, issue: &Issue, sha: &str) -> String {
+fn render_workpad_bootstrap_sync(
+    workspace: &std::path::Path,
+    issue: &Issue,
+    provider: &str,
+    sha: &str,
+) -> String {
     let issue_url = issue.url.clone().unwrap_or_default();
+    let header = workpad_header(provider);
 
     format!(
-        "{AGENT_WORKPAD_HEADER}\n\n```text\nunknown-host:{}@{sha}\n```\n\n### Plan\n\n- [ ] 1\\. Reconcile tracker and repository state\n- [ ] 2\\. Implement the requested issue scope\n- [ ] 3\\. Run required validation\n- [ ] 4\\. Open or update the pull request and link it to the issue\n\n### Acceptance Criteria\n\n- [ ] The requested issue scope is implemented for {}.\n- [ ] Required validation from the issue is complete.\n- [ ] A pull request is opened and linked before review handoff.\n- [ ] GitHub Actions and required PR checks are green before review handoff.\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- {AGENT_BOOTSTRAP_NOTE}\n- Issue: {}\n",
+        "{header}\n\n```text\nunknown-host:{}@{sha}\n```\n\n### Plan\n\n- [ ] 1\\. Reconcile tracker and repository state\n- [ ] 2\\. Implement the requested issue scope\n- [ ] 3\\. Run required validation\n- [ ] 4\\. Open or update the pull request and link it to the issue\n\n### Acceptance Criteria\n\n- [ ] The requested issue scope is implemented for {}.\n- [ ] Required validation from the issue is complete.\n- [ ] A pull request is opened and linked before review handoff.\n- [ ] GitHub Actions and required PR checks are green before review handoff.\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- {AGENT_BOOTSTRAP_NOTE}\n- Issue: {}\n",
         workspace.display(),
         issue.identifier,
         issue_url
@@ -432,12 +449,15 @@ async fn runtime_hostname() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{
-        merge_runtime_status_section, render_runtime_status_section, workpad_has_progress,
-        PullRequestChecksSummary, RUNTIME_STATUS_END, RUNTIME_STATUS_START,
+        merge_runtime_status_section, render_runtime_status_section, render_workpad_bootstrap_sync,
+        workpad_has_progress, PullRequestChecksSummary, RUNTIME_STATUS_END, RUNTIME_STATUS_START,
     };
     use crate::github::PullRequestChecksState;
     use crate::model::Issue;
+    use crate::providers::{workpad_header, AGENT_WORKPAD_HEADER};
 
     fn issue_with_workpad(body: Option<&str>) -> Issue {
         Issue {
@@ -477,6 +497,24 @@ mod tests {
             "## Agent Workpad\n\n### Plan\n\n- [x] 1. Done\n\n### Notes\n\n- Updated by the agent.\n",
         ));
         assert!(workpad_has_progress(&issue));
+    }
+
+    #[test]
+    fn provider_specific_workpad_counts_as_progress() {
+        let issue = issue_with_workpad(Some(
+            "## Codex Workpad\n\n### Plan\n\n- [x] 1. Done\n\n### Notes\n\n- Updated by the agent.\n",
+        ));
+        assert!(workpad_has_progress(&issue));
+    }
+
+    #[test]
+    fn bootstrap_workpad_uses_provider_specific_header() {
+        let issue = issue_with_workpad(None);
+        let body =
+            render_workpad_bootstrap_sync(Path::new("/tmp/workspace"), &issue, "codex", "abc123");
+
+        assert!(body.starts_with(workpad_header("codex")));
+        assert!(!body.starts_with(AGENT_WORKPAD_HEADER));
     }
 
     #[test]

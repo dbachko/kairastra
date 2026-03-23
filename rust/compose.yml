@@ -5,10 +5,13 @@ services:
       dockerfile: rust/Dockerfile
       args:
         CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.114.0}
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-2.1.81}
     environment:
       SYMPHONY_DEPLOY_MODE: docker
       GITHUB_TOKEN: ${GITHUB_TOKEN}
       CODEX_AUTH_MODE: ${CODEX_AUTH_MODE:-auto}
+      CLAUDE_AUTH_MODE: ${CLAUDE_AUTH_MODE:-auto}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       WORKFLOW_PATH: /config/WORKFLOW.md
       SYMPHONY_WORKSPACE_ROOT: ${SYMPHONY_WORKSPACE_ROOT:-/workspaces}
@@ -17,6 +20,11 @@ services:
       SYMPHONY_GITHUB_REPO: ${SYMPHONY_GITHUB_REPO:-}
       SYMPHONY_GITHUB_PROJECT_NUMBER: ${SYMPHONY_GITHUB_PROJECT_NUMBER:-}
       SYMPHONY_GITHUB_PROJECT_URL: ${SYMPHONY_GITHUB_PROJECT_URL:-}
+      SYMPHONY_CODEX_MODEL: ${SYMPHONY_CODEX_MODEL:-}
+      SYMPHONY_CODEX_REASONING_EFFORT: ${SYMPHONY_CODEX_REASONING_EFFORT:-}
+      SYMPHONY_CODEX_FAST: ${SYMPHONY_CODEX_FAST:-false}
+      SYMPHONY_CLAUDE_MODEL: ${SYMPHONY_CLAUDE_MODEL:-}
+      SYMPHONY_CLAUDE_REASONING_EFFORT: ${SYMPHONY_CLAUDE_REASONING_EFFORT:-}
       SYMPHONY_GIT_CLONE_URL: ${SYMPHONY_GIT_CLONE_URL:-}
       SYMPHONY_GIT_PUSH_URL: ${SYMPHONY_GIT_PUSH_URL:-}
       SYMPHONY_AGENT_ASSIGNEE: ${SYMPHONY_AGENT_ASSIGNEE:-}
@@ -28,8 +36,10 @@ services:
       - ${SEED_REPO_PATH:-..}:/seed-repo:ro
       - symphony_rust_workspaces:${SYMPHONY_WORKSPACE_ROOT:-/workspaces}
       - symphony_rust_codex:/root/.codex
+      - symphony_rust_claude:/root/.claude
     restart: unless-stopped
 
 volumes:
   symphony_rust_workspaces:
   symphony_rust_codex:
+  symphony_rust_claude:

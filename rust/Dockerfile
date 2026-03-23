@@ -11,10 +11,11 @@ RUN cargo build --locked --release
 FROM node:24-bookworm-slim AS runtime
 
 ARG CODEX_CLI_VERSION=0.114.0
+ARG CLAUDE_CODE_VERSION=2.1.81
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates docker-compose docker.io gcc gh git libc6-dev make openssh-client pkg-config rsync \
-    && npm install -g "@openai/codex@${CODEX_CLI_VERSION}" \
+    && npm install -g "@openai/codex@${CODEX_CLI_VERSION}" "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/cargo /usr/local/cargo
