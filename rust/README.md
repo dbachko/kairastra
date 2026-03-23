@@ -186,8 +186,9 @@ make docker-login
 ```
 
 `make docker-login` opens a provider picker that shows which providers are already ready and which
-still need login. You can still skip the picker with `make docker-login PROVIDER=codex` or
-`make docker-login PROVIDER=claude`.
+still need action. In Docker, Codex can use interactive login, but Claude is recommended to use
+`ANTHROPIC_API_KEY` instead of browser login. You can still skip the picker with
+`make docker-login PROVIDER=codex` or `make docker-login PROVIDER=claude`.
 Docker also sets `SYMPHONY_DEPLOY_MODE=docker`, so `doctor` inside the container validates Docker
 prerequisites instead of looking for `systemctl`.
 
@@ -337,8 +338,8 @@ Important details:
   fields resolve inside the container at runtime.
 - `CODEX_AUTH_MODE=subscription` plus `make docker-login PROVIDER=codex` is the intended Codex subscription/device-auth path.
 - `CODEX_AUTH_MODE=api_key` plus `OPENAI_API_KEY` is the intended API-key path.
-- `CLAUDE_AUTH_MODE=subscription` plus `make docker-login PROVIDER=claude` is the intended Claude subscription path.
-- `CLAUDE_AUTH_MODE=api_key` plus `ANTHROPIC_API_KEY` is the intended Claude API-key path.
+- `CLAUDE_AUTH_MODE=api_key` plus `ANTHROPIC_API_KEY` is the intended Claude Docker path.
+- Browser-based Claude subscription login may fail in Docker; `make docker-login` will point you to the API-key path and only offer browser login as a fallback.
 
 Available make targets:
 
@@ -348,7 +349,7 @@ Available make targets:
 - `make docker-logs`
 - `make docker-login` opens an interactive provider picker and then runs the matching login flow when needed
 - `make docker-login PROVIDER=codex` goes straight to the Codex login flow
-- `make docker-login PROVIDER=claude` goes straight to the Claude login flow
+- `make docker-login PROVIDER=claude` shows the Claude Docker auth guidance and can optionally try browser login as a fallback
 
 ## Native VPS deployment details
 
