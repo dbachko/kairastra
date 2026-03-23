@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -124,9 +124,11 @@ impl ClaudeSession {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("missing_claude_stdout"))?;
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(log_stderr(stderr));
-        }
+        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+        let stderr_logger = child.stderr.take().map(|stderr| {
+            let stderr_lines = Arc::clone(&stderr_lines);
+            tokio::spawn(log_stderr(stderr, stderr_lines))
+        });
 
         let parse_result = timeout(
             Duration::from_millis(self.config.turn_timeout_ms),
@@ -156,15 +158,32 @@ impl ClaudeSession {
             .wait()
             .await
             .context("failed to wait for Claude turn")?;
+        if let Some(task) = stderr_logger {
+            let _ = task.await;
+        }
+        let stderr_summary = summarize_stderr(&stderr_lines);
         match result {
             Ok(result) => {
                 if !status.success() {
+                    if let Some(stderr) = stderr_summary {
+                        return Err(anyhow!(
+                            "claude_turn_failed: process_exited={status}; stderr={stderr}"
+                        ));
+                    }
                     return Err(anyhow!("claude_turn_failed: process_exited={status}"));
                 }
                 self.current_session_id = Some(result.session_id.clone());
                 Ok(result)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                if !status.success() {
+                    if let Some(stderr) = stderr_summary {
+                        return Err(anyhow!("{error}; process_exited={status}; stderr={stderr}"));
+                    }
+                    return Err(anyhow!("{error}; process_exited={status}"));
+                }
+                Err(error)
+            }
         }
     }
 
@@ -500,14 +519,29 @@ fn shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 
-async fn log_stderr(stderr: ChildStderr) {
+async fn log_stderr(stderr: ChildStderr, captured_lines: Arc<Mutex<Vec<String>>>) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
+        if let Ok(mut captured) = captured_lines.lock() {
+            if captured.len() >= 5 {
+                captured.remove(0);
+            }
+            captured.push(trimmed.to_string());
+        }
         warn!(provider = "claude", stderr = trimmed, "Claude stderr");
+    }
+}
+
+fn summarize_stderr(captured_lines: &Arc<Mutex<Vec<String>>>) -> Option<String> {
+    let captured = captured_lines.lock().ok()?;
+    if captured.is_empty() {
+        None
+    } else {
+        Some(captured.join(" | "))
     }
 }
 
@@ -669,6 +703,44 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
             }
         }
         assert!(saw_approval_required);
+    }
+
+    #[tokio::test]
+    async fn surfaces_stderr_when_claude_exits_before_result() {
+        let dir = tempdir().unwrap();
+        let workspace_root = dir.path().join("workspaces");
+        let workspace = workspace_root.join("ISSUE-ERR");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let script = dir.path().join("stderr-claude.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+printf '%s\n' 'Not logged in · Please run /login' >&2
+exit 1
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let settings = settings_with_command(&workspace_root, &script.display().to_string(), "");
+        let mut session = ClaudeSession::start(&settings, "fake", &workspace).unwrap();
+        let (tx, _rx) = unbounded_channel();
+
+        let error = session
+            .run_turn(&issue("ISSUE-ERR"), "prompt", &tx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("process_exited="));
+        assert!(error.contains("Not logged in"));
     }
 
     #[tokio::test]
