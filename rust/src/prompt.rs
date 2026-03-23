@@ -99,10 +99,7 @@ pub fn continuation_prompt(issue: &Issue, turn_number: usize, max_turns: usize) 
 mod tests {
     use crate::config::Settings;
     use crate::model::{Issue, WorkflowDefinition};
-    use crate::providers::{
-        AGENT_BOOTSTRAP_NOTE, AGENT_WORKPAD_HEADER, LEGACY_CODEX_BOOTSTRAP_NOTE,
-        LEGACY_CODEX_WORKPAD_HEADER,
-    };
+    use crate::providers::{AGENT_BOOTSTRAP_NOTE, AGENT_WORKPAD_HEADER};
     use crate::workflow::WorkflowSnapshot;
 
     use super::{build_prompt, continuation_prompt};
@@ -236,35 +233,5 @@ providers:
         let prompt = continuation_prompt(&issue, 2, 20);
         assert!(prompt.contains("first action this turn must be to update"));
         assert!(prompt.contains("issuecomment-99"));
-    }
-
-    #[test]
-    fn continuation_prompt_recognizes_legacy_bootstrap_workpad() {
-        let issue = Issue {
-            id: "1".to_string(),
-            project_item_id: None,
-            identifier: "dbachko/symphony-gh#1".to_string(),
-            title: "Continuation".to_string(),
-            description: None,
-            priority: None,
-            state: "In Progress".to_string(),
-            branch_name: None,
-            url: Some("https://github.com/dbachko/symphony-gh/issues/1".to_string()),
-            assignees: Vec::new(),
-            labels: Vec::new(),
-            blocked_by: Vec::new(),
-            created_at: None,
-            updated_at: None,
-            workpad_comment_id: Some(99),
-            workpad_comment_url: Some(
-                "https://github.com/dbachko/symphony-gh/issues/1#issuecomment-99".to_string(),
-            ),
-            workpad_comment_body: Some(format!(
-                "{LEGACY_CODEX_WORKPAD_HEADER}\n\n### Notes\n\n- {LEGACY_CODEX_BOOTSTRAP_NOTE}\n"
-            )),
-        };
-
-        let prompt = continuation_prompt(&issue, 2, 20);
-        assert!(prompt.contains("first action this turn must be to update"));
     }
 }

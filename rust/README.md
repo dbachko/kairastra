@@ -46,17 +46,25 @@ cargo run -- run /path/to/WORKFLOW.md
 cargo run -- setup
 cargo run -- doctor
 cargo run -- auth status
-cargo run -- auth login --mode chatgpt
+cargo run -- auth login --mode subscription
 cargo run -- auth login --mode api-key
 ```
 
 What each command does:
 
-- `run`: start the orchestrator loop. `--once` runs a single scheduling tick.
+- `run`: start the orchestrator loop. `--once` performs one dispatch pass and waits for any
+  workers started in that pass to finish. Continuations and retries are deferred to the next run.
 - `setup`: guided first-run flow for native VPS or Docker.
 - `doctor`: validate local prerequisites, workflow loading, GitHub connectivity, and the selected provider auth state.
 - `auth status`: print the current provider auth state as JSON. The default provider is `codex`.
-- `auth login`: run either ChatGPT subscription/device login or API-key bootstrap through the selected provider CLI.
+- `auth login`: run either subscription/device login or API-key bootstrap through the selected
+  provider CLI.
+
+Additional operator docs:
+
+- [docs/architecture.md](../docs/architecture.md)
+- [docs/workflow-reference.md](../docs/workflow-reference.md)
+- [docs/troubleshooting.md](../docs/troubleshooting.md)
 
 ## Quick start
 
@@ -136,10 +144,10 @@ cargo run -- setup --mode native
 cargo run -- doctor --workflow ../WORKFLOW.md --env-file ../symphony.env
 ```
 
-If you use ChatGPT subscription auth:
+If you use subscription auth:
 
 ```bash
-cargo run -- auth login --mode chatgpt
+cargo run -- auth login --mode subscription
 cargo run -- auth status
 ```
 
@@ -156,7 +164,7 @@ cargo run -- auth login --mode api-key
 2. Fill in `GITHUB_TOKEN` and the workflow-related `SYMPHONY_*` values.
 3. Point `WORKFLOW_FILE` at the workflow you want mounted.
 4. Start the stack.
-5. If you use ChatGPT/device auth, run the Docker login helper once.
+5. If you use subscription/device auth, run the Docker login helper once.
 
 Example:
 
@@ -265,7 +273,7 @@ Supported runtime modes:
 
 - `auto`: if `OPENAI_API_KEY` is present, prefer API-key bootstrap; otherwise rely on persisted login state
 - `api_key`: require `OPENAI_API_KEY`
-- `chatgpt`: use persisted ChatGPT/device-auth login state only
+- `subscription`: use persisted device-auth login state only
 
 Status command:
 
@@ -286,12 +294,12 @@ This reports:
 Login commands:
 
 ```bash
-cargo run -- auth login --mode chatgpt
+cargo run -- auth login --mode subscription
 cargo run -- auth login --mode api-key
 ```
 
-Use `chatgpt` for device/browser login and `api-key` when `OPENAI_API_KEY` is already set in the
-current shell.
+Use `subscription` for device/browser login and `api-key` when `OPENAI_API_KEY` is already set in
+the current shell.
 
 ## Docker deployment details
 
@@ -309,7 +317,7 @@ Important details:
 - Codex auth persists in the `symphony_rust_codex` volume.
 - Compose now passes through the workflow-related `SYMPHONY_*` variables so env-backed workflow
   fields resolve inside the container at runtime.
-- `CODEX_AUTH_MODE=chatgpt` plus `make docker-login` is the intended subscription/device-auth path.
+- `CODEX_AUTH_MODE=subscription` plus `make docker-login` is the intended subscription/device-auth path.
 - `CODEX_AUTH_MODE=api_key` plus `OPENAI_API_KEY` is the intended API-key path.
 
 Available make targets:

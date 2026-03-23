@@ -64,7 +64,7 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
 
     let workflow_path = resolve_workflow_path(options.workflow.as_ref());
     let mut checks = Vec::new();
-    let mode = options.mode.unwrap_or_else(|| infer_mode());
+    let mode = options.mode.unwrap_or_else(infer_mode);
 
     checks.push(check_command("gh"));
     checks.push(match mode {

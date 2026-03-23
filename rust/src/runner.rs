@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::warn;
 
 use crate::agent::AgentEvent;
 use crate::github::{GitHubTracker, OpenPullRequest, PullRequestChecksSummary, Tracker};
@@ -197,7 +198,18 @@ pub async fn run_issue(
     }
     .await;
 
-    workspace::run_after_run_hook(&snapshot.settings, &workspace.path, &issue).await;
+    if let Err(error) =
+        workspace::run_after_run_hook(&snapshot.settings, &workspace.path, &issue).await
+    {
+        warn!(
+            issue_identifier = %issue.identifier,
+            error = ?error,
+            "after_run hook failed"
+        );
+        if result.is_ok() {
+            return Err(error);
+        }
+    }
     result
 }
 
@@ -369,6 +381,55 @@ fn merge_runtime_status_section(existing_body: &str, runtime_section: &str) -> S
     }
 }
 
+async fn render_workpad_bootstrap(workspace: &std::path::Path, issue: &Issue) -> Result<String> {
+    let hostname = runtime_hostname().await?;
+    let sha = current_head_short_sha(workspace)
+        .await?
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(
+        render_workpad_bootstrap_sync(workspace, issue, &sha).replacen(
+            "unknown-host",
+            &hostname,
+            1,
+        ),
+    )
+}
+
+fn render_workpad_bootstrap_sync(workspace: &std::path::Path, issue: &Issue, sha: &str) -> String {
+    let issue_url = issue.url.clone().unwrap_or_default();
+
+    format!(
+        "{AGENT_WORKPAD_HEADER}\n\n```text\nunknown-host:{}@{sha}\n```\n\n### Plan\n\n- [ ] 1\\. Reconcile tracker and repository state\n- [ ] 2\\. Implement the requested issue scope\n- [ ] 3\\. Run required validation\n- [ ] 4\\. Open or update the pull request and link it to the issue\n\n### Acceptance Criteria\n\n- [ ] The requested issue scope is implemented for {}.\n- [ ] Required validation from the issue is complete.\n- [ ] A pull request is opened and linked before review handoff.\n- [ ] GitHub Actions and required PR checks are green before review handoff.\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- {AGENT_BOOTSTRAP_NOTE}\n- Issue: {}\n",
+        workspace.display(),
+        issue.identifier,
+        issue_url
+    )
+}
+
+async fn runtime_hostname() -> Result<String> {
+    if let Ok(value) = std::env::var("HOSTNAME") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    let output = Command::new("hostname")
+        .output()
+        .await
+        .context("failed to read hostname")?;
+    if !output.status.success() {
+        return Ok("unknown-host".to_string());
+    }
+
+    let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if hostname.is_empty() {
+        Ok("unknown-host".to_string())
+    } else {
+        Ok(hostname)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -419,22 +480,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_checked_workpad_counts_as_progress() {
-        let issue = issue_with_workpad(Some(
-            "## Codex Workpad\n\n### Plan\n\n- [x] 1. Done\n\n### Notes\n\n- Updated by Codex.\n",
-        ));
-        assert!(workpad_has_progress(&issue));
-    }
-
-    #[test]
-    fn legacy_bootstrap_workpad_does_not_count_as_progress() {
-        let issue = issue_with_workpad(Some(
-            "## Codex Workpad\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- Bootstrap created by Symphony runtime before the first Codex turn.\n",
-        ));
-        assert!(!workpad_has_progress(&issue));
-    }
-
-    #[test]
     fn merge_runtime_status_appends_without_rewriting_plan() {
         let original = "## Agent Workpad\n\n### Plan\n\n- [x] 1. Real plan item\n\n### Validation\n\n- [ ] `cargo test`\n";
         let merged = merge_runtime_status_section(
@@ -482,54 +527,5 @@ mod tests {
         assert!(!section.contains("[x]"));
         assert!(!section.contains("[ ]"));
         assert!(section.contains("PR checks: pending"));
-    }
-}
-
-async fn render_workpad_bootstrap(workspace: &std::path::Path, issue: &Issue) -> Result<String> {
-    let hostname = runtime_hostname().await?;
-    let sha = current_head_short_sha(workspace)
-        .await?
-        .unwrap_or_else(|| "unknown".to_string());
-    Ok(
-        render_workpad_bootstrap_sync(workspace, issue, &sha).replacen(
-            "unknown-host",
-            &hostname,
-            1,
-        ),
-    )
-}
-
-fn render_workpad_bootstrap_sync(workspace: &std::path::Path, issue: &Issue, sha: &str) -> String {
-    let issue_url = issue.url.clone().unwrap_or_default();
-
-    format!(
-        "{AGENT_WORKPAD_HEADER}\n\n```text\nunknown-host:{}@{sha}\n```\n\n### Plan\n\n- [ ] 1\\. Reconcile tracker and repository state\n- [ ] 2\\. Implement the requested issue scope\n- [ ] 3\\. Run required validation\n- [ ] 4\\. Open or update the pull request and link it to the issue\n\n### Acceptance Criteria\n\n- [ ] The requested issue scope is implemented for {}.\n- [ ] Required validation from the issue is complete.\n- [ ] A pull request is opened and linked before review handoff.\n- [ ] GitHub Actions and required PR checks are green before review handoff.\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- {AGENT_BOOTSTRAP_NOTE}\n- Issue: {}\n",
-        workspace.display(),
-        issue.identifier,
-        issue_url
-    )
-}
-
-async fn runtime_hostname() -> Result<String> {
-    if let Ok(value) = std::env::var("HOSTNAME") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-
-    let output = Command::new("hostname")
-        .output()
-        .await
-        .context("failed to read hostname")?;
-    if !output.status.success() {
-        return Ok("unknown-host".to_string());
-    }
-
-    let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if hostname.is_empty() {
-        Ok("unknown-host".to_string())
-    } else {
-        Ok(hostname)
     }
 }

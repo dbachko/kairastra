@@ -101,17 +101,12 @@ impl ProviderId {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GitHubMode {
+    #[default]
     ProjectsV2,
     IssuesOnly,
-}
-
-impl Default for GitHubMode {
-    fn default() -> Self {
-        Self::ProjectsV2
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -208,7 +203,7 @@ pub(crate) enum BoolOrString {
 
 impl Settings {
     pub fn from_workflow(workflow: &WorkflowDefinition) -> Result<Self> {
-        reject_legacy_codex_block(&workflow.config)?;
+        reject_removed_codex_block(&workflow.config)?;
 
         let raw = serde_yaml::from_value::<RawSettings>(workflow.config.clone())
             .map_err(|error| anyhow!("invalid_workflow_config: {error}"))?;
@@ -426,7 +421,7 @@ pub fn normalize_issue_state(state: &str) -> String {
     state.trim().to_lowercase()
 }
 
-fn reject_legacy_codex_block(config: &serde_yaml::Value) -> Result<()> {
+fn reject_removed_codex_block(config: &serde_yaml::Value) -> Result<()> {
     if config.get("codex").is_some() {
         return Err(anyhow!(
             "invalid_workflow_config: top-level `codex` is no longer supported; use agent.provider plus providers.codex"
@@ -480,10 +475,10 @@ pub(crate) fn expand_path(raw: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn resolve_u32(value: Option<IntOrString>, field_name: &str) -> Result<Option<u32>> {
-    Ok(resolve_optional_u64(value, field_name)?
-        .map(|value| u32::try_from(value))
+    resolve_optional_u64(value, field_name)?
+        .map(u32::try_from)
         .transpose()
-        .map_err(|_| anyhow!("invalid_workflow_config: {field_name} is out of range"))?)
+        .map_err(|_| anyhow!("invalid_workflow_config: {field_name} is out of range"))
 }
 
 pub(crate) fn resolve_usize(
@@ -603,7 +598,7 @@ providers:
     }
 
     #[test]
-    fn rejects_legacy_codex_block() {
+    fn rejects_removed_codex_block() {
         env::set_var("GITHUB_TOKEN", "token-123");
         let definition = WorkflowDefinition {
             config: serde_yaml::from_str(

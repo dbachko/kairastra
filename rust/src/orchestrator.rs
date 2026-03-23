@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
@@ -59,6 +59,7 @@ impl Orchestrator {
 
     pub async fn run_once(&self) -> Result<()> {
         let snapshot = self.workflow_store.current()?;
+        let (worker_tx, mut worker_rx) = unbounded_channel::<WorkerMessage>();
         let mut state = RuntimeState {
             running: HashMap::new(),
             claimed: HashSet::new(),
@@ -72,16 +73,24 @@ impl Orchestrator {
             }
             return Err(error);
         }
-        if let Err(error) = self
-            .poll_tick(&snapshot, &mut state, &unbounded_channel().0)
-            .await
-        {
+        if let Err(error) = self.poll_tick(&snapshot, &mut state, &worker_tx).await {
             if is_rate_limited_error(&error) {
                 warn!(error = ?error, "tracker rate limited during run_once poll");
                 return Ok(());
             }
             return Err(error);
         }
+
+        self.drain_workers_until_idle(&snapshot, &mut state, &mut worker_rx)
+            .await?;
+
+        if !state.retry_attempts.is_empty() {
+            info!(
+                deferred_retry_count = state.retry_attempts.len(),
+                "run_once finished; deferred retries will run on the next invocation"
+            );
+        }
+
         Ok(())
     }
 
@@ -148,6 +157,22 @@ impl Orchestrator {
         for issue in issues {
             self.cleanup_terminal_issue(snapshot, issue, "startup")
                 .await;
+        }
+
+        Ok(())
+    }
+
+    async fn drain_workers_until_idle(
+        &self,
+        snapshot: &WorkflowSnapshot,
+        state: &mut RuntimeState,
+        worker_rx: &mut UnboundedReceiver<WorkerMessage>,
+    ) -> Result<()> {
+        while !state.running.is_empty() {
+            let Some(message) = worker_rx.recv().await else {
+                break;
+            };
+            self.handle_worker_message(snapshot, state, message).await?;
         }
 
         Ok(())
@@ -224,7 +249,7 @@ impl Orchestrator {
 
             let refreshed = self
                 .tracker
-                .fetch_issue_states_by_ids(&[issue_id.clone()])
+                .fetch_issue_states_by_ids(std::slice::from_ref(&issue_id))
                 .await?;
             match refreshed.into_iter().next() {
                 Some(issue) if snapshot.settings.active_state(&issue.state) => {
@@ -435,7 +460,7 @@ impl Orchestrator {
     ) -> Result<Option<Issue>> {
         let refreshed = self
             .tracker
-            .fetch_issue_states_by_ids(&[issue.id.clone()])
+            .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
             .await?;
         let Some(mut issue) = refreshed.into_iter().next() else {
             return Ok(None);
@@ -523,7 +548,7 @@ impl Orchestrator {
                     Ok(WorkerOutcome::Completed) => {
                         match self
                             .tracker
-                            .fetch_issue_states_by_ids(&[issue_id.clone()])
+                            .fetch_issue_states_by_ids(std::slice::from_ref(&issue_id))
                             .await
                         {
                             Ok(refreshed) => {
@@ -911,7 +936,7 @@ providers:
 
     #[test]
     fn sorts_by_priority_then_identifier() {
-        let mut issues = vec![
+        let mut issues = [
             issue("2", "Todo", Some(2)),
             issue("1", "Todo", Some(1)),
             issue("3", "Todo", None),

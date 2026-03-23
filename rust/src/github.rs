@@ -455,7 +455,9 @@ mutation SymphonyUpdateProjectItemStatus(
         )
         .await?;
 
-        let refreshed = self.fetch_issue_states_by_ids(&[issue.id.clone()]).await?;
+        let refreshed = self
+            .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
+            .await?;
         Ok(refreshed.into_iter().next().unwrap_or_else(|| {
             let mut updated = issue.clone();
             updated.state = target_status.to_string();
@@ -2328,76 +2330,6 @@ mod tests {
         assert_eq!(
             updated.workpad_comment_url.as_deref(),
             Some("https://github.com/openai/symphony/issues/42#issuecomment-9")
-        );
-    }
-
-    #[tokio::test]
-    async fn ensure_workpad_comment_reuses_legacy_codex_comment() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/repos/openai/symphony/issues/42/comments"))
-            .and(query_param("per_page", "100"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {
-                    "id": 9,
-                    "body": "## Codex Workpad\n\nexisting",
-                    "html_url": "https://github.com/openai/symphony/issues/42#issuecomment-9"
-                }
-            ])))
-            .mount(&server)
-            .await;
-
-        let tracker = GitHubTracker::new(
-            settings(&format!(
-                r#"tracker:
-  kind: github
-  owner: openai
-  api_key: fake
-  endpoint: {0}/graphql
-  rest_endpoint: {0}
-  repo: symphony
-  mode: issues_only
-"#,
-                server.uri()
-            ))
-            .tracker,
-        )
-        .unwrap();
-
-        let issue = Issue {
-            id: "issue-node-42".to_string(),
-            project_item_id: None,
-            identifier: "openai/symphony#42".to_string(),
-            title: "Issue".to_string(),
-            description: None,
-            priority: None,
-            state: "Todo".to_string(),
-            branch_name: None,
-            url: Some("https://github.com/openai/symphony/issues/42".to_string()),
-            assignees: Vec::new(),
-            labels: Vec::new(),
-            blocked_by: Vec::new(),
-            created_at: None,
-            updated_at: None,
-            workpad_comment_id: None,
-            workpad_comment_url: None,
-            workpad_comment_body: None,
-        };
-
-        let updated = tracker
-            .ensure_workpad_comment(&issue, "## Agent Workpad\n\nnew")
-            .await
-            .unwrap();
-
-        assert_eq!(updated.workpad_comment_id, Some(9));
-        assert_eq!(
-            updated.workpad_comment_url.as_deref(),
-            Some("https://github.com/openai/symphony/issues/42#issuecomment-9")
-        );
-        assert_eq!(
-            updated.workpad_comment_body.as_deref(),
-            Some("## Codex Workpad\n\nexisting")
         );
     }
 

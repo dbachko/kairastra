@@ -79,10 +79,15 @@ pub fn find_command(name: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::{inspect_status, AuthMode};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn auto_mode_prefers_api_key_when_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("CODEX_AUTH_MODE", "auto");
         std::env::set_var("OPENAI_API_KEY", "test-key");
         let status = inspect_status("codex").unwrap();

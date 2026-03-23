@@ -38,14 +38,13 @@ pub fn collect(non_interactive: bool) -> Result<ClaudeSetupConfig> {
 
 pub fn render_workflow_section(config: &ClaudeSetupConfig) -> String {
     let _ = config;
-    format!(
-        r#"providers:
+    r#"providers:
   claude:
     command: claude
     model: $SYMPHONY_CLAUDE_MODEL
     reasoning_effort: $SYMPHONY_CLAUDE_REASONING_EFFORT
     approval_policy: never"#
-    )
+        .to_string()
 }
 
 pub fn render_env_section(_mode: DeployMode, config: &ClaudeSetupConfig) -> String {
