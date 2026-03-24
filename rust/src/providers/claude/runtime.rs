@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{ChildStderr, ChildStdout, Command};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{timeout, Duration};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::agent::{AgentBackend, AgentEvent, AgentEventKind, AgentSession, TurnResult};
 use crate::config::Settings;
@@ -105,10 +105,12 @@ impl ClaudeSession {
             command.env(super::auth::OAUTH_TOKEN_ENV, token);
         }
 
+        debug!(issue_identifier = %issue.identifier, command = %self.cli_command(), "launching Claude");
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to launch Claude Code for {}", issue.identifier))?;
         self.last_process_id = child.id();
+        debug!(issue_identifier = %issue.identifier, pid = ?child.id(), "Claude process spawned");
 
         let mut stdin = child
             .stdin
@@ -239,6 +241,7 @@ impl ClaudeSession {
                 continue;
             }
 
+            debug!(stdout_line = %line, "Claude stdout");
             let message = match serde_json::from_str::<JsonValue>(&line) {
                 Ok(message) => message,
                 Err(error) => {
@@ -373,6 +376,7 @@ impl ClaudeSession {
             }
         }
 
+        warn!("Claude stdout closed without a result message");
         Err(anyhow!("claude_stream_ended_without_result"))
     }
 }
