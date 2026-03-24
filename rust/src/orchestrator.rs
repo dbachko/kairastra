@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde_json::Value as JsonValue;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
@@ -34,10 +35,28 @@ pub struct Orchestrator {
     tracker: Arc<GitHubTracker>,
 }
 
+#[derive(Default)]
 struct RuntimeState {
     running: HashMap<String, RunningEntry>,
     claimed: HashSet<String>,
     retry_attempts: HashMap<String, RetryEntry>,
+    agent_totals: AgentTotals,
+    agent_rate_limits: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentTotals {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    seconds_running: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TokenUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
 }
 
 struct RunningEntry {
@@ -45,8 +64,19 @@ struct RunningEntry {
     issue: Issue,
     provider: String,
     workspace_path: Option<PathBuf>,
+    started_at: Instant,
     last_agent_timestamp: Instant,
     session_id: Option<String>,
+    agent_process_pid: Option<String>,
+    last_agent_event: Option<String>,
+    last_agent_message: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    last_reported_input_tokens: u64,
+    last_reported_output_tokens: u64,
+    last_reported_total_tokens: u64,
+    turn_count: usize,
     attempt: Option<u32>,
     handle: JoinHandle<()>,
 }
@@ -67,11 +97,7 @@ impl Orchestrator {
     pub async fn run_once(&self) -> Result<()> {
         let snapshot = self.workflow_store.current()?;
         let (worker_tx, mut worker_rx) = unbounded_channel::<WorkerMessage>();
-        let mut state = RuntimeState {
-            running: HashMap::new(),
-            claimed: HashSet::new(),
-            retry_attempts: HashMap::new(),
-        };
+        let mut state = RuntimeState::default();
 
         if let Err(error) = self.startup_cleanup(&snapshot).await {
             if is_rate_limited_error(&error) {
@@ -103,11 +129,7 @@ impl Orchestrator {
 
     pub async fn run(&self) -> Result<()> {
         let (worker_tx, mut worker_rx) = unbounded_channel::<WorkerMessage>();
-        let mut state = RuntimeState {
-            running: HashMap::new(),
-            claimed: HashSet::new(),
-            retry_attempts: HashMap::new(),
-        };
+        let mut state = RuntimeState::default();
 
         let initial_snapshot = self.workflow_store.current()?;
         if let Err(error) = self.startup_cleanup(&initial_snapshot).await {
@@ -362,7 +384,9 @@ impl Orchestrator {
         }
 
         for issue_id in remove_ids {
-            state.running.remove(&issue_id);
+            if let Some(running) = state.running.remove(&issue_id) {
+                state.agent_totals.seconds_running += running.started_at.elapsed().as_secs_f64();
+            }
         }
         for (issue_id, identifier, attempt) in retries {
             schedule_retry(
@@ -474,7 +498,8 @@ impl Orchestrator {
             });
         });
 
-        info!(issue_identifier = %issue_id, provider = %provider_name, "worker started");
+        let started_at = Instant::now();
+        info!(issue_identifier = %identifier, provider = %provider_name, "worker started");
         state.running.insert(
             issue_id.clone(),
             RunningEntry {
@@ -482,8 +507,19 @@ impl Orchestrator {
                 issue,
                 provider: provider_name,
                 workspace_path: workspace_hint,
-                last_agent_timestamp: Instant::now(),
+                started_at,
+                last_agent_timestamp: started_at,
                 session_id: None,
+                agent_process_pid: None,
+                last_agent_event: None,
+                last_agent_message: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                last_reported_input_tokens: 0,
+                last_reported_output_tokens: 0,
+                last_reported_total_tokens: 0,
+                turn_count: 0,
                 attempt,
                 handle,
             },
@@ -568,20 +604,47 @@ impl Orchestrator {
                     running.workspace_path = Some(workspace_path);
                 }
             }
-            WorkerMessage::AppEvent { issue_id, event } => {
+            WorkerMessage::TurnStarted {
+                issue_id,
+                turn_number,
+            } => {
                 if let Some(running) = state.running.get_mut(&issue_id) {
                     running.last_agent_timestamp = Instant::now();
+                    running.turn_count = running.turn_count.max(turn_number);
+                    running.last_agent_event = Some("turn_started".to_string());
+                    running.last_agent_message = Some(format!("turn {turn_number} started"));
+                }
+            }
+            WorkerMessage::AppEvent { issue_id, event } => {
+                let mut usage_delta = None;
+                let mut rate_limits = None;
+                if let Some(running) = state.running.get_mut(&issue_id) {
+                    running.last_agent_timestamp = Instant::now();
+                    if let Some(session_id) = event.session_id.clone().or_else(|| {
+                        event
+                            .payload
+                            .get("session_id")
+                            .and_then(JsonValue::as_str)
+                            .map(ToString::to_string)
+                    }) {
+                        running.session_id = Some(session_id);
+                    }
+                    if let Some(process_id) = event.agent_process_pid.clone() {
+                        running.agent_process_pid = Some(process_id);
+                    }
+                    running.last_agent_event = Some(agent_event_name(&event.event).to_string());
+                    running.last_agent_message = Some(summarize_agent_event(&event));
+                    if let Some(usage) = extract_token_usage(&event.payload) {
+                        usage_delta = Some(apply_token_usage(running, usage));
+                    }
+                    rate_limits = extract_rate_limits(&event.payload);
                     let is_codex = running.provider.eq_ignore_ascii_case("codex");
                     if is_codex {
                         log_codex_event(&running.identifier, &event);
                     }
                     match event.event {
                         AgentEventKind::SessionStarted => {
-                            running.session_id = event
-                                .payload
-                                .get("session_id")
-                                .and_then(serde_json::Value::as_str)
-                                .map(ToString::to_string);
+                            running.turn_count = running.turn_count.max(1);
                         }
                         AgentEventKind::TurnFailed
                         | AgentEventKind::TurnCancelled
@@ -599,6 +662,23 @@ impl Orchestrator {
                         _ => {}
                     }
                 }
+                if let Some(delta) = usage_delta {
+                    state.agent_totals.input_tokens = state
+                        .agent_totals
+                        .input_tokens
+                        .saturating_add(delta.input_tokens);
+                    state.agent_totals.output_tokens = state
+                        .agent_totals
+                        .output_tokens
+                        .saturating_add(delta.output_tokens);
+                    state.agent_totals.total_tokens = state
+                        .agent_totals
+                        .total_tokens
+                        .saturating_add(delta.total_tokens);
+                }
+                if let Some(latest_rate_limits) = rate_limits {
+                    state.agent_rate_limits = Some(latest_rate_limits);
+                }
             }
             WorkerMessage::Finished {
                 issue_id,
@@ -609,6 +689,9 @@ impl Orchestrator {
                 ..
             } => {
                 let running = state.running.remove(&issue_id);
+                if let Some(entry) = running.as_ref() {
+                    state.agent_totals.seconds_running += entry.started_at.elapsed().as_secs_f64();
+                }
                 let provider = running
                     .as_ref()
                     .map(|entry| entry.provider.as_str())
@@ -1018,6 +1101,155 @@ fn log_codex_notification(issue_identifier: &str, payload: &serde_json::Value) {
     }
 }
 
+fn agent_event_name(event: &AgentEventKind) -> &'static str {
+    match event {
+        AgentEventKind::SessionStarted => "session_started",
+        AgentEventKind::Notification => "notification",
+        AgentEventKind::TurnCompleted => "turn_completed",
+        AgentEventKind::TurnFailed => "turn_failed",
+        AgentEventKind::TurnCancelled => "turn_cancelled",
+        AgentEventKind::TurnInputRequired => "turn_input_required",
+        AgentEventKind::ApprovalAutoApproved => "approval_auto_approved",
+        AgentEventKind::ApprovalRequired => "approval_required",
+        AgentEventKind::ToolCallCompleted => "tool_call_completed",
+        AgentEventKind::ToolCallFailed => "tool_call_failed",
+        AgentEventKind::UnsupportedToolCall => "unsupported_tool_call",
+        AgentEventKind::ToolInputAutoAnswered => "tool_input_auto_answered",
+        AgentEventKind::Malformed => "malformed",
+        AgentEventKind::OtherMessage => "other_message",
+        AgentEventKind::TurnEndedWithError => "turn_ended_with_error",
+    }
+}
+
+fn summarize_agent_event(event: &AgentEvent) -> String {
+    let detail = event
+        .payload
+        .get("method")
+        .and_then(JsonValue::as_str)
+        .or_else(|| event.payload.get("type").and_then(JsonValue::as_str))
+        .or_else(|| event.payload.get("subtype").and_then(JsonValue::as_str))
+        .or_else(|| event.payload.get("tool_name").and_then(JsonValue::as_str));
+
+    let base = match detail {
+        Some(detail) => format!("{} ({detail})", agent_event_name(&event.event)),
+        None => agent_event_name(&event.event).to_string(),
+    };
+
+    if base.len() >= 160 {
+        return truncate_summary(&base, 160);
+    }
+
+    if event.payload.is_null() {
+        return base;
+    }
+
+    truncate_summary(&format!("{base}: {}", event.payload), 240)
+}
+
+fn truncate_summary(value: &str, limit: usize) -> String {
+    let mut truncated = value.trim().to_string();
+    if truncated.len() > limit {
+        truncated.truncate(limit.saturating_sub(3));
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+fn apply_token_usage(running: &mut RunningEntry, current: TokenUsage) -> TokenUsage {
+    let delta = TokenUsage {
+        input_tokens: usage_delta(running.last_reported_input_tokens, current.input_tokens),
+        output_tokens: usage_delta(running.last_reported_output_tokens, current.output_tokens),
+        total_tokens: usage_delta(running.last_reported_total_tokens, current.total_tokens),
+    };
+
+    running.input_tokens = current.input_tokens;
+    running.output_tokens = current.output_tokens;
+    running.total_tokens = current.total_tokens;
+    running.last_reported_input_tokens = current.input_tokens;
+    running.last_reported_output_tokens = current.output_tokens;
+    running.last_reported_total_tokens = current.total_tokens;
+
+    delta
+}
+
+fn usage_delta(previous: u64, current: u64) -> u64 {
+    if current >= previous {
+        current - previous
+    } else {
+        current
+    }
+}
+
+fn extract_token_usage(payload: &JsonValue) -> Option<TokenUsage> {
+    match payload {
+        JsonValue::Object(object) => {
+            if let Some(usage) = object.get("usage").and_then(extract_token_usage) {
+                return Some(usage);
+            }
+            if let Some(usage) = token_usage_from_object(object) {
+                return Some(usage);
+            }
+            object.values().find_map(extract_token_usage)
+        }
+        JsonValue::Array(values) => values.iter().find_map(extract_token_usage),
+        _ => None,
+    }
+}
+
+fn token_usage_from_object(object: &serde_json::Map<String, JsonValue>) -> Option<TokenUsage> {
+    let input_tokens = object
+        .get("input_tokens")
+        .or_else(|| object.get("inputTokens"))
+        .and_then(json_u64);
+    let output_tokens = object
+        .get("output_tokens")
+        .or_else(|| object.get("outputTokens"))
+        .and_then(json_u64);
+    let total_tokens = object
+        .get("total_tokens")
+        .or_else(|| object.get("totalTokens"))
+        .and_then(json_u64);
+
+    if input_tokens.is_none() && output_tokens.is_none() && total_tokens.is_none() {
+        return None;
+    }
+
+    let input_tokens = input_tokens.unwrap_or(0);
+    let output_tokens = output_tokens.unwrap_or(0);
+    let total_tokens = total_tokens.unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+
+    Some(TokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    })
+}
+
+fn extract_rate_limits(payload: &JsonValue) -> Option<JsonValue> {
+    match payload {
+        JsonValue::Object(object) => {
+            if let Some(rate_limits) = object
+                .get("rate_limits")
+                .or_else(|| object.get("rateLimits"))
+                .cloned()
+            {
+                return Some(rate_limits);
+            }
+            object.values().find_map(extract_rate_limits)
+        }
+        JsonValue::Array(values) => values.iter().find_map(extract_rate_limits),
+        _ => None,
+    }
+}
+
+fn json_u64(value: &JsonValue) -> Option<u64> {
+    match value {
+        JsonValue::Number(number) => number.as_u64(),
+        JsonValue::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
 fn log_runtime_error(phase: &str, error: &anyhow::Error) {
     if is_rate_limited_error(error) {
         warn!(phase, error = ?error, "tracker rate limited; continuing");
@@ -1423,14 +1655,16 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
+    use serde_json::json;
+
     use crate::config::Settings;
     use crate::model::{BlockerRef, Issue, WorkflowDefinition};
 
     use super::{
-        classify_blocked_worker_failure, classify_provider_selection_block, issue_eligible,
-        issue_provider, issue_sort_key, merge_blocker_section, render_blocked_failure_workpad,
-        select_dispatchable, IssueProviderSelection, RuntimeState, BLOCKER_SECTION_END,
-        BLOCKER_SECTION_START,
+        classify_blocked_worker_failure, classify_provider_selection_block, extract_rate_limits,
+        extract_token_usage, issue_eligible, issue_provider, issue_sort_key, merge_blocker_section,
+        render_blocked_failure_workpad, select_dispatchable, usage_delta, IssueProviderSelection,
+        RuntimeState, TokenUsage, BLOCKER_SECTION_END, BLOCKER_SECTION_START,
     };
     use crate::workflow::WorkflowSnapshot;
 
@@ -1555,11 +1789,7 @@ providers:
             state: Some("In Progress".to_string()),
         });
 
-        let state = RuntimeState {
-            running: Default::default(),
-            claimed: Default::default(),
-            retry_attempts: Default::default(),
-        };
+        let state = RuntimeState::default();
 
         assert!(!issue_eligible(&snapshot, &issue, &state, &HashMap::new()));
     }
@@ -1580,11 +1810,7 @@ providers:
     #[test]
     fn enforces_per_state_capacity() {
         let snapshot = snapshot();
-        let state = RuntimeState {
-            running: Default::default(),
-            claimed: Default::default(),
-            retry_attempts: Default::default(),
-        };
+        let state = RuntimeState::default();
 
         let issues = vec![issue("1", "Todo", Some(1)), issue("2", "Todo", Some(2))];
         let selected = select_dispatchable(&snapshot, &issues, &state);
@@ -1595,11 +1821,7 @@ providers:
     #[test]
     fn human_review_is_not_dispatchable_when_not_active() {
         let snapshot = snapshot();
-        let state = RuntimeState {
-            running: Default::default(),
-            claimed: Default::default(),
-            retry_attempts: Default::default(),
-        };
+        let state = RuntimeState::default();
 
         let issue = issue("1", "Human Review", Some(1));
         assert!(!issue_eligible(&snapshot, &issue, &state, &HashMap::new()));
@@ -1608,11 +1830,7 @@ providers:
     #[test]
     fn merging_and_rework_are_dispatchable_when_active() {
         let snapshot = snapshot();
-        let state = RuntimeState {
-            running: Default::default(),
-            claimed: Default::default(),
-            retry_attempts: Default::default(),
-        };
+        let state = RuntimeState::default();
 
         let merging = issue("1", "Merging", Some(1));
         let rework = issue("2", "Rework", Some(1));
@@ -1624,11 +1842,7 @@ providers:
     #[test]
     fn configured_assignee_filter_requires_matching_login() {
         let snapshot = snapshot_with_assignee("codex-bot");
-        let state = RuntimeState {
-            running: Default::default(),
-            claimed: Default::default(),
-            retry_attempts: Default::default(),
-        };
+        let state = RuntimeState::default();
 
         let mut assigned = issue("1", "Todo", Some(1));
         assigned.assignees = vec!["codex-bot".to_string()];
@@ -1777,6 +1991,42 @@ providers:
 
         assert!(second.contains("second"));
         assert!(!second.contains("first"));
+    }
+
+    #[test]
+    fn extracts_nested_token_usage_and_rate_limits() {
+        let payload = json!({
+            "params": {
+                "usage": {
+                    "inputTokens": 12,
+                    "outputTokens": "8"
+                },
+                "rateLimits": {
+                    "primaryRemaining": 99
+                }
+            }
+        });
+
+        assert_eq!(
+            extract_token_usage(&payload),
+            Some(TokenUsage {
+                input_tokens: 12,
+                output_tokens: 8,
+                total_tokens: 20,
+            })
+        );
+        assert_eq!(
+            extract_rate_limits(&payload),
+            Some(json!({
+                "primaryRemaining": 99
+            }))
+        );
+    }
+
+    #[test]
+    fn usage_delta_treats_counter_reset_as_new_usage() {
+        assert_eq!(usage_delta(10, 15), 5);
+        assert_eq!(usage_delta(10, 4), 4);
     }
 
     #[test]

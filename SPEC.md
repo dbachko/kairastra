@@ -4,6 +4,10 @@ Status: Draft v1 (language-agnostic)
 
 Purpose: Define a service that orchestrates coding agents to get project work done.
 
+Upstream baseline: Reconciled against `openai/symphony` `SPEC.md` on March 24, 2026 at commit
+`a164593aacb3db4d6808adc5a87173d906726406`, with GitHub tracker and multi-provider adaptations for
+this repository.
+
 ## 1. Problem Statement
 
 Symphony is a long-running automation service that continuously reads work from an issue tracker
@@ -91,7 +95,7 @@ Important boundary:
 6. `Agent Runner`
    - Creates workspace.
    - Builds prompt from issue + workflow template.
-   - Launches the coding agent app-server client.
+   - Launches the selected coding-agent provider runtime.
    - Streams agent updates back to the orchestrator.
 
 7. `Status Surface` (optional)
@@ -130,7 +134,8 @@ Symphony is easiest to port when kept in these layers:
 - Issue tracker API (GitHub for `tracker.kind: github` in this specification version).
 - Local filesystem for workspaces and logs.
 - Optional workspace population tooling (for example Git CLI, if used).
-- Coding-agent executable that supports JSON-RPC-like app-server mode over stdio.
+- Coding-agent provider executable(s) selected by `agent.provider` (for example Codex app-server
+  or Claude Code).
 - Host environment authentication for the issue tracker and coding agent.
 
 ## 4. Core Domain Model
@@ -226,13 +231,13 @@ Fields:
 - `session_id` (string, `<thread_id>-<turn_id>`)
 - `thread_id` (string)
 - `turn_id` (string)
-- `codex_app_server_pid` (string or null)
-- `last_codex_event` (string/enum or null)
-- `last_codex_timestamp` (timestamp or null)
-- `last_codex_message` (summarized payload)
-- `codex_input_tokens` (integer)
-- `codex_output_tokens` (integer)
-- `codex_total_tokens` (integer)
+- `agent_process_pid` (string or null)
+- `last_agent_event` (string/enum or null)
+- `last_agent_timestamp` (timestamp or null)
+- `last_agent_message` (summarized payload)
+- `input_tokens` (integer)
+- `output_tokens` (integer)
+- `total_tokens` (integer)
 - `last_reported_input_tokens` (integer)
 - `last_reported_output_tokens` (integer)
 - `last_reported_total_tokens` (integer)
@@ -264,8 +269,8 @@ Fields:
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
-- `codex_totals` (aggregate tokens + runtime seconds)
-- `codex_rate_limits` (latest rate-limit snapshot from agent events)
+- `agent_totals` (aggregate tokens + runtime seconds)
+- `agent_rate_limits` (latest rate-limit snapshot from agent events)
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
@@ -327,7 +332,7 @@ Top-level keys:
 - `workspace`
 - `hooks`
 - `agent`
-- `codex`
+- `providers`
 
 Unknown keys should be ignored for forward compatibility.
 
@@ -412,7 +417,8 @@ Fields:
 - `after_run` (multiline shell script string, optional)
   - Runs after each agent attempt (success, failure, timeout, or cancellation) once the workspace
     exists.
-  - Failure is logged but ignored.
+  - Failure is always logged.
+  - If the main run attempt otherwise succeeded, `after_run` failure should fail the overall run.
 - `before_remove` (multiline shell script string, optional)
   - Runs before workspace deletion if the directory exists.
   - Failure is logged but ignored; cleanup still proceeds.
@@ -426,6 +432,10 @@ Fields:
 
 Fields:
 
+- `provider` (string)
+  - Required.
+  - Selects the provider block under `providers`.
+  - Current built-in provider IDs in the Rust runtime: `codex`, `claude`
 - `max_concurrent_agents` (integer or string integer)
   - Default: `10`
   - Changes should be re-applied at runtime and affect subsequent dispatch decisions.
@@ -442,7 +452,16 @@ Fields:
   - State keys are normalized (`lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
 
-#### 5.3.6 `codex` (object)
+#### 5.3.6 `providers` (object)
+
+Provider selection and validation:
+
+- `agent.provider` must point at a mapping under `providers`.
+- Unknown provider mappings should be ignored for forward compatibility unless selected by
+  `agent.provider`.
+- The current Rust runtime ships built-in `codex` and `claude` provider adapters.
+
+#### 5.3.6.1 `providers.codex` (object)
 
 Fields:
 
@@ -458,6 +477,11 @@ fields locally if they want stricter startup checks.
   - Default: `codex app-server`
   - The runtime launches this command via `bash -lc` in the workspace directory.
   - The launched process must speak a compatible app-server protocol over stdio.
+- `model` (string, optional)
+- `reasoning_effort` (string, optional)
+  - Current accepted values in the Rust runtime: `none`, `minimal`, `low`, `medium`, `high`,
+    `xhigh`
+- `fast` (boolean or string boolean, optional)
 - `approval_policy` (Codex `AskForApproval` value)
   - Default: implementation-defined.
 - `thread_sandbox` (Codex `SandboxMode` value)
@@ -468,6 +492,29 @@ fields locally if they want stricter startup checks.
   - Default: `3600000` (1 hour)
 - `read_timeout_ms` (integer)
   - Default: `5000`
+- `stall_timeout_ms` (integer)
+  - Default: `300000` (5 minutes)
+  - If `<= 0`, stall detection is disabled.
+
+#### 5.3.6.2 `providers.claude` (object)
+
+Fields:
+
+- `command` (string shell command)
+  - Default: `claude`
+  - The current Rust runtime launches this command directly in the workspace directory without a
+    shell wrapper.
+- `model` (string, optional)
+- `reasoning_effort` (string, optional)
+  - Current accepted values in the Rust runtime: `low`, `medium`, `high`
+- `permission_mode` (string, optional)
+  - Current accepted values in the Rust runtime: `acceptEdits`, `bypassPermissions`, `default`,
+    `dontAsk`, `plan`
+- `approval_policy` (string, optional compatibility alias)
+  - The current Rust runtime accepts this legacy field and maps `never` to
+    `permission_mode: bypassPermissions`.
+- `turn_timeout_ms` (integer)
+  - Default: `3600000` (1 hour)
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
@@ -535,11 +582,11 @@ Value coercion semantics:
 
 Dynamic reload is required:
 
-- The software should watch `WORKFLOW.md` for changes.
-- On change, it should re-read and re-apply workflow config and prompt template without restart.
+- The software should detect `WORKFLOW.md` changes and re-read/re-apply workflow config and prompt
+  template without restart.
 - The software should attempt to adjust live behavior to the new config (for example polling
-  cadence, concurrency limits, active/terminal states, codex settings, workspace paths/hooks, and
-  prompt content for future runs).
+  cadence, concurrency limits, active/terminal states, selected provider settings,
+  workspace paths/hooks, and prompt content for future runs).
 - Reloaded config applies to future dispatch, retry scheduling, reconciliation decisions, hook
   execution, and agent launches.
 - Implementations are not required to restart in-flight agent sessions automatically when config
@@ -547,7 +594,7 @@ Dynamic reload is required:
 - Extensions that manage their own listeners/resources (for example an HTTP server port change) may
   require restart unless the implementation explicitly supports live rebind.
 - Implementations should also re-validate/reload defensively during runtime operations (for example
-  before dispatch) in case filesystem watch events are missed.
+  before dispatch) in case direct file-change detection is unavailable or delayed.
 - Invalid reloads should not crash the service; keep operating with the last known good effective
   configuration and emit an operator-visible error.
 
@@ -576,7 +623,8 @@ Validation checks:
 - `tracker.owner` is present when required by the selected tracker kind.
 - `tracker.repo` is present when required by the selected tracker mode.
 - `tracker.project_v2_number` is present when required by the selected tracker mode.
-- `codex.command` is present and non-empty.
+- `agent.provider` is present.
+- `providers.<agent.provider>` exists and is a mapping.
 
 ### 6.4 Config Fields Summary (Cheat Sheet)
 
@@ -606,18 +654,28 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
+- `agent.provider`: string, required; current built-ins are `codex` and `claude`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.assignee_login`: string, optional
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
-- `codex.command`: shell command string, default `codex app-server`
-- `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
-- `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
-- `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
-- `codex.turn_timeout_ms`: integer, default `3600000`
-- `codex.read_timeout_ms`: integer, default `5000`
-- `codex.stall_timeout_ms`: integer, default `300000`
+- `providers.codex.command`: shell command string, default `codex app-server`
+- `providers.codex.model`: string, optional
+- `providers.codex.reasoning_effort`: string, optional
+- `providers.codex.fast`: boolean, optional
+- `providers.codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
+- `providers.codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
+- `providers.codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
+- `providers.codex.turn_timeout_ms`: integer, default `3600000`
+- `providers.codex.read_timeout_ms`: integer, default `5000`
+- `providers.codex.stall_timeout_ms`: integer, default `300000`
+- `providers.claude.command`: shell command string, default `claude`
+- `providers.claude.model`: string, optional
+- `providers.claude.reasoning_effort`: string, optional
+- `providers.claude.permission_mode`: string, optional
+- `providers.claude.turn_timeout_ms`: integer, default `3600000`
+- `providers.claude.stall_timeout_ms`: integer, default `300000`
 - `server.port` (extension): integer, optional; enables the optional HTTP server, `0` may be used
   for ephemeral local bind, and CLI `--port` overrides it
 
@@ -815,9 +873,9 @@ Reconciliation runs every tick and has two parts.
 Part A: Stall detection
 
 - For each running issue, compute `elapsed_ms` since:
-  - `last_codex_timestamp` if any event has been seen, else
+  - `last_agent_timestamp` if any event has been seen, else
   - `started_at`
-- If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
+- If `elapsed_ms > selected_provider.stall_timeout_ms`, terminate the worker and queue a retry.
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
 
 Part B: Tracker state refresh
@@ -913,7 +971,10 @@ Failure semantics:
 
 - `after_create` failure or timeout is fatal to workspace creation.
 - `before_run` failure or timeout is fatal to the current run attempt.
-- `after_run` failure or timeout is logged and ignored.
+- `after_run` failure or timeout is always surfaced in logs.
+- If the main agent run succeeded, `after_run` failure should fail the overall run attempt.
+- If the main agent run already failed, `after_run` failure may be logged without replacing the
+  original error.
 - `before_remove` failure or timeout is logged and ignored.
 
 ### 9.5 Safety Invariants
@@ -938,7 +999,16 @@ Invariant 3: Workspace key is sanitized.
 
 ## 10. Agent Runner Protocol (Coding Agent Integration)
 
-This section defines the language-neutral contract for integrating a coding agent app-server.
+This section defines the language-neutral contract for integrating a coding-agent provider runtime.
+
+Provider selection:
+
+- `agent.provider` selects the provider mapping under `providers`.
+- The current Rust runtime ships built-in `codex` and `claude` adapters.
+- Sections 10.2 through 10.6 define the Codex app-server profile used when
+  `agent.provider == "codex"`.
+- Other providers may use different transports as long as they honor the worker/session contract in
+  Section 10.7 and emit equivalent logical events to the orchestrator.
 
 Compatibility profile:
 
@@ -954,11 +1024,23 @@ Compatibility profile:
 
 Subprocess launch parameters:
 
-- Command: `codex.command`
-- Invocation: `bash -lc <codex.command>`
+- Selected provider: `agent.provider`
+- Config source: `providers.<agent.provider>`
 - Working directory: workspace path
 - Stdout/stderr: separate streams
+
+Codex app-server launch profile:
+
+- Command: `providers.codex.command`
+- Invocation: `bash -lc <providers.codex.command>`
 - Framing: line-delimited protocol messages on stdout (JSON-RPC-like JSON per line)
+
+Other provider launch profiles:
+
+- Command/argv and transport are implementation-defined.
+- The provider should still execute inside the workspace directory, surface a process ID when
+  available, enforce configured timeouts, and emit structured session/turn events back to the
+  orchestrator.
 
 Notes:
 
@@ -1053,7 +1135,7 @@ include:
 
 - `event` (enum/string)
 - `timestamp` (UTC timestamp)
-- `codex_app_server_pid` (if available)
+- `agent_process_pid` (if available)
 - optional `usage` map (token counts)
 - payload fields as needed
 
@@ -1183,11 +1265,11 @@ Hard failure on user input requirement:
 
 ### 10.6 Timeouts and Error Mapping
 
-Timeouts:
+Codex app-server timeouts:
 
-- `codex.read_timeout_ms`: request/response timeout during startup and sync requests
-- `codex.turn_timeout_ms`: total turn stream timeout
-- `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
+- `providers.codex.read_timeout_ms`: request/response timeout during startup and sync requests
+- `providers.codex.turn_timeout_ms`: total turn stream timeout
+- `providers.codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
 
 Error mapping (recommended normalized categories):
 
@@ -1203,14 +1285,14 @@ Error mapping (recommended normalized categories):
 
 ### 10.7 Agent Runner Contract
 
-The `Agent Runner` wraps workspace + prompt + app-server client.
+The `Agent Runner` wraps workspace + prompt + selected provider runtime.
 
 Behavior:
 
 1. Create/reuse workspace for issue.
 2. Build prompt from workflow template.
-3. Start app-server session.
-4. Forward app-server events to orchestrator.
+3. Start provider session.
+4. Forward provider events to orchestrator.
 5. On any error, fail the worker attempt (the orchestrator will retry).
 
 Note:
@@ -1397,7 +1479,7 @@ should return:
 - `running` (list of running session rows)
 - each running row should include `turn_count`
 - `retrying` (list of retry queue rows)
-- `codex_totals`
+- `agent_totals`
   - `input_tokens`
   - `output_tokens`
   - `total_tokens`
@@ -1535,7 +1617,7 @@ Minimum endpoints:
           "error": "no available orchestrator slots"
         }
       ],
-      "codex_totals": {
+      "agent_totals": {
         "input_tokens": 5000,
         "output_tokens": 2400,
         "total_tokens": 7400,
@@ -1789,7 +1871,7 @@ treat harness hardening as part of the core safety model rather than an optional
 function start_service():
   configure_logging()
   start_observability_outputs()
-  start_workflow_watch(on_change=reload_and_reapply_workflow)
+  workflow_store = initialize_workflow_store()
 
   state = {
     poll_interval_ms: get_config_poll_interval_ms(),
@@ -1798,8 +1880,8 @@ function start_service():
     claimed: set(),
     retry_attempts: {},
     completed: set(),
-    codex_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-    codex_rate_limits: null
+    agent_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+    agent_rate_limits: null
   }
 
   validation = validate_dispatch_config()
@@ -1891,13 +1973,13 @@ function dispatch_issue(issue, state, attempt):
     identifier: issue.identifier,
     issue,
     session_id: null,
-    codex_app_server_pid: null,
-    last_codex_message: null,
-    last_codex_event: null,
-    last_codex_timestamp: null,
-    codex_input_tokens: 0,
-    codex_output_tokens: 0,
-    codex_total_tokens: 0,
+    agent_process_pid: null,
+    last_agent_message: null,
+    last_agent_event: null,
+    last_agent_timestamp: null,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
     last_reported_input_tokens: 0,
     last_reported_output_tokens: 0,
     last_reported_total_tokens: 0,
@@ -1923,7 +2005,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
 
   session = app_server.start_session(workspace=workspace.path)
   if session failed:
-    run_hook_best_effort("after_run", workspace.path)
+    run_after_run_preserving_original_error(workspace.path)
     fail_worker("agent session startup error")
 
   max_turns = config.agent.max_turns
@@ -1933,7 +2015,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
     prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
     if prompt failed:
       app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
+      run_after_run_preserving_original_error(workspace.path)
       fail_worker("prompt error")
 
     turn_result = app_server.run_turn(
@@ -1945,13 +2027,13 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
 
     if turn_result failed:
       app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
+      run_after_run_preserving_original_error(workspace.path)
       fail_worker("agent turn error")
 
     refreshed_issue = tracker.fetch_issue_states_by_ids([issue.id])
     if refreshed_issue failed:
       app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
+      run_after_run_preserving_original_error(workspace.path)
       fail_worker("issue state refresh error")
 
     issue = refreshed_issue[0] or issue
@@ -1965,7 +2047,8 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
     turn_number = turn_number + 1
 
   app_server.stop_session(session)
-  run_hook_best_effort("after_run", workspace.path)
+  if run_hook("after_run", workspace.path) failed:
+    fail_worker("after_run hook error")
 
   exit_normal()
 ```
@@ -2062,7 +2145,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `tracker.api_key` works (including `$VAR` indirection)
 - `$VAR` resolution works for tracker API key and path values
 - `~` path expansion works
-- `codex.command` is preserved as a shell command string
+- `agent.provider` selects a provider mapping under `providers`
 - Per-state concurrency override map normalizes state names and ignores invalid values
 - Prompt template renders `issue` and `attempt`
 - Prompt rendering fails on unknown variables (strict mode)
@@ -2078,7 +2161,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Workspace-local helper/cache paths are kept inside the workspace root
 - `after_create` hook runs only on new workspace creation
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
-- `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
+- `after_run` hook runs after each attempt and its failure is surfaced
+- If the main run succeeded, `after_run` failure fails the overall worker outcome
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
 - Workspace path sanitization and root containment invariants are enforced before agent launch
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
@@ -2112,7 +2196,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Runtime-owned terminal cleanup moves a closed issue to project `Done` before workspace removal
   when that behavior is implemented
 - Reconciliation with no running issues is a no-op
-- Normal worker exit schedules a short continuation retry only when the issue remains active
+- Exhausting `agent.max_turns` schedules a short continuation retry
+- Normal worker completion without continuation clears the claim after one final state refresh
 - Abnormal worker exit increments retries with 10s-based exponential backoff
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error
@@ -2122,35 +2207,46 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   limits
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
 
-### 17.5 Coding-Agent App-Server Client
+### 17.5 Provider Runtime Integration
 
-- Launch command uses workspace cwd and invokes `bash -lc <codex.command>`
-- Startup handshake sends `initialize`, `initialized`, `thread/start`, `turn/start`
-- `initialize` includes client identity/capabilities payload required by the targeted Codex
-  app-server protocol
-- Policy-related startup payloads use the implementation's documented approval/sandbox settings
-- `thread/start` and `turn/start` parse nested IDs and emit `session_started`
-- Request/response read timeout is enforced
-- Turn timeout is enforced
-- Partial JSON lines are buffered until newline
-- Stdout and stderr are handled separately; protocol JSON is parsed from stdout only
-- Non-JSON stderr lines are logged but do not crash parsing
-- Command/file-change approvals are handled according to the implementation's documented policy
-- Unsupported dynamic tool calls are rejected without stalling the session
+- Selected provider starts inside the workspace cwd and emits session/turn events back to the
+  orchestrator
+- Provider-specific timeout settings are enforced
+- Unsupported dynamic tool calls are rejected without stalling the session when the provider
+  supports dynamic tools
 - User input requests are handled according to the implementation's documented policy and do not
   stall indefinitely
-- Usage and rate-limit payloads are extracted from nested payload shapes
-- Compatible payload variants for approvals, user-input-required signals, and usage/rate-limit
-  telemetry are accepted when they preserve the same logical meaning
-- If optional client-side tools are implemented, the startup handshake advertises the supported tool
-  specs required for discovery by the targeted app-server version
-- If the optional `github_graphql` client-side tool extension is implemented:
+- When `agent.provider == "codex"`, launch uses workspace cwd and invokes
+  `bash -lc <providers.codex.command>`
+- When `agent.provider == "codex"`, startup handshake sends `initialize`, `initialized`,
+  `thread/start`, `turn/start`
+- When `agent.provider == "codex"`, `initialize` includes client identity/capabilities payload
+  required by the targeted Codex app-server protocol
+- When `agent.provider == "codex"`, policy-related startup payloads use the implementation's
+  documented approval/sandbox settings
+- When `agent.provider == "codex"`, `thread/start` and `turn/start` parse nested IDs and emit
+  `session_started`
+- When `agent.provider == "codex"`, request/response read timeout is enforced
+- When `agent.provider == "codex"`, partial JSON lines are buffered until newline
+- When `agent.provider == "codex"`, stdout and stderr are handled separately and protocol JSON is
+  parsed from stdout only
+- When `agent.provider == "codex"`, non-JSON stderr lines are logged but do not crash parsing
+- When `agent.provider == "codex"`, command/file-change approvals are handled according to the
+  implementation's documented policy
+- When `agent.provider == "codex"`, usage and rate-limit payloads are extracted from nested payload
+  shapes
+- When `agent.provider == "codex"`, compatible payload variants for approvals,
+  user-input-required signals, and usage/rate-limit telemetry are accepted when they preserve the
+  same logical meaning
+- If the optional Codex-side client tools are implemented, the startup handshake advertises the
+  supported tool specs required for discovery by the targeted app-server version
+- If the optional `github_graphql` Codex-side client tool extension is implemented:
   - the tool is advertised to the session
   - valid `query` / `variables` inputs execute against configured GitHub auth
   - top-level GraphQL `errors` produce `success=false` while preserving the GraphQL body
   - invalid arguments, missing auth, and transport failures return structured failure payloads
   - unsupported tool names still fail without stalling the session
-- If the optional `github_rest` client-side tool extension is implemented:
+- If the optional `github_rest` Codex-side client tool extension is implemented:
   - the tool is advertised to the session
   - valid allow-listed REST requests execute against configured GitHub auth
   - unsupported methods/paths, invalid arguments, missing auth, and transport failures return
@@ -2203,16 +2299,17 @@ Use the same validation profiles as Section 17:
 - Workflow path selection supports explicit runtime path and cwd default
 - `WORKFLOW.md` loader with YAML front matter + prompt body split
 - Typed config layer with defaults and `$` resolution
-- Dynamic `WORKFLOW.md` watch/reload/re-apply for config and prompt
+- Dynamic `WORKFLOW.md` reload/re-apply for config and prompt
+- Workflow changes are detected without restart and invalid reloads keep the last known good config
 - Polling orchestrator with single-authority mutable state
 - Issue tracker client with candidate fetch + state refresh + terminal fetch
 - Workspace manager with sanitized per-issue workspaces
 - Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
 - Hook timeout config (`hooks.timeout_ms`, default `60000`)
-- Coding-agent app-server subprocess client with JSON line protocol
-- Codex launch command config (`codex.command`, default `codex app-server`)
+- Selected provider configuration under `agent.provider` + `providers.<provider>`
+- Codex app-server subprocess client with JSON line protocol when `agent.provider == "codex"`
 - Strict prompt rendering with `issue` and `attempt` variables
-- Exponential retry queue with continuation retries after normal exit while the issue remains active
+- Exponential retry queue with continuation retries after a worker exhausts `agent.max_turns`
 - Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
 - Reconciliation that stops runs on terminal/non-active tracker states
 - Workspace cleanup for terminal issues (startup sweep + active transition)
@@ -2225,10 +2322,11 @@ Use the same validation profiles as Section 17:
 
 - Optional HTTP server honors CLI `--port` over `server.port`, uses a safe default bind host, and
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
-- Optional `github_graphql` client-side tool extension exposes raw GitHub GraphQL access through the
-  app-server session using configured Symphony auth.
-- Optional `github_rest` client-side tool extension exposes constrained GitHub REST access through
-  the app-server session using configured Symphony auth.
+- Optional `github_graphql` Codex-side client tool extension exposes raw GitHub GraphQL access
+  through the app-server session using configured Symphony auth.
+- Optional `github_rest` Codex-side client tool extension exposes constrained GitHub REST access
+  through the app-server session using configured Symphony auth.
+- TODO: Add a provider-neutral conformance profile for the Claude runtime surface.
 - TODO: Persist retry queue and session metadata across process restarts.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.
