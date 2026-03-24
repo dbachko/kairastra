@@ -50,8 +50,8 @@ ensure_runtime_home() {
     ln -s "$claude_auth_dir/.claude.json" "$symphony_home/.claude.json"
   fi
 
-  chown "$symphony_user:$symphony_user" "$workspace_root"
   chown -R "$symphony_user:$symphony_user" \
+    "$workspace_root" \
     "$symphony_home" \
     "$codex_auth_dir" \
     "$claude_auth_dir"
