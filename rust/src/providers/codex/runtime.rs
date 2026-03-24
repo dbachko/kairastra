@@ -416,14 +416,31 @@ impl CodexSession {
                         })
                         .unwrap_or_else(|| "turn".to_string());
                     let session_id = format!("{}-{resolved_turn_id}", self.thread_id);
+                    let turn_status = payload
+                        .get("params")
+                        .and_then(|params| params.get("turn"))
+                        .and_then(|turn| turn.get("status"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("completed");
+
+                    let event = match turn_status {
+                        "failed" => AgentEventKind::TurnFailed,
+                        "interrupted" => AgentEventKind::TurnCancelled,
+                        _ => AgentEventKind::TurnCompleted,
+                    };
                     let _ = on_event.send(AgentEvent {
-                        event: AgentEventKind::TurnCompleted,
+                        event,
                         timestamp: now,
-                        payload,
+                        payload: payload.clone(),
                         session_id: Some(session_id),
                         agent_process_pid: self.process_id().map(|value| value.to_string()),
                     });
-                    return Ok(resolved_turn_id);
+
+                    match turn_status {
+                        "failed" => return Err(anyhow!("turn_failed: {}", payload)),
+                        "interrupted" => return Err(anyhow!("turn_cancelled: {}", payload)),
+                        _ => return Ok(resolved_turn_id),
+                    }
                 }
                 "turn/failed" => {
                     let resolved_turn_id = turn_id.clone().unwrap_or_else(|| "turn".to_string());
@@ -1152,6 +1169,70 @@ done
             }
         }
         assert!(saw_input_required);
+    }
+
+    #[tokio::test]
+    async fn treats_failed_turn_completed_status_as_error() {
+        let dir = tempdir().unwrap();
+        let workspace_root = dir.path().join("workspaces");
+        let workspace = workspace_root.join("ISSUE-1B");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let script = dir.path().join("failed-turn-codex.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+count=0
+while IFS= read -r _line; do
+  count=$((count + 1))
+  case "$count" in
+    1)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    2)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-1b"}}}'
+      ;;
+    3)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-1b"}}}'
+      ;;
+    4)
+      printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-1b","status":"failed"},"error":{"message":"boom"}}}'
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let settings =
+            settings_with_command(&workspace_root, &script.display().to_string(), "", "");
+        let tracker = tracker(&settings);
+        let mut session = CodexSession::start(&settings, tracker, &workspace)
+            .await
+            .unwrap();
+        let (tx, mut rx) = unbounded_channel();
+
+        let error = session
+            .run_turn(&issue("ISSUE-1B"), "prompt", &tx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("turn_failed"));
+        let mut saw_failed = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event.event, AgentEventKind::TurnFailed) {
+                saw_failed = true;
+            }
+        }
+        assert!(saw_failed);
     }
 
     #[tokio::test]

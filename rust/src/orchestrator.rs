@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::agent::AgentEventKind;
+use crate::agent::{AgentEvent, AgentEventKind};
 use crate::config::{normalize_issue_state, ProviderId, Settings};
 use crate::github::{is_rate_limited_error, GitHubTracker, Tracker};
 use crate::model::Issue;
@@ -571,6 +571,10 @@ impl Orchestrator {
             WorkerMessage::AppEvent { issue_id, event } => {
                 if let Some(running) = state.running.get_mut(&issue_id) {
                     running.last_agent_timestamp = Instant::now();
+                    let is_codex = running.provider.eq_ignore_ascii_case("codex");
+                    if is_codex {
+                        log_codex_event(&running.identifier, &event);
+                    }
                     match event.event {
                         AgentEventKind::SessionStarted => {
                             running.session_id = event
@@ -584,11 +588,13 @@ impl Orchestrator {
                         | AgentEventKind::TurnInputRequired
                         | AgentEventKind::ApprovalRequired
                         | AgentEventKind::TurnEndedWithError => {
-                            warn!(
-                                issue_identifier = %running.identifier,
-                                payload = %event.payload,
-                                "worker emitted terminal app-server event"
-                            );
+                            if !is_codex {
+                                warn!(
+                                    issue_identifier = %running.identifier,
+                                    payload = %event.payload,
+                                    "worker emitted terminal app-server event"
+                                );
+                            }
                         }
                         _ => {}
                     }
@@ -792,6 +798,224 @@ struct BlockedIssueContext<'a> {
     session_id: Option<&'a str>,
     error: &'a str,
     blocked: &'a BlockedWorkerFailure,
+}
+
+fn log_codex_event(issue_identifier: &str, event: &AgentEvent) {
+    match event.event {
+        AgentEventKind::SessionStarted => {
+            let session_id = event
+                .payload
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            info!(issue_identifier = %issue_identifier, session_id, "codex session started");
+        }
+        AgentEventKind::ApprovalAutoApproved => {
+            info!(
+                issue_identifier = %issue_identifier,
+                payload = %event.payload,
+                "codex approval auto-approved"
+            );
+        }
+        AgentEventKind::ApprovalRequired => {
+            warn!(
+                issue_identifier = %issue_identifier,
+                payload = %event.payload,
+                "codex approval required"
+            );
+        }
+        AgentEventKind::TurnInputRequired => {
+            warn!(
+                issue_identifier = %issue_identifier,
+                payload = %event.payload,
+                "codex turn input required"
+            );
+        }
+        AgentEventKind::TurnFailed
+        | AgentEventKind::TurnCancelled
+        | AgentEventKind::TurnEndedWithError => {
+            warn!(
+                issue_identifier = %issue_identifier,
+                payload = %event.payload,
+                "codex turn ended with error"
+            );
+        }
+        AgentEventKind::ToolCallFailed => {
+            warn!(
+                issue_identifier = %issue_identifier,
+                payload = %event.payload,
+                "codex dynamic tool call failed"
+            );
+        }
+        AgentEventKind::UnsupportedToolCall => {
+            warn!(
+                issue_identifier = %issue_identifier,
+                payload = %event.payload,
+                "codex requested unsupported dynamic tool"
+            );
+        }
+        AgentEventKind::Malformed => {
+            warn!(
+                issue_identifier = %issue_identifier,
+                payload = %event.payload,
+                "codex emitted malformed stdout payload"
+            );
+        }
+        AgentEventKind::ToolInputAutoAnswered => {
+            info!(
+                issue_identifier = %issue_identifier,
+                payload = %event.payload,
+                "codex tool request user input auto-answered"
+            );
+        }
+        AgentEventKind::Notification => log_codex_notification(issue_identifier, &event.payload),
+        _ => {}
+    }
+}
+
+fn log_codex_notification(issue_identifier: &str, payload: &serde_json::Value) {
+    let Some(method) = payload.get("method").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+
+    match method {
+        "turn/started" => {
+            let turn_id = payload
+                .get("params")
+                .and_then(|params| params.get("turn"))
+                .and_then(|turn| turn.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            info!(issue_identifier = %issue_identifier, turn_id, "codex turn started");
+        }
+        "turn/plan/updated" => {
+            let plan = payload
+                .get("params")
+                .and_then(|params| params.get("plan"))
+                .and_then(serde_json::Value::as_array);
+            let current_step = plan.and_then(|steps| {
+                steps.iter().find_map(|step| {
+                    let status = step.get("status").and_then(serde_json::Value::as_str)?;
+                    if status == "inProgress" {
+                        step.get("step").and_then(serde_json::Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+            });
+            let step_count = plan.map(|steps| steps.len()).unwrap_or(0);
+            if let Some(current_step) = current_step {
+                info!(
+                    issue_identifier = %issue_identifier,
+                    step_count,
+                    current_step,
+                    "codex plan updated"
+                );
+            } else {
+                info!(
+                    issue_identifier = %issue_identifier,
+                    step_count,
+                    "codex plan updated"
+                );
+            }
+        }
+        "item/started" => {
+            let Some(item) = payload.get("params").and_then(|params| params.get("item")) else {
+                return;
+            };
+            let Some(item_type) = item.get("type").and_then(serde_json::Value::as_str) else {
+                return;
+            };
+
+            match item_type {
+                "commandExecution" => {
+                    let command = item
+                        .get("command")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|argv| {
+                            argv.iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default();
+                    info!(
+                        issue_identifier = %issue_identifier,
+                        command,
+                        "codex command started"
+                    );
+                }
+                "fileChange" => {
+                    let change_count = item
+                        .get("changes")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|changes| changes.len())
+                        .unwrap_or(0);
+                    info!(
+                        issue_identifier = %issue_identifier,
+                        change_count,
+                        "codex file change started"
+                    );
+                }
+                "dynamicToolCall" => {
+                    let tool = item
+                        .get("tool")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    info!(issue_identifier = %issue_identifier, tool, "codex dynamic tool started");
+                }
+                "mcpToolCall" => {
+                    let server = item
+                        .get("server")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let tool = item
+                        .get("tool")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    info!(
+                        issue_identifier = %issue_identifier,
+                        server,
+                        tool,
+                        "codex MCP tool started"
+                    );
+                }
+                _ => {}
+            }
+        }
+        "item/completed" => {
+            let Some(item) = payload.get("params").and_then(|params| params.get("item")) else {
+                return;
+            };
+            let status = item
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("completed");
+            if !matches!(status, "failed" | "declined") {
+                return;
+            }
+
+            let item_type = item
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            warn!(
+                issue_identifier = %issue_identifier,
+                item_type,
+                status,
+                payload = %payload,
+                "codex item completed unsuccessfully"
+            );
+        }
+        "error" => {
+            warn!(
+                issue_identifier = %issue_identifier,
+                payload = %payload,
+                "codex error notification"
+            );
+        }
+        _ => {}
+    }
 }
 
 fn log_runtime_error(phase: &str, error: &anyhow::Error) {
