@@ -731,6 +731,8 @@ hooks:
   before_run: |
     set -euo pipefail
 
+    git config --global --add safe.directory "$(pwd)"
+
     restore_support_dir_from_seed() {{
       support_dir="$1"
       if [ -e "$support_dir" ]; then
