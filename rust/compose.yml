@@ -8,9 +8,13 @@ services:
         CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-2.1.81}
     environment:
       SYMPHONY_DEPLOY_MODE: docker
+      SYMPHONY_USER: ${SYMPHONY_USER:-symphony}
+      SYMPHONY_HOME: ${SYMPHONY_HOME:-/home/symphony}
       GITHUB_TOKEN: ${GITHUB_TOKEN}
       CODEX_AUTH_MODE: ${CODEX_AUTH_MODE:-auto}
       CLAUDE_AUTH_MODE: ${CLAUDE_AUTH_MODE:-auto}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      SYMPHONY_CLAUDE_KEYRING_PASSWORD: ${SYMPHONY_CLAUDE_KEYRING_PASSWORD:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       WORKFLOW_PATH: /config/WORKFLOW.md
@@ -35,11 +39,13 @@ services:
       - ${WORKFLOW_FILE:-../WORKFLOW.md}:/config/WORKFLOW.md:ro
       - ${SEED_REPO_PATH:-..}:/seed-repo:ro
       - symphony_rust_workspaces:${SYMPHONY_WORKSPACE_ROOT:-/workspaces}
-      - symphony_rust_codex:/root/.codex
-      - symphony_rust_claude:/root/.claude
+      - symphony_rust_home:${SYMPHONY_HOME:-/home/symphony}
+      - symphony_rust_codex:/var/lib/symphony-auth/codex
+      - symphony_rust_claude:/var/lib/symphony-auth/claude
     restart: unless-stopped
 
 volumes:
   symphony_rust_workspaces:
+  symphony_rust_home:
   symphony_rust_codex:
   symphony_rust_claude:

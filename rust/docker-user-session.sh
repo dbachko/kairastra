@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+runtime_dir="${XDG_RUNTIME_DIR:-$HOME/.runtime}"
+mkdir -p "$runtime_dir" "$HOME/.cache" "$HOME/.local/share/keyrings"
+chmod 700 "$runtime_dir"
+export XDG_RUNTIME_DIR="$runtime_dir"
+
+exec dbus-run-session -- bash -lc '
+set -euo pipefail
+
+runtime_dir="${XDG_RUNTIME_DIR:-$HOME/.runtime}"
+mkdir -p "$runtime_dir" "$HOME/.cache" "$HOME/.local/share/keyrings"
+chmod 700 "$runtime_dir"
+export XDG_RUNTIME_DIR="$runtime_dir"
+
+if command -v gnome-keyring-daemon >/dev/null 2>&1; then
+  keyring_password="${SYMPHONY_CLAUDE_KEYRING_PASSWORD:-}"
+  eval "$(printf "%s\n" "$keyring_password" | gnome-keyring-daemon --unlock 2>/dev/null)"
+  eval "$(printf "%s\n" "$keyring_password" | gnome-keyring-daemon --start --components=secrets 2>/dev/null)"
+fi
+
+exec "$@"
+' bash "$@"

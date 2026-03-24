@@ -136,21 +136,6 @@ fn handle_login_action(status: &AuthStatus, display_name: &str) -> Result<()> {
             }
             Ok(())
         }
-        LoginAction::DockerApiKeyRecommended => {
-            println!(
-                "{display_name} in Docker should use API-key auth. Set CLAUDE_AUTH_MODE=api_key and {} in rust/.env, then rerun `make docker-up`.",
-                api_key_env_name(&status.provider)
-            );
-            let try_browser_login = Confirm::with_theme(&ColorfulTheme::default())
-                .with_prompt("Try the browser-based Claude login anyway?")
-                .default(false)
-                .interact()?;
-            if try_browser_login {
-                run_login(&status.provider, AuthMode::Subscription)
-            } else {
-                Ok(())
-            }
-        }
         LoginAction::NeedsApiKey => Err(anyhow!(
             "{} is configured for API-key auth. Set {} and rerun doctor.",
             display_name,
@@ -192,10 +177,6 @@ fn provider_menu_label(display_name: &str, status: &AuthStatus) -> String {
                 )
             }
         }
-        LoginAction::DockerApiKeyRecommended => format!(
-            "Use {} for {display_name} (recommended in Docker)",
-            api_key_env_name(&status.provider)
-        ),
         LoginAction::Subscription => format!("Log in to {display_name}"),
         LoginAction::NeedsApiKey => format!(
             "Set {} for {display_name}",
@@ -234,21 +215,10 @@ fn login_action(status: &AuthStatus) -> LoginAction {
         return LoginAction::AlreadyLoggedIn;
     }
 
-    if status.provider == "claude" && running_in_docker() {
-        return LoginAction::DockerApiKeyRecommended;
-    }
-
     match status.configured_mode {
         AuthMode::ApiKey => LoginAction::NeedsApiKey,
         AuthMode::Auto | AuthMode::Subscription => LoginAction::Subscription,
     }
-}
-
-fn running_in_docker() -> bool {
-    matches!(
-        std::env::var("SYMPHONY_DEPLOY_MODE"),
-        Ok(value) if value.trim().eq_ignore_ascii_case("docker")
-    )
 }
 
 struct AuthMenuEntry {
@@ -262,7 +232,6 @@ enum LoginAction {
     Subscription,
     AlreadyLoggedIn,
     ApiKeyReady,
-    DockerApiKeyRecommended,
     NeedsApiKey,
     ProviderUnavailable,
 }
@@ -353,15 +322,5 @@ mod tests {
             provider_menu_label("Codex", &status),
             "✓ Codex (ready via OPENAI_API_KEY; saved login also present)"
         );
-    }
-
-    #[test]
-    fn login_action_recommends_api_key_for_claude_in_docker() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("SYMPHONY_DEPLOY_MODE", "docker");
-        let status = status("claude");
-
-        assert_eq!(login_action(&status), LoginAction::DockerApiKeyRecommended);
-        std::env::remove_var("SYMPHONY_DEPLOY_MODE");
     }
 }

@@ -186,9 +186,13 @@ make docker-login
 ```
 
 `make docker-login` opens a provider picker that shows which providers are already ready and which
-still need action. In Docker, Codex can use interactive login, but Claude is recommended to use
-`ANTHROPIC_API_KEY` instead of browser login. You can still skip the picker with
+still need action. Both Codex and Claude can use subscription login in Docker, and API-key auth is
+still available when you want it. You can skip the picker with
 `make docker-login PROVIDER=codex` or `make docker-login PROVIDER=claude`.
+For Claude subscription login in Docker, the command prints the OAuth URL and then renders a
+masked terminal prompt named `Paste Authentication Code` so you can paste the browser code back
+into the same terminal session. After submit, Symphony prints progress lines while it waits for
+Claude to finish the login handshake.
 Docker also sets `SYMPHONY_DEPLOY_MODE=docker`, so `doctor` inside the container validates Docker
 prerequisites instead of looking for `systemctl`.
 
@@ -285,9 +289,9 @@ Expected behavior:
 
 Supported runtime modes:
 
-- `auto`: prefer the matching provider API key env var when present (`OPENAI_API_KEY` for Codex, `ANTHROPIC_API_KEY` for Claude); otherwise rely on persisted login state
+- `auto`: prefer the matching provider API key env var when present (`OPENAI_API_KEY` for Codex, `ANTHROPIC_API_KEY` for Claude); otherwise rely on persisted login state or a saved Claude subscription token
 - `api_key`: require the matching provider API key env var
-- `subscription`: use persisted device-auth or account login state only
+- `subscription`: use persisted device-auth, account login state, or a saved Claude subscription token only
 
 Status command:
 
@@ -302,7 +306,7 @@ This reports:
 - configured auth mode
 - inferred auth mode
 - whether the provider CLI is available locally
-- whether the provider's local auth state exists (`~/.codex` or `~/.claude`)
+- whether the provider's local auth state exists (`~/.codex` for Codex; for Claude, Symphony treats `claude auth status --json` plus a saved `~/.claude/oauth-token` as authoritative, and the documented Linux/Windows credential path is `~/.claude/.credentials.json`)
 - whether the matching API key env var is set (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`)
 - a reminder about the matching Docker auth volume inside the container
 
@@ -317,7 +321,13 @@ cargo run -- auth menu
 ```
 
 Use `subscription` for device/browser or account login and `api-key` when the matching provider API
-key is already set in the current shell.
+key is already set in the current shell. In Docker, Claude subscription login now uses Symphony's own
+OAuth flow: it prints the Claude authorize URL, prompts for the pasted authentication code, exchanges
+that code using Claude Code's JSON PKCE token exchange, requests the same 1-year subscription token
+expiry that `claude setup-token` uses, and persists the returned Claude subscription token in the
+shared Claude auth volume so the running worker can pick it up without restarting the service
+container.
+Paste the Authentication Code shown on Claude's browser page after sign-in, not the authorize URL itself.
 
 ## Docker deployment details
 
@@ -332,14 +342,21 @@ Important details:
 - `WORKFLOW_FILE` is mounted read-only at `/config/WORKFLOW.md`.
 - `SEED_REPO_PATH` is mounted read-only at `/seed-repo`.
 - workspaces live in the `symphony_rust_workspaces` volume.
-- Codex auth persists in the `symphony_rust_codex` volume.
-- Claude auth persists in the `symphony_rust_claude` volume.
+- runtime home state persists in the `symphony_rust_home` volume.
+- Codex auth persists in the `symphony_rust_codex` volume and is linked into the runtime home.
+- Claude auth persists in the `symphony_rust_claude` volume and is linked into the runtime home.
+- a saved Claude long-lived OAuth token is stored at `~/.claude/oauth-token` inside that shared auth volume.
+- the container now runs Symphony as a non-root `symphony` user so Claude's bypass-permissions mode works.
+- Claude Code is installed from Anthropic's native Linux installer inside the image rather than the npm package.
+- Docker now starts a per-container D-Bus session plus a headless GNOME keyring for the `symphony` user so Claude subscription auth has a Linux secret store available in headless environments.
+- the headless keyring lives under the persisted runtime home volume; by default it is unlocked with an empty password inside the container session, and you can override that by setting `SYMPHONY_CLAUDE_KEYRING_PASSWORD`.
 - Compose now passes through the workflow-related `SYMPHONY_*` variables so env-backed workflow
   fields resolve inside the container at runtime.
 - `CODEX_AUTH_MODE=subscription` plus `make docker-login PROVIDER=codex` is the intended Codex subscription/device-auth path.
 - `CODEX_AUTH_MODE=api_key` plus `OPENAI_API_KEY` is the intended API-key path.
-- `CLAUDE_AUTH_MODE=api_key` plus `ANTHROPIC_API_KEY` is the intended Claude Docker path.
-- Browser-based Claude subscription login may fail in Docker; `make docker-login` will point you to the API-key path and only offer browser login as a fallback.
+- `CLAUDE_AUTH_MODE=subscription` plus `make docker-login PROVIDER=claude` is the intended Claude subscription path; in Docker Symphony drives the browser OAuth flow itself and persists the resulting long-lived subscription token into the shared Claude auth volume.
+- `CLAUDE_AUTH_MODE=api_key` plus `ANTHROPIC_API_KEY` remains available when you want Anthropic Console billing instead of a Claude subscription login.
+- `CLAUDE_CODE_OAUTH_TOKEN` is also supported directly when you want to pre-seed Docker/VPS auth from a token generated elsewhere.
 
 Available make targets:
 
@@ -349,7 +366,9 @@ Available make targets:
 - `make docker-logs`
 - `make docker-login` opens an interactive provider picker and then runs the matching login flow when needed
 - `make docker-login PROVIDER=codex` goes straight to the Codex login flow
-- `make docker-login PROVIDER=claude` shows the Claude Docker auth guidance and can optionally try browser login as a fallback
+- `make docker-login PROVIDER=claude` goes straight to the Claude subscription login flow
+- the Claude Docker login helper prints a browser authorize URL directly and never drops you into Claude's raw terminal TUI
+- after you paste the browser auth code, Symphony exchanges it directly and either saves the token or returns the exact HTTP error body from Anthropic instead of hanging
 
 ## Native VPS deployment details
 

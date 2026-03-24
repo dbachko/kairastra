@@ -10,7 +10,7 @@ pub const COMMAND_NAME: &str = "codex";
 const AUTH_DIR_NAME: &str = ".codex";
 const AUTH_MODE_ENV: &str = "CODEX_AUTH_MODE";
 const DOCKER_VOLUME_HINT: &str =
-    "Docker mode persists Codex auth inside the symphony_rust_codex volume mounted at /root/.codex in the container.";
+    "Docker mode persists Codex auth through the symphony_rust_home and symphony_rust_codex volumes mounted for the non-root runtime user.";
 
 pub fn inspect_status() -> AuthStatus {
     let configured_mode = AuthMode::from_env_var(AUTH_MODE_ENV);

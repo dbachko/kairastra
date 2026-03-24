@@ -101,6 +101,9 @@ impl ClaudeSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(token) = super::auth::oauth_token() {
+            command.env(super::auth::OAUTH_TOKEN_ENV, token);
+        }
 
         let mut child = command
             .spawn()
@@ -564,7 +567,9 @@ fn validate_workspace_cwd(root: &Path, workspace: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
+    use std::sync::Mutex;
 
     use tempfile::tempdir;
     use tokio::sync::mpsc::unbounded_channel;
@@ -574,6 +579,37 @@ mod tests {
     use crate::model::{Issue, WorkflowDefinition};
 
     use super::{AgentEventKind, ClaudeSession};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: OsString) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.original.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     fn issue(identifier: &str) -> Issue {
         Issue {
@@ -797,5 +833,62 @@ printf '%s\n' "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,
 
         let trace = fs::read_to_string(trace_file).unwrap();
         assert!(trace.contains("--resume claude-session-1"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn injects_saved_oauth_token_into_claude_process() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+        let claude_dir = home_dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("oauth-token"), "sk-ant-oat01-test-token").unwrap();
+
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let _token = EnvVarGuard::unset(crate::providers::claude::auth::OAUTH_TOKEN_ENV);
+
+        let workspace_root = dir.path().join("workspaces");
+        let workspace = workspace_root.join("ISSUE-TOKEN");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let script = dir.path().join("token-claude.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+token="${CLAUDE_CODE_OAUTH_TOKEN:-missing}"
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude-session-token"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-session-token","result":"'"${token}"'"}'
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let settings = settings_with_command(&workspace_root, &script.display().to_string(), "");
+        let mut session = ClaudeSession::start(&settings, "fake", &workspace).unwrap();
+        let (tx, mut rx) = unbounded_channel();
+
+        session
+            .run_turn(&issue("ISSUE-TOKEN"), "prompt", &tx)
+            .await
+            .unwrap();
+
+        let mut saw_token = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event.event, AgentEventKind::TurnCompleted)
+                && event.payload.get("result").and_then(|value| value.as_str())
+                    == Some("sk-ant-oat01-test-token")
+            {
+                saw_token = true;
+            }
+        }
+
+        assert!(saw_token);
     }
 }
