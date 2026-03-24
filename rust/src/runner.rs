@@ -30,6 +30,10 @@ pub enum WorkerMessage {
         identifier: String,
         workspace_path: PathBuf,
     },
+    TurnStarted {
+        issue_id: String,
+        turn_number: usize,
+    },
     AppEvent {
         issue_id: String,
         event: AgentEvent,
@@ -85,6 +89,10 @@ pub async fn run_issue(
 
         for turn_number in 1..=snapshot.settings.agent.max_turns {
             info!(issue_identifier = %issue.identifier, turn = turn_number, "running agent turn");
+            let _ = event_tx.send(WorkerMessage::TurnStarted {
+                issue_id: current_issue.id.clone(),
+                turn_number,
+            });
             let prompt = if turn_number == 1 {
                 build_prompt(&snapshot, &current_issue, attempt)?
             } else {
