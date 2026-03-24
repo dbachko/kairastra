@@ -81,6 +81,11 @@ providers:
     turn_sandbox_policy:
       type: workspaceWrite
       networkAccess: true
+  claude:
+    command: claude
+    model: $SYMPHONY_CLAUDE_MODEL
+    reasoning_effort: $SYMPHONY_CLAUDE_REASONING_EFFORT
+    approval_policy: never
 ---
 
 You are working on GitHub issue `{{ issue.identifier }}`.

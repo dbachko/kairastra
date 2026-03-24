@@ -150,6 +150,8 @@ hooks:
   before_run: |
     set -euo pipefail
 
+    git config --global --add safe.directory "$(pwd)"
+
     restore_support_dir_from_seed() {
       support_dir="$1"
       if [ -e "$support_dir" ]; then
@@ -240,6 +242,11 @@ providers:
     turn_sandbox_policy:
       type: workspaceWrite
       networkAccess: true
+  claude:
+    command: claude
+    model: $SYMPHONY_CLAUDE_MODEL
+    reasoning_effort: $SYMPHONY_CLAUDE_REASONING_EFFORT
+    approval_policy: never
 ---
 
 You are working on GitHub issue `{{ issue.identifier }}`.
@@ -298,7 +305,7 @@ The agent should be able to talk to GitHub through the injected `github_graphql`
 
 - Start by determining the issue's current status, then follow the matching flow for that status.
 - Start every task by opening the tracking workpad comment and bringing it up to date before doing new implementation work.
-- The runtime may already have created the bootstrap `## Codex Workpad` comment for this issue; if so, reuse and edit that exact comment instead of creating another.
+- The runtime may already have created the bootstrap workpad comment for this issue; if so, reuse and edit that exact comment instead of creating another.
 - Your first tracker mutation must be to replace the bootstrap-only workpad with a real plan and current checklist state. Do not leave the bootstrap note or an all-unchecked workpad in place.
 - If the rendered `Current workpad` section still shows the bootstrap note or only unchecked placeholder items, update that exact comment before any further implementation or handoff work.
 - When publishing changes, explicitly open and follow `.codex/skills/push/SKILL.md`. Do not improvise PR creation with raw REST calls or ad hoc bodies.
@@ -350,14 +357,14 @@ The agent should be able to talk to GitHub through the injected `github_graphql`
    - Create a fresh branch from `origin/main` and restart execution flow as a new attempt.
 5. For `Todo` issues, do startup sequencing in this exact order:
    - move the issue to `In Progress`
-   - find or create the `## Codex Workpad` bootstrap comment
+   - find or create the bootstrap workpad comment
    - only then begin analysis, planning, and implementation work
 6. Add a short workpad note if state and issue content are inconsistent, then proceed with the safest flow.
 
 ## Step 1: Start or continue execution
 
 1. Find or create a single persistent workpad comment for the issue:
-   - Search existing issue comments for a marker header: `## Codex Workpad`.
+   - Search existing issue comments for a marker header: `## Codex Workpad`, `## Claude Workpad`, or `## Agent Workpad`.
    - If found, reuse that comment; do not create a new workpad comment.
    - If not found, create one workpad comment and use it for all updates.
    - Persist the workpad comment ID and only write progress updates to that ID.
@@ -469,11 +476,11 @@ Use this only when completion is blocked by missing required tools or missing au
 1. Treat `Rework` as a full approach reset, not incremental patching.
 2. Re-read the full issue body and all human comments; explicitly identify what will be done differently this attempt.
 3. Close the existing PR tied to the issue if it should not be reused.
-4. Remove the existing `## Codex Workpad` comment or replace it with a clearly fresh workpad.
+4. Remove the existing workpad comment or replace it with a clearly fresh workpad.
 5. Create a fresh branch from `origin/main`.
 6. Start over from the normal kickoff flow:
    - if current issue state is `Todo`, move it to `In Progress`; otherwise keep the current state
-   - create a new bootstrap `## Codex Workpad` comment
+   - create a new bootstrap workpad comment
    - build a fresh plan, checklist, and validation path
 
 ## Completion bar before Human Review
@@ -490,7 +497,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - If the branch PR is already closed or merged, do not reuse that branch or prior implementation state for continuation.
 - For closed or merged branch PRs, create a new branch from `origin/main` and restart from reproduction and planning.
 - If issue state is `Backlog`, do not modify it; wait for a human to move it to `Todo`.
-- Prefer exactly one persistent workpad comment (`## Codex Workpad`) per issue.
+- Prefer exactly one persistent workpad comment per issue.
 - If comment editing is unavailable in-session, fall back to using the issue body as the persistent workpad. Only report blocked if neither comment editing nor issue-body editing is available.
 - Temporary proof edits are allowed only for local verification and must be reverted before commit.
 - If out-of-scope improvements are found, create a separate follow-up issue rather than expanding current scope.
@@ -505,7 +512,7 @@ Use this only when completion is blocked by missing required tools or missing au
 Use this exact structure for the persistent workpad comment and keep it updated in place throughout execution:
 
 ````md
-## Codex Workpad
+## Agent Workpad
 
 ```text
 <hostname>:<abs-path>@<short-sha>

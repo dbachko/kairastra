@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use symphony_rust::auth::{inspect_status, run_login, AuthMode};
+use symphony_rust::auth::{inspect_status, run_login, run_login_menu, AuthMode};
 use symphony_rust::deploy::DeployMode;
 use symphony_rust::doctor::{run as run_doctor, DoctorFormat, DoctorOptions};
 use symphony_rust::github::GitHubTracker;
@@ -77,8 +77,8 @@ struct DoctorArgs {
 
 #[derive(Debug, Args)]
 struct AuthArgs {
-    #[arg(long, default_value = "codex")]
-    provider: String,
+    #[arg(long)]
+    provider: Option<String>,
 
     #[command(subcommand)]
     command: AuthCommand,
@@ -88,6 +88,7 @@ struct AuthArgs {
 enum AuthCommand {
     Status,
     Login(AuthLoginArgs),
+    Menu,
 }
 
 #[derive(Debug, Args)]
@@ -145,6 +146,7 @@ async fn main() -> Result<()> {
             provider,
             command: AuthCommand::Status,
         }) => {
+            let provider = provider.unwrap_or_else(|| "codex".to_string());
             let status = inspect_status(&provider)?;
             println!("{}", serde_json::to_string_pretty(&status)?);
             Ok(())
@@ -152,7 +154,14 @@ async fn main() -> Result<()> {
         Command::Auth(AuthArgs {
             provider,
             command: AuthCommand::Login(args),
-        }) => run_login(&provider, args.mode.into()),
+        }) => run_login(
+            &provider.unwrap_or_else(|| "codex".to_string()),
+            args.mode.into(),
+        ),
+        Command::Auth(AuthArgs {
+            provider,
+            command: AuthCommand::Menu,
+        }) => run_login_menu(provider.as_deref()),
     }
 }
 
