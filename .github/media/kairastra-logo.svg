@@ -1,0 +1,52 @@
+<svg width="1280" height="320" viewBox="0 0 1280 320" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="logoBg" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(264 102) rotate(43.4) scale(1151.22 732.839)">
+      <stop stop-color="#14213D"/>
+      <stop offset="0.55" stop-color="#0B1220"/>
+      <stop offset="1" stop-color="#040814"/>
+    </radialGradient>
+    <linearGradient id="logoOrbit" x1="92" y1="74" x2="300" y2="266" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7DD3FC"/>
+      <stop offset="0.45" stop-color="#A78BFA"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+    <linearGradient id="logoMetal" x1="132" y1="94" x2="248" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FAFC"/>
+      <stop offset="1" stop-color="#CBD5E1"/>
+    </linearGradient>
+    <linearGradient id="logoSpark" x1="232" y1="64" x2="284" y2="122" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FDE68A"/>
+      <stop offset="1" stop-color="#F97316"/>
+    </linearGradient>
+    <filter id="logoGlow" x="44" y="44" width="276" height="232" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="12"/>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="1264" height="304" rx="36" fill="url(#logoBg)"/>
+  <rect x="8" y="8" width="1264" height="304" rx="36" stroke="#1E293B" stroke-width="2"/>
+  <circle cx="1166" cy="74" r="2.5" fill="#F8FAFC" fill-opacity="0.6"/>
+  <circle cx="1118" cy="108" r="2" fill="#7DD3FC" fill-opacity="0.5"/>
+  <circle cx="1078" cy="72" r="1.75" fill="#F59E0B" fill-opacity="0.55"/>
+  <path d="M1078 72L1118 108L1166 74" stroke="#334155" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M78 236H314" stroke="#1E293B" stroke-width="2" stroke-linecap="round"/>
+  <g filter="url(#logoGlow)">
+    <circle cx="182" cy="160" r="92" fill="#0F172A" fill-opacity="0.55"/>
+  </g>
+  <circle cx="182" cy="160" r="92" stroke="url(#logoOrbit)" stroke-width="10"/>
+  <circle cx="182" cy="160" r="68" stroke="#334155" stroke-width="3"/>
+  <ellipse cx="182" cy="160" rx="88" ry="48" transform="rotate(-28 182 160)" stroke="url(#logoOrbit)" stroke-width="7.5"/>
+  <ellipse cx="182" cy="160" rx="86" ry="42" transform="rotate(34 182 160)" stroke="#7DD3FC" stroke-opacity="0.35" stroke-width="4.5"/>
+  <path d="M104 120C132 98 158 88 182 88C212 88 241 103 270 132" stroke="#475569" stroke-width="3" stroke-linecap="round"/>
+  <path d="M94 164C118 188 147 204 183 204C220 204 249 189 274 160" stroke="#334155" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="116" cy="118" r="5.5" fill="#7DD3FC"/>
+  <circle cx="270" cy="132" r="5.5" fill="#F59E0B"/>
+  <circle cx="95" cy="163" r="4.5" fill="#A78BFA"/>
+  <path d="M150 106V214" stroke="url(#logoMetal)" stroke-width="16" stroke-linecap="round"/>
+  <path d="M162 160L234 104" stroke="url(#logoMetal)" stroke-width="16" stroke-linecap="round"/>
+  <path d="M162 160L238 220" stroke="url(#logoMetal)" stroke-width="16" stroke-linecap="round"/>
+  <path d="M257 58L264 77L283 84L264 91L257 110L250 91L231 84L250 77L257 58Z" fill="url(#logoSpark)"/>
+  <path d="M111 236C133 218 157 208 183 208C211 208 235 218 257 236" stroke="#475569" stroke-width="2.5" stroke-linecap="round"/>
+  <text x="354" y="144" fill="#F8FAFC" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="78" font-weight="700" letter-spacing="1.2">Kairastra</text>
+  <text x="358" y="204" fill="#94A3B8" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="28" font-weight="500" letter-spacing="0.8">Align intent. Launch execution. Land the merge.</text>
+  <path d="M356 227H878" stroke="url(#logoOrbit)" stroke-width="3" stroke-linecap="round" stroke-opacity="0.55"/>
+</svg>

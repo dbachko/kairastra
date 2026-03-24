@@ -1,6 +1,6 @@
 # Workflow Reference
 
-Symphony reads runtime behavior from `WORKFLOW.md`.
+Kairastra reads runtime behavior from `WORKFLOW.md`.
 
 ## Structure
 
@@ -9,7 +9,7 @@ Symphony reads runtime behavior from `WORKFLOW.md`.
 1. YAML front matter between leading `---` delimiters
 2. A Markdown prompt template body rendered per issue
 
-If the file has no front matter, Symphony treats the entire file as the prompt body.
+If the file has no front matter, Kairastra treats the entire file as the prompt body.
 
 ## Core sections
 

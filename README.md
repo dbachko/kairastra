@@ -1,10 +1,14 @@
-# QueuePilot
+![Kairastra logo](.github/media/kairastra-logo.svg)
 
-QueuePilot is a GitHub-native autonomous work runner built from the Symphony service model.
+# Kairastra
 
-[![QueuePilot demo video preview](.github/media/symphony-demo-poster.jpg)](.github/media/symphony-demo.mp4)
+_Align intent. Launch execution. Land the merge._
 
-_In the [demo video](.github/media/symphony-demo.mp4), QueuePilot watches a GitHub work queue,
+Kairastra is a GitHub-native autonomous work runner built from the Symphony service model.
+
+[![Kairastra demo video preview](.github/media/symphony-demo-poster.jpg)](.github/media/symphony-demo.mp4)
+
+_In the [demo video](.github/media/symphony-demo.mp4), Kairastra watches a GitHub work queue,
 spins up isolated agent workspaces, drives implementation forward, and leaves behind reviewable
 proof of work in pull requests, CI status, and issue updates._
 
@@ -27,12 +31,13 @@ The local service contract lives in [SPEC.md](SPEC.md). It is reconciled against
 [openai/symphony](https://github.com/openai/symphony) specification, but this repo documents and
 implements its own GitHub-oriented behavior.
 
-## Why "QueuePilot"
+## Why "Kairastra"
 
 `symphony-gh` is an accurate repo slug, but it is not a very good product name.
 
-QueuePilot fits the actual behavior better: the system pulls from a GitHub queue, assigns isolated
-runs, and drives work toward review and merge without constant operator supervision.
+Kairastra is derived from `kairos`, the opportune moment, and `astra`, the stars. That fits the
+actual behavior better: the system waits for the right dispatch moment, launches isolated runs, and
+keeps work moving toward review and merge without constant operator supervision.
 
 ## Start Here
 
@@ -41,6 +46,9 @@ If you want to run the implementation in this repository, start with:
 - [rust/README.md](rust/README.md) for setup, deployment modes, auth, and operations
 - [docs/README.md](docs/README.md) for architecture, workflow config, and troubleshooting
 - [SPEC.md](SPEC.md) for the repo's normative service contract
+
+The repo slug and several operator-facing paths still use historical `symphony` names. The public
+docs use `Kairastra` for the product and call out those legacy names where operators need them.
 
 ## Implementation Scope
 

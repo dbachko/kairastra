@@ -1,5 +1,7 @@
 # Troubleshooting
 
+Use these checks when Kairastra setup, auth, or runtime behavior is not matching expectations.
+
 ## First checks
 
 Run:
