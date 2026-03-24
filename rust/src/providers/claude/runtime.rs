@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -90,22 +91,35 @@ impl ClaudeSession {
         self.turn_counter += 1;
         let turn_id = format!("turn-{}", self.turn_counter);
 
-        let mut command = Command::new("bash");
+        // Invoke claude directly without a shell wrapper.  Using bash -lc re-sources login
+        // profile scripts (already done by the outer docker-user-session.sh wrapper) and can
+        // cause 5-30 second startup delays.  The binary is on PATH via the parent process env.
+        let argv = self.cli_argv();
+        let mut command = Command::new(&argv[0]);
         command
-            .arg("-lc")
-            .arg(self.cli_command())
+            .args(&argv[1..])
             .current_dir(&self.workspace)
             .env("GITHUB_TOKEN", self.github_token.as_str())
             .env("GH_TOKEN", self.github_token.as_str())
+            // Prevent Claude Code from trying to use gnome-keyring/D-Bus for credentials.
+            // When the keyring daemon is present but empty it can block waiting for interactive
+            // input.  With DBUS_SESSION_BUS_ADDRESS unset Claude falls back to reading
+            // ~/.claude/.credentials.json (and CLAUDE_CODE_OAUTH_TOKEN) which is what we want.
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            // Disable update checks and telemetry pings that add network latency at startup.
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         if let Some(token) = super::auth::oauth_token() {
-            command.env(super::auth::OAUTH_TOKEN_ENV, token);
+            // CLAUDE_CODE_OAUTH_TOKEN is the Claude Code OAuth/subscription token.
+            // Do not mirror it into ANTHROPIC_AUTH_TOKEN: Claude treats that env var as an
+            // Anthropic API credential, which breaks subscription auth with a 401.
+            command.env(super::auth::OAUTH_TOKEN_ENV, &token);
         }
 
-        debug!(issue_identifier = %issue.identifier, command = %self.cli_command(), "launching Claude");
+        debug!(issue_identifier = %issue.identifier, argv = ?argv, "launching Claude");
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to launch Claude Code for {}", issue.identifier))?;
@@ -116,59 +130,79 @@ impl ClaudeSession {
             .stdin
             .take()
             .ok_or_else(|| anyhow!("missing_claude_stdin"))?;
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .context("failed to write Claude prompt")?;
-        stdin
-            .shutdown()
-            .await
-            .context("failed to close Claude stdin")?;
-
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| anyhow!("missing_claude_stdout"))?;
+        let prompt_text = prompt.to_string();
+        let stdin_writer = tokio::spawn(async move {
+            stdin
+                .write_all(prompt_text.as_bytes())
+                .await
+                .context("failed to write Claude prompt")?;
+            stdin
+                .shutdown()
+                .await
+                .context("failed to close Claude stdin")?;
+            Ok::<(), anyhow::Error>(())
+        });
         let stderr_lines = Arc::new(Mutex::new(Vec::new()));
         let stderr_logger = child.stderr.take().map(|stderr| {
             let stderr_lines = Arc::clone(&stderr_lines);
             tokio::spawn(log_stderr(stderr, stderr_lines))
         });
 
-        let parse_result = timeout(
-            Duration::from_millis(self.config.turn_timeout_ms),
-            self.await_turn_completion(BufReader::new(stdout).lines(), &turn_id, on_event),
-        )
-        .await;
-
-        let result = match parse_result {
-            Ok(result) => result,
-            Err(_) => {
-                child.kill().await.ok();
-                emit_event(
-                    on_event,
-                    AgentEventKind::TurnEndedWithError,
-                    json!({
-                        "reason": "turn_timeout",
-                        "turn_id": turn_id,
-                    }),
-                    self.current_session_id.clone(),
-                    self.last_process_id,
-                );
-                return Err(anyhow!("turn_timeout"));
+        let result = self
+            .await_turn_completion(BufReader::new(stdout).lines(), &turn_id, on_event)
+            .await;
+        let timeout_reason = result.as_ref().err().and_then(|error| {
+            let error_text = error.to_string();
+            match error_text.as_str() {
+                "turn_timeout" => Some("turn_timeout"),
+                "turn_stalled" => Some("turn_stalled"),
+                _ => None,
             }
-        };
+        });
+        if let Some(reason) = timeout_reason {
+            child.kill().await.ok();
+            emit_event(
+                on_event,
+                AgentEventKind::TurnEndedWithError,
+                json!({
+                    "reason": reason,
+                    "turn_id": turn_id,
+                }),
+                self.current_session_id.clone(),
+                self.last_process_id,
+            );
+        }
 
         let status = child
             .wait()
             .await
             .context("failed to wait for Claude turn")?;
+        debug!(issue_identifier = %issue.identifier, exit_status = %status, "Claude process exited");
+        let stdin_error = match stdin_writer.await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(error) => Some(format!("failed to join Claude stdin writer: {error}")),
+        };
         if let Some(task) = stderr_logger {
             let _ = task.await;
         }
         let stderr_summary = summarize_stderr(&stderr_lines);
         match result {
             Ok(result) => {
+                if let Some(stdin_error) = stdin_error {
+                    if let Some(stderr) = stderr_summary {
+                        return Err(anyhow!(
+                            "claude_turn_failed: stdin_write={stdin_error}; process_exited={status}; stderr={stderr}"
+                        ));
+                    }
+                    return Err(anyhow!(
+                        "claude_turn_failed: stdin_write={stdin_error}; process_exited={status}"
+                    ));
+                }
                 if !status.success() {
                     if let Some(stderr) = stderr_summary {
                         return Err(anyhow!(
@@ -181,6 +215,11 @@ impl ClaudeSession {
                 Ok(result)
             }
             Err(error) => {
+                let error = if let Some(stdin_error) = stdin_error {
+                    anyhow!("{error}; stdin_write={stdin_error}")
+                } else {
+                    error
+                };
                 if !status.success() {
                     if let Some(stderr) = stderr_summary {
                         return Err(anyhow!("{error}; process_exited={status}; stderr={stderr}"));
@@ -192,34 +231,39 @@ impl ClaudeSession {
         }
     }
 
-    fn cli_command(&self) -> String {
-        let mut args = vec![
+    /// Returns the full argv for direct (non-shell) invocation.
+    /// `config.command` may be a multi-word prefix like `"timeout 300 claude"`, so we
+    /// split it on whitespace before appending our own flags.
+    fn cli_argv(&self) -> Vec<String> {
+        let mut argv: Vec<String> = self
+            .config
+            .command
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+
+        argv.extend([
             "--print".to_string(),
             "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--permission-mode".to_string(),
             self.config.permission_mode.clone(),
-        ];
+        ]);
         if let Some(model) = self.config.model.as_ref() {
-            args.push("--model".to_string());
-            args.push(model.clone());
+            argv.push("--model".to_string());
+            argv.push(model.clone());
         }
         if let Some(effort) = self.config.reasoning_effort.as_ref() {
-            args.push("--effort".to_string());
-            args.push(effort.clone());
+            argv.push("--effort".to_string());
+            argv.push(effort.clone());
         }
         if let Some(session_id) = self.current_session_id.as_ref() {
-            args.push("--resume".to_string());
-            args.push(session_id.clone());
+            argv.push("--resume".to_string());
+            argv.push(session_id.clone());
         }
 
-        let mut command = self.config.command.clone();
-        for arg in args {
-            command.push(' ');
-            command.push_str(&shell_escape(&arg));
-        }
-        command
+        argv
     }
 
     async fn await_turn_completion(
@@ -228,15 +272,58 @@ impl ClaudeSession {
         turn_id: &str,
         on_event: &UnboundedSender<AgentEvent>,
     ) -> Result<TurnResult> {
+        let turn_started = Instant::now();
         let mut current_session_id = self.current_session_id.clone();
         let mut saw_permission_denial = false;
         let mut emitted_approval_required = false;
+        let mut last_event_at = Instant::now();
 
-        while let Some(line) = stdout
-            .next_line()
-            .await
-            .context("failed to read Claude output line")?
-        {
+        loop {
+            if self.config.turn_timeout_ms > 0
+                && turn_started.elapsed() >= Duration::from_millis(self.config.turn_timeout_ms)
+            {
+                return Err(anyhow!("turn_timeout"));
+            }
+
+            if self.config.stall_timeout_ms > 0
+                && last_event_at.elapsed() >= Duration::from_millis(self.config.stall_timeout_ms)
+            {
+                return Err(anyhow!("turn_stalled"));
+            }
+
+            let remaining_turn = if self.config.turn_timeout_ms == 0 {
+                Duration::from_secs(3600)
+            } else {
+                Duration::from_millis(self.config.turn_timeout_ms)
+                    .saturating_sub(turn_started.elapsed())
+            };
+            let remaining_stall = if self.config.stall_timeout_ms == 0 {
+                Duration::from_secs(3600)
+            } else {
+                Duration::from_millis(self.config.stall_timeout_ms)
+                    .saturating_sub(last_event_at.elapsed())
+            };
+            let wait_for = remaining_turn.min(remaining_stall);
+
+            let line = timeout(wait_for, stdout.next_line())
+                .await
+                .map_err(|_| {
+                    if self.config.stall_timeout_ms > 0
+                        && last_event_at.elapsed()
+                            >= Duration::from_millis(self.config.stall_timeout_ms)
+                    {
+                        anyhow!("turn_stalled")
+                    } else {
+                        anyhow!("turn_timeout")
+                    }
+                })?
+                .context("failed to read Claude output line")?;
+
+            let Some(line) = line else {
+                warn!("Claude stdout closed without a result message");
+                return Err(anyhow!("claude_stream_ended_without_result"));
+            };
+            last_event_at = Instant::now();
             if line.trim().is_empty() {
                 continue;
             }
@@ -375,9 +462,6 @@ impl ClaudeSession {
                 }
             }
         }
-
-        warn!("Claude stdout closed without a result message");
-        Err(anyhow!("claude_stream_ended_without_result"))
     }
 }
 
@@ -520,10 +604,6 @@ fn emit_event(
         session_id,
         agent_process_pid: process_id.map(|value| value.to_string()),
     });
-}
-
-fn shell_escape(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 
 async fn log_stderr(stderr: ChildStderr, captured_lines: Arc<Mutex<Vec<String>>>) {
@@ -894,5 +974,148 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
         }
 
         assert!(saw_token);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn does_not_inject_oauth_token_as_anthropic_auth_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+        let claude_dir = home_dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("oauth-token"), "sk-ant-oat01-test-token").unwrap();
+
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let _token = EnvVarGuard::unset(crate::providers::claude::auth::OAUTH_TOKEN_ENV);
+
+        let workspace_root = dir.path().join("workspaces");
+        let workspace = workspace_root.join("ISSUE-AUTH-TOKEN");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let script = dir.path().join("anthropic-token-claude.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+token="${ANTHROPIC_AUTH_TOKEN:-missing}"
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude-session-auth-token"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-session-auth-token","result":"'"${token}"'"}'
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let settings = settings_with_command(&workspace_root, &script.display().to_string(), "");
+        let mut session = ClaudeSession::start(&settings, "fake", &workspace).unwrap();
+        let (tx, mut rx) = unbounded_channel();
+
+        session
+            .run_turn(&issue("ISSUE-AUTH-TOKEN"), "prompt", &tx)
+            .await
+            .unwrap();
+
+        let mut saw_missing = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event.event, AgentEventKind::TurnCompleted)
+                && event.payload.get("result").and_then(|value| value.as_str()) == Some("missing")
+            {
+                saw_missing = true;
+            }
+        }
+
+        assert!(saw_missing);
+    }
+
+    #[tokio::test]
+    async fn stalls_when_claude_emits_no_output() {
+        let dir = tempdir().unwrap();
+        let workspace_root = dir.path().join("workspaces");
+        let workspace = workspace_root.join("ISSUE-STALL");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let script = dir.path().join("silent-claude.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+sleep 2
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let settings = settings_with_command(
+            &workspace_root,
+            &script.display().to_string(),
+            "stall_timeout_ms: 50\nturn_timeout_ms: 1000",
+        );
+        let mut session = ClaudeSession::start(&settings, "fake", &workspace).unwrap();
+        let (tx, _rx) = unbounded_channel();
+
+        let error = session
+            .run_turn(&issue("ISSUE-STALL"), "prompt", &tx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("turn_stalled"));
+    }
+
+    #[tokio::test]
+    async fn reads_stdout_while_large_prompt_is_still_being_written() {
+        let dir = tempdir().unwrap();
+        let workspace_root = dir.path().join("workspaces");
+        let workspace = workspace_root.join("ISSUE-LARGE-PROMPT");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let script = dir.path().join("eager-claude.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude-session-large"}'
+i=0
+while [ "$i" -lt 1024 ]; do
+  printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}]}}'
+  i=$((i + 1))
+done
+cat >/dev/null
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-session-large","result":"ok"}'
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let settings = settings_with_command(
+            &workspace_root,
+            &script.display().to_string(),
+            "stall_timeout_ms: 1000\nturn_timeout_ms: 5000",
+        );
+        let mut session = ClaudeSession::start(&settings, "fake", &workspace).unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let large_prompt = "x".repeat(200_000);
+
+        let result = session
+            .run_turn(&issue("ISSUE-LARGE-PROMPT"), &large_prompt, &tx)
+            .await
+            .unwrap();
+
+        assert_eq!(result.session_id, "claude-session-large");
     }
 }

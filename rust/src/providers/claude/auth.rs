@@ -35,6 +35,25 @@ struct ClaudeCliAuthStatus {
 #[derive(Debug, Deserialize)]
 struct OAuthExchangeResponse {
     access_token: String,
+    refresh_token: Option<String>,
+    expires_in: Option<u64>,
+}
+
+/// Matches the `claudeAiOauth` section Claude Code writes/reads in `~/.claude/.credentials.json`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeOAuthCredential {
+    access_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+    expires_at: u64, // Unix timestamp in **milliseconds**
+    scopes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeCredentialsFile {
+    claude_ai_oauth: ClaudeOAuthCredential,
 }
 
 const SUBSCRIPTION_TOKEN_EXPIRES_IN_SECONDS: u64 = 31_536_000;
@@ -57,10 +76,14 @@ pub fn inspect_status() -> AuthStatus {
         .unwrap_or(false);
     let oauth_token_env_present = read_non_empty_env(OAUTH_TOKEN_ENV).is_some();
     let oauth_token_file_present = oauth_token_file_path().is_file();
-    let oauth_token_present = oauth_token_env_present || oauth_token_file_present;
+    let credentials_file_valid = read_credentials_file()
+        .map(|c| !is_expired(c.claude_ai_oauth.expires_at))
+        .unwrap_or(false);
+    let oauth_token_present =
+        oauth_token_env_present || oauth_token_file_present || credentials_file_valid;
     let effective_auth_path =
         effective_auth_path(oauth_token_env_present, oauth_token_file_present);
-    let logged_in = read_logged_in_status().unwrap_or(false);
+    let logged_in = read_logged_in_status().unwrap_or(false) || credentials_file_valid;
     let auth_file_present = auth_file_path().is_file() || oauth_token_present || logged_in;
 
     let inferred_mode = match configured_mode {
@@ -91,6 +114,12 @@ pub fn inspect_status() -> AuthStatus {
 }
 
 pub fn oauth_token() -> Option<String> {
+    // Prefer the credentials file (what Claude Code reads natively) when it has a valid token.
+    if let Some(creds) = read_credentials_file() {
+        if !is_expired(creds.claude_ai_oauth.expires_at) {
+            return Some(creds.claude_ai_oauth.access_token);
+        }
+    }
     read_non_empty_env(OAUTH_TOKEN_ENV).or_else(read_oauth_token_from_file)
 }
 
@@ -152,11 +181,12 @@ fn run_docker_subscription_login(_command: PathBuf) -> Result<()> {
 
     let authorization_code = parse_authorization_code(&pasted_code, &flow.state)?;
     eprintln!("Exchanging Claude authentication code...");
-    let token = exchange_auth_code(&flow, &authorization_code)?;
-    persist_oauth_token(&token)?;
+    let response = exchange_auth_code(&flow, &authorization_code)?;
+    persist_oauth_credentials(&response)?;
     eprintln!(
-        "Saved Claude subscription token to {}.",
-        oauth_token_file_path().display()
+        "Saved Claude credentials to {} (and {}).",
+        credentials_file_path().display(),
+        oauth_token_file_path().display(),
     );
     Ok(())
 }
@@ -315,7 +345,10 @@ fn validate_oauth_state(actual: &str, expected: &str) -> Result<()> {
     }
 }
 
-fn exchange_auth_code(flow: &DockerOAuthFlow, authorization_code: &str) -> Result<String> {
+fn exchange_auth_code(
+    flow: &DockerOAuthFlow,
+    authorization_code: &str,
+) -> Result<OAuthExchangeResponse> {
     let request = oauth_code_exchange_request(flow, authorization_code);
 
     let response = oauth_client()?
@@ -324,9 +357,67 @@ fn exchange_auth_code(flow: &DockerOAuthFlow, authorization_code: &str) -> Resul
         .send()
         .context("failed to exchange Claude OAuth code")?;
 
-    let payload =
-        parse_oauth_json_response::<OAuthExchangeResponse>(response, "claude_oauth_code_exchange")?;
-    Ok(payload.access_token)
+    parse_oauth_json_response::<OAuthExchangeResponse>(response, "claude_oauth_code_exchange")
+}
+
+/// Writes credentials to both `~/.claude/.credentials.json` (what Claude Code reads natively)
+/// and `~/.claude/oauth-token` (legacy fallback via `CLAUDE_CODE_OAUTH_TOKEN` env var).
+fn persist_oauth_credentials(response: &OAuthExchangeResponse) -> Result<()> {
+    let expires_in = response
+        .expires_in
+        .unwrap_or(SUBSCRIPTION_TOKEN_EXPIRES_IN_SECONDS);
+    let expires_at_ms = now_unix_ms().saturating_add(expires_in.saturating_mul(1_000));
+
+    let creds = ClaudeCredentialsFile {
+        claude_ai_oauth: ClaudeOAuthCredential {
+            access_token: response.access_token.clone(),
+            refresh_token: response.refresh_token.clone(),
+            expires_at: expires_at_ms,
+            scopes: vec!["user:inference".to_string()],
+        },
+    };
+
+    let path = credentials_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(&creds).context("failed to serialize credentials")?;
+    std::fs::write(&path, &json).with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to secure {}", path.display()))?;
+    }
+
+    // Also keep the plain-token file so CLAUDE_CODE_OAUTH_TOKEN env var continues to work.
+    persist_oauth_token(&response.access_token)?;
+
+    Ok(())
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn is_expired(expires_at_ms: u64) -> bool {
+    // Consider expired 5 minutes early to avoid using a token right at the edge.
+    let now = now_unix_ms();
+    expires_at_ms < now.saturating_add(5 * 60 * 1_000)
+}
+
+fn credentials_file_path() -> PathBuf {
+    auth_file_path() // ~/.claude/.credentials.json — same path
+}
+
+fn read_credentials_file() -> Option<ClaudeCredentialsFile> {
+    let path = credentials_file_path();
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<ClaudeCredentialsFile>(&data).ok()
 }
 
 fn oauth_code_exchange_request<'a>(

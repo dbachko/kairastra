@@ -196,7 +196,11 @@ impl Orchestrator {
             .await?;
 
         let issues = self.tracker.fetch_candidate_issues().await?;
-        debug!(fetched = issues.len(), running = state.running.len(), "poll tick");
+        debug!(
+            fetched = issues.len(),
+            running = state.running.len(),
+            "poll tick"
+        );
         let available_slots = snapshot
             .settings
             .agent
@@ -323,6 +327,7 @@ impl Orchestrator {
                 && running.last_agent_timestamp.elapsed() >= Duration::from_millis(stall_timeout_ms)
             {
                 running.handle.abort();
+                state.claimed.remove(&issue_id);
                 retries.push((
                     issue_id.clone(),
                     running.identifier.clone(),
