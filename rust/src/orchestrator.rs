@@ -196,7 +196,11 @@ impl Orchestrator {
             .await?;
 
         let issues = self.tracker.fetch_candidate_issues().await?;
-        debug!(fetched = issues.len(), running = state.running.len(), "poll tick");
+        debug!(
+            fetched = issues.len(),
+            running = state.running.len(),
+            "poll tick"
+        );
         let available_slots = snapshot
             .settings
             .agent
