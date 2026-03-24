@@ -9,7 +9,7 @@ use chrono::Utc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::agent::AgentEventKind;
 use crate::config::{normalize_issue_state, ProviderId, Settings};
@@ -196,16 +196,24 @@ impl Orchestrator {
             .await?;
 
         let issues = self.tracker.fetch_candidate_issues().await?;
+        debug!(fetched = issues.len(), running = state.running.len(), "poll tick");
         let available_slots = snapshot
             .settings
             .agent
             .max_concurrent_agents
             .saturating_sub(state.running.len());
         if available_slots == 0 {
+            debug!("no available slots; skipping dispatch");
             return Ok(());
         }
 
         let dispatchable = select_dispatchable(snapshot, &issues, state);
+        debug!(
+            fetched = issues.len(),
+            dispatchable = dispatchable.len(),
+            available_slots,
+            "dispatch candidates"
+        );
         let mut dispatched = 0_usize;
         for issue in dispatchable {
             if dispatched >= available_slots {
@@ -461,6 +469,7 @@ impl Orchestrator {
             });
         });
 
+        info!(issue_identifier = %issue_id, provider = %provider_name, "worker started");
         state.running.insert(
             issue_id.clone(),
             RunningEntry {
@@ -1061,16 +1070,23 @@ fn issue_eligible(
         || issue.title.trim().is_empty()
         || issue.state.trim().is_empty()
     {
+        debug!(issue_identifier = %issue.identifier, "skipping: missing required fields");
         return false;
     }
 
     if !snapshot.settings.active_state(&issue.state)
         || snapshot.settings.terminal_state(&issue.state)
     {
+        debug!(
+            issue_identifier = %issue.identifier,
+            state = %issue.state,
+            "skipping: state not active"
+        );
         return false;
     }
 
     if state.claimed.contains(&issue.id) || state.running.contains_key(&issue.id) {
+        debug!(issue_identifier = %issue.identifier, "skipping: already claimed or running");
         return false;
     }
 
@@ -1080,6 +1096,11 @@ fn issue_eligible(
             .iter()
             .any(|assignee| assignee.eq_ignore_ascii_case(assignee_login))
         {
+            debug!(
+                issue_identifier = %issue.identifier,
+                required_assignee = %assignee_login,
+                "skipping: assignee filter not matched"
+            );
             return false;
         }
     }
@@ -1093,6 +1114,7 @@ fn issue_eligible(
                 .unwrap_or(true)
         })
     {
+        debug!(issue_identifier = %issue.identifier, "skipping: blocked by open dependency");
         return false;
     }
 
@@ -1104,6 +1126,14 @@ fn issue_eligible(
     let allowed = snapshot
         .settings
         .max_concurrent_agents_for_state(&issue.state);
+    if used >= allowed {
+        debug!(
+            issue_identifier = %issue.identifier,
+            used,
+            allowed,
+            "skipping: concurrency limit reached for state"
+        );
+    }
     used < allowed
 }
 
