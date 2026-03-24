@@ -1,38 +1,37 @@
 <svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <radialGradient id="markBg" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(188 142) rotate(43.2) scale(458.682 292.44)">
+    <radialGradient id="markBg" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(186 146) rotate(44.1) scale(458.987 286.065)">
       <stop stop-color="#14213D"/>
-      <stop offset="0.55" stop-color="#0B1220"/>
+      <stop offset="0.58" stop-color="#0B1220"/>
       <stop offset="1" stop-color="#040814"/>
     </radialGradient>
-    <linearGradient id="markOrbit" x1="104" y1="102" x2="400" y2="390" gradientUnits="userSpaceOnUse">
+    <linearGradient id="markRing" x1="100" y1="98" x2="408" y2="404" gradientUnits="userSpaceOnUse">
       <stop stop-color="#7DD3FC"/>
-      <stop offset="0.45" stop-color="#A78BFA"/>
+      <stop offset="0.48" stop-color="#A78BFA"/>
       <stop offset="1" stop-color="#F59E0B"/>
     </linearGradient>
-    <linearGradient id="markMetal" x1="164" y1="138" x2="314" y2="340" gradientUnits="userSpaceOnUse">
+    <linearGradient id="markK" x1="178" y1="146" x2="328" y2="352" gradientUnits="userSpaceOnUse">
       <stop stop-color="#F8FAFC"/>
       <stop offset="1" stop-color="#CBD5E1"/>
     </linearGradient>
-    <linearGradient id="markSpark" x1="320" y1="94" x2="390" y2="166" gradientUnits="userSpaceOnUse">
+    <linearGradient id="markSpark" x1="318" y1="88" x2="390" y2="162" gradientUnits="userSpaceOnUse">
       <stop stop-color="#FDE68A"/>
       <stop offset="1" stop-color="#F97316"/>
     </linearGradient>
   </defs>
   <rect x="16" y="16" width="480" height="480" rx="88" fill="url(#markBg)"/>
   <rect x="16" y="16" width="480" height="480" rx="88" stroke="#1E293B" stroke-width="4"/>
-  <circle cx="256" cy="256" r="138" stroke="url(#markOrbit)" stroke-width="16"/>
-  <circle cx="256" cy="256" r="100" stroke="#334155" stroke-width="5"/>
-  <ellipse cx="256" cy="256" rx="136" ry="74" transform="rotate(-28 256 256)" stroke="url(#markOrbit)" stroke-width="10"/>
-  <ellipse cx="256" cy="256" rx="130" ry="66" transform="rotate(34 256 256)" stroke="#7DD3FC" stroke-opacity="0.35" stroke-width="6"/>
-  <path d="M143 197C182 164 220 148 256 148C299 148 340 168 383 213" stroke="#475569" stroke-width="4.5" stroke-linecap="round"/>
-  <path d="M129 262C163 296 203 319 257 319C310 319 351 296 385 257" stroke="#334155" stroke-width="4.5" stroke-linecap="round"/>
-  <circle cx="145" cy="196" r="8" fill="#7DD3FC"/>
-  <circle cx="383" cy="213" r="8" fill="#F59E0B"/>
-  <circle cx="129" cy="261" r="6.5" fill="#A78BFA"/>
-  <path d="M206 164V348" stroke="url(#markMetal)" stroke-width="24" stroke-linecap="round"/>
-  <path d="M223 256L340 165" stroke="url(#markMetal)" stroke-width="24" stroke-linecap="round"/>
-  <path d="M223 256L347 353" stroke="url(#markMetal)" stroke-width="24" stroke-linecap="round"/>
-  <path d="M367 92L379 124L411 136L379 148L367 180L355 148L323 136L355 124L367 92Z" fill="url(#markSpark)"/>
-  <path d="M140 374C175 345 212 331 256 331C299 331 338 345 372 374" stroke="#475569" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="256" cy="256" r="154" fill="#0F172A"/>
+  <circle cx="256" cy="256" r="154" stroke="url(#markRing)" stroke-width="18"/>
+  <circle cx="256" cy="256" r="114" stroke="#334155" stroke-width="5"/>
+  <ellipse cx="256" cy="256" rx="134" ry="56" stroke="url(#markRing)" stroke-width="12"/>
+  <ellipse cx="256" cy="256" rx="134" ry="56" transform="rotate(58 256 256)" stroke="#7DD3FC" stroke-opacity="0.6" stroke-width="10"/>
+  <ellipse cx="256" cy="256" rx="134" ry="56" transform="rotate(-58 256 256)" stroke="#475569" stroke-width="9"/>
+  <circle cx="123" cy="256" r="10" fill="#A78BFA"/>
+  <circle cx="185" cy="171" r="10" fill="#7DD3FC"/>
+  <circle cx="388" cy="257" r="10" fill="#F59E0B"/>
+  <path d="M196 166V346" stroke="url(#markK)" stroke-width="28" stroke-linecap="round"/>
+  <path d="M213 256L330 168" stroke="url(#markK)" stroke-width="28" stroke-linecap="round"/>
+  <path d="M213 256L338 354" stroke="url(#markK)" stroke-width="28" stroke-linecap="round"/>
+  <path d="M365 86L377 119L410 131L377 143L365 176L353 143L320 131L353 119L365 86Z" fill="url(#markSpark)"/>
 </svg>
