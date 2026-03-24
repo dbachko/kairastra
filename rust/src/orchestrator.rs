@@ -9,7 +9,7 @@ use chrono::Utc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::agent::AgentEventKind;
 use crate::config::{normalize_issue_state, ProviderId, Settings};
@@ -1075,14 +1075,14 @@ fn issue_eligible(
         || issue.title.trim().is_empty()
         || issue.state.trim().is_empty()
     {
-        debug!(issue_identifier = %issue.identifier, "skipping: missing required fields");
+        trace!(issue_identifier = %issue.identifier, "skipping: missing required fields");
         return false;
     }
 
     if !snapshot.settings.active_state(&issue.state)
         || snapshot.settings.terminal_state(&issue.state)
     {
-        debug!(
+        trace!(
             issue_identifier = %issue.identifier,
             state = %issue.state,
             "skipping: state not active"
@@ -1091,7 +1091,7 @@ fn issue_eligible(
     }
 
     if state.claimed.contains(&issue.id) || state.running.contains_key(&issue.id) {
-        debug!(issue_identifier = %issue.identifier, "skipping: already claimed or running");
+        trace!(issue_identifier = %issue.identifier, "skipping: already claimed or running");
         return false;
     }
 
@@ -1101,7 +1101,7 @@ fn issue_eligible(
             .iter()
             .any(|assignee| assignee.eq_ignore_ascii_case(assignee_login))
         {
-            debug!(
+            trace!(
                 issue_identifier = %issue.identifier,
                 required_assignee = %assignee_login,
                 "skipping: assignee filter not matched"
@@ -1119,7 +1119,7 @@ fn issue_eligible(
                 .unwrap_or(true)
         })
     {
-        debug!(issue_identifier = %issue.identifier, "skipping: blocked by open dependency");
+        trace!(issue_identifier = %issue.identifier, "skipping: blocked by open dependency");
         return false;
     }
 
@@ -1132,7 +1132,7 @@ fn issue_eligible(
         .settings
         .max_concurrent_agents_for_state(&issue.state);
     if used >= allowed {
-        debug!(
+        trace!(
             issue_identifier = %issue.identifier,
             used,
             allowed,

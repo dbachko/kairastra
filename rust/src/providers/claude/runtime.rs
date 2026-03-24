@@ -794,6 +794,7 @@ printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude-session-1"
 printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"hello.txt","content":"hi"}}]}}'
 printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"Claude requested permissions to write to hello.txt, but you have not granted it yet."}]}}'
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-session-1","permission_denials":[{"tool_name":"Write","tool_use_id":"toolu_1"}],"result":"done"}'
+cat >/dev/null
 "#,
         )
         .unwrap();
@@ -886,6 +887,7 @@ fi
 printf '%s\n' "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"${{session_id}}\"}}"
 printf '%s\n' "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}"
 printf '%s\n' "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"${{session_id}}\",\"result\":\"ok\"}}"
+cat >/dev/null
 "#,
                 trace_file.display()
             ),
@@ -943,6 +945,7 @@ printf '%s\n' "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,
 token="${CLAUDE_CODE_OAUTH_TOKEN:-missing}"
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude-session-token"}'
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-session-token","result":"'"${token}"'"}'
+cat >/dev/null
 "#,
         )
         .unwrap();
@@ -1000,6 +1003,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 token="${ANTHROPIC_AUTH_TOKEN:-missing}"
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude-session-auth-token"}'
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-session-auth-token","result":"'"${token}"'"}'
+cat >/dev/null
 "#,
         )
         .unwrap();
