@@ -1,12 +1,16 @@
-# Symphony Rust
+# Kairastra Runtime
 
-This directory contains the current Rust implementation of Symphony for GitHub Issues and Projects
+This directory contains the current Rust implementation of Kairastra for GitHub Issues and Projects
 v2. It is the operator-facing runtime in this repo: it loads `WORKFLOW.md`, polls GitHub, creates
 per-issue workspaces, launches the configured agent provider, and keeps the issue lifecycle in sync
 with the runtime.
 
 Use this README as the practical setup and operations guide. The normative behavior still lives in
 [`SPEC.md`](../SPEC.md).
+
+Public docs in this repository use `Kairastra` as the product name. Commands, file names, service
+units, binaries, and env vars may still use historical `symphony` names until the runtime itself is
+renamed.
 
 ## What it does
 
@@ -73,7 +77,7 @@ Additional operator docs:
 
 ## GitHub token requirements
 
-For `tracker.mode: projects_v2`, Symphony needs a GitHub token that can read and usually mutate the
+For `tracker.mode: projects_v2`, Kairastra needs a GitHub token that can read and usually mutate the
 target Project v2.
 
 For a user-owned Project v2 like `https://github.com/users/<user>/projects/<number>`:
@@ -85,7 +89,7 @@ The reason is GitHub does not support fine-grained PATs for Projects owned by a 
 the Projects API docs require `read:project` for queries or `project` for queries plus mutations.
 GitHub also documents `repo` for command-line repository access.
 
-Recommended classic PAT scopes for Symphony:
+Recommended classic PAT scopes for Kairastra:
 
 - `project`
 - `repo` if the target repository is private
@@ -109,14 +113,14 @@ Creation flow:
 2. Open `Tokens (classic)`
 3. Click `Generate new token (classic)`
 4. Select:
-   - `project` for full Symphony project-state automation
+   - `project` for full Kairastra project-state automation
    - `repo` if the repository is private
    - `workflow` if you want agent runs to be able to push workflow-file changes
 
 Notes:
 
 - If you only want to test read-only project access, `read:project` can replace `project`.
-- Symphony moves issues between project states, so `project` is the practical choice for end-to-end use.
+- Kairastra moves issues between project states, so `project` is the practical choice for end-to-end use.
 - Without `workflow`, pushes that modify `.github/workflows/*` will be rejected by GitHub even if normal code pushes succeed.
 - If you are accessing org resources protected by SSO, GitHub may require SSO authorization for the token after creation.
 
@@ -126,7 +130,7 @@ References:
 - GitHub token creation and `repo` scope guidance: https://docs.github.com/en/enterprise-server%403.19/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
 - GitHub note that fine-grained PATs do not support user-owned Projects: https://docs.github.com/ko/enterprise-server%403.14/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
 
-Symphony currently assumes a classic PAT for user-owned Project v2 workflows. If you want to stay
+Kairastra currently assumes a classic PAT for user-owned Project v2 workflows. If you want to stay
 on a fine-grained PAT, use `issues_only` mode or move the project to an organization and verify the
 token policy there.
 
@@ -191,7 +195,7 @@ still available when you want it. You can skip the picker with
 `make docker-login PROVIDER=codex` or `make docker-login PROVIDER=claude`.
 For Claude subscription login in Docker, the command prints the OAuth URL and then renders a
 masked terminal prompt named `Paste Authentication Code` so you can paste the browser code back
-into the same terminal session. After submit, Symphony prints progress lines while it waits for
+into the same terminal session. After submit, Kairastra prints progress lines while it waits for
 Claude to finish the login handshake.
 Docker also sets `SYMPHONY_DEPLOY_MODE=docker`, so `doctor` inside the container validates Docker
 prerequisites instead of looking for `systemctl`.
@@ -199,7 +203,7 @@ prerequisites instead of looking for `systemctl`.
 ## Guided setup
 
 The setup flow is intentionally narrow: it does not try to turn a VPS into a full workstation. It
-collects only the information needed to run Symphony safely.
+collects only the information needed to run Kairastra safely.
 
 Interactive mode:
 
@@ -306,7 +310,7 @@ This reports:
 - configured auth mode
 - inferred auth mode
 - whether the provider CLI is available locally
-- whether the provider's local auth state exists (`~/.codex` for Codex; for Claude, Symphony treats `claude auth status --json` plus a saved `~/.claude/oauth-token` as authoritative, and the documented Linux/Windows credential path is `~/.claude/.credentials.json`)
+- whether the provider's local auth state exists (`~/.codex` for Codex; for Claude, Kairastra treats `claude auth status --json` plus a saved `~/.claude/oauth-token` as authoritative, and the documented Linux/Windows credential path is `~/.claude/.credentials.json`)
 - whether the matching API key env var is set (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`)
 - a reminder about the matching Docker auth volume inside the container
 
@@ -321,7 +325,7 @@ cargo run -- auth menu
 ```
 
 Use `subscription` for device/browser or account login and `api-key` when the matching provider API
-key is already set in the current shell. In Docker, Claude subscription login now uses Symphony's own
+key is already set in the current shell. In Docker, Claude subscription login now uses Kairastra's own
 OAuth flow: it prints the Claude authorize URL, prompts for the pasted authentication code, exchanges
 that code using Claude Code's JSON PKCE token exchange, requests the same 1-year subscription token
 expiry that `claude setup-token` uses, and persists the returned Claude subscription token in the
@@ -346,7 +350,7 @@ Important details:
 - Codex auth persists in the `symphony_rust_codex` volume and is linked into the runtime home.
 - Claude auth persists in the `symphony_rust_claude` volume and is linked into the runtime home.
 - a saved Claude long-lived OAuth token is stored at `~/.claude/oauth-token` inside that shared auth volume.
-- the container now runs Symphony as a non-root `symphony` user so Claude's bypass-permissions mode works.
+- the container now runs Kairastra as a non-root `symphony` user so Claude's bypass-permissions mode works.
 - Claude Code is installed from Anthropic's native Linux installer inside the image rather than the npm package.
 - Docker now starts a per-container D-Bus session plus a headless GNOME keyring for the `symphony` user so Claude subscription auth has a Linux secret store available in headless environments.
 - the headless keyring lives under the persisted runtime home volume; by default it is unlocked with an empty password inside the container session, and you can override that by setting `SYMPHONY_CLAUDE_KEYRING_PASSWORD`.
@@ -354,7 +358,7 @@ Important details:
   fields resolve inside the container at runtime.
 - `CODEX_AUTH_MODE=subscription` plus `make docker-login PROVIDER=codex` is the intended Codex subscription/device-auth path.
 - `CODEX_AUTH_MODE=api_key` plus `OPENAI_API_KEY` is the intended API-key path.
-- `CLAUDE_AUTH_MODE=subscription` plus `make docker-login PROVIDER=claude` is the intended Claude subscription path; in Docker Symphony drives the browser OAuth flow itself and persists the resulting long-lived subscription token into the shared Claude auth volume.
+- `CLAUDE_AUTH_MODE=subscription` plus `make docker-login PROVIDER=claude` is the intended Claude subscription path; in Docker Kairastra drives the browser OAuth flow itself and persists the resulting long-lived subscription token into the shared Claude auth volume.
 - `CLAUDE_AUTH_MODE=api_key` plus `ANTHROPIC_API_KEY` remains available when you want Anthropic Console billing instead of a Claude subscription login.
 - `CLAUDE_CODE_OAUTH_TOKEN` is also supported directly when you want to pre-seed Docker/VPS auth from a token generated elsewhere.
 
@@ -368,7 +372,7 @@ Available make targets:
 - `make docker-login PROVIDER=codex` goes straight to the Codex login flow
 - `make docker-login PROVIDER=claude` goes straight to the Claude subscription login flow
 - the Claude Docker login helper prints a browser authorize URL directly and never drops you into Claude's raw terminal TUI
-- after you paste the browser auth code, Symphony exchanges it directly and either saves the token or returns the exact HTTP error body from Anthropic instead of hanging
+- after you paste the browser auth code, Kairastra exchanges it directly and either saves the token or returns the exact HTTP error body from Anthropic instead of hanging
 
 ## Native VPS deployment details
 
@@ -414,7 +418,7 @@ environment variables such as:
 - `SYMPHONY_CODEX_REASONING_EFFORT`
 - `SYMPHONY_CODEX_FAST`
 
-If you provide `SYMPHONY_GITHUB_PROJECT_URL` in the setup flow, Symphony can derive the GitHub
+If you provide `SYMPHONY_GITHUB_PROJECT_URL` in the setup flow, Kairastra can derive the GitHub
 owner and Project v2 number automatically for URLs like
 `https://github.com/users/<owner>/projects/<number>` and
 `https://github.com/orgs/<owner>/projects/<number>`.
@@ -433,7 +437,7 @@ Provider runtime controls:
 - `agent.provider` selects the default agent backend for the workflow. Supported values are
   `codex` and `claude`.
 - label overrides such as `agent:claude` can route individual issues to a different configured provider.
-- `providers.codex.model` sets the model Symphony requests for the thread and subsequent turns.
+- `providers.codex.model` sets the model Kairastra requests for the thread and subsequent turns.
 - `providers.codex.reasoning_effort` controls thinking depth. Valid values are `none`, `minimal`, `low`,
   `medium`, `high`, and `xhigh`.
 - `providers.codex.fast` is a boolean. `true` maps to Codex `serviceTier=fast`; `false` maps to
@@ -443,7 +447,7 @@ Provider runtime controls:
 ## GitHub bootstrap helper
 
 From the repo root, `scripts/bootstrap_github_project.py` can converge a GitHub Project and repo
-toward the Symphony workflow shape:
+toward the Kairastra workflow shape:
 
 ```bash
 python3 scripts/bootstrap_github_project.py --dry-run
@@ -460,11 +464,11 @@ It ensures:
 
 - the expected `Status` options
 - a numeric `Priority` field
-- a default label pack for Symphony-oriented filtering
+- a default label pack for Kairastra-oriented filtering
 
 ## Day-2 operations
 
-Useful commands once Symphony is running:
+Useful commands once Kairastra is running:
 
 ```bash
 cargo run -- doctor --workflow /path/to/WORKFLOW.md --env-file /path/to/envfile

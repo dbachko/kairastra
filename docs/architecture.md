@@ -1,6 +1,7 @@
-# Architecture
+# Kairastra Architecture
 
-This repository currently ships a Rust implementation of Symphony for GitHub Issues and Projects v2.
+Kairastra is this repository's GitHub-native implementation of the Symphony orchestration model. The
+current shipped runtime is Rust-based and targets GitHub Issues plus Projects v2.
 
 ## Runtime shape
 
