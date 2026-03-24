@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::agent::AgentEvent;
 use crate::github::{GitHubTracker, OpenPullRequest, PullRequestChecksSummary, Tracker};
@@ -50,9 +50,11 @@ pub async fn run_issue(
     attempt: Option<u32>,
     event_tx: UnboundedSender<WorkerMessage>,
 ) -> Result<WorkerOutcome> {
+    info!(issue_identifier = %issue.identifier, "ensuring workspace");
     let workspace = workspace::ensure_workspace(&snapshot.settings, &issue)
         .await
         .with_context(|| format!("failed to prepare workspace for {}", issue.identifier))?;
+    info!(issue_identifier = %issue.identifier, workspace = %workspace.path.display(), "workspace ready");
 
     let _ = event_tx.send(WorkerMessage::RuntimeInfo {
         issue_id: issue.id.clone(),
@@ -60,11 +62,15 @@ pub async fn run_issue(
         workspace_path: workspace.path.clone(),
     });
 
+    info!(issue_identifier = %issue.identifier, "running before_run hook");
     workspace::run_before_run_hook(&snapshot.settings, &workspace.path, &issue).await?;
+    info!(issue_identifier = %issue.identifier, "before_run hook complete");
 
     let result = async {
+        info!(issue_identifier = %issue.identifier, "starting provider session");
         let mut session =
             providers::start_session(&snapshot.settings, tracker.clone(), &workspace.path).await?;
+        info!(issue_identifier = %issue.identifier, "provider session started");
 
         let mut current_issue = issue.clone();
         let workpad_body = render_workpad_bootstrap(
@@ -78,6 +84,7 @@ pub async fn run_issue(
             .await?;
 
         for turn_number in 1..=snapshot.settings.agent.max_turns {
+            info!(issue_identifier = %issue.identifier, turn = turn_number, "running agent turn");
             let prompt = if turn_number == 1 {
                 build_prompt(&snapshot, &current_issue, attempt)?
             } else {
@@ -108,6 +115,7 @@ pub async fn run_issue(
                 .await?;
             drop(forward_tx);
             let _ = forwarder.await;
+            info!(issue_identifier = %issue.identifier, turn = turn_number, "agent turn complete");
 
             // The selected agent may have updated the persistent workpad comment during the turn.
             // Refresh it before adding Symphony's runtime section so we never clobber
