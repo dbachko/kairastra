@@ -80,6 +80,7 @@ Current built-in providers:
 
 - `codex`
 - `claude`
+- `gemini`
 
 ## Auth naming
 

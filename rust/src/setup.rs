@@ -35,6 +35,7 @@ struct SetupValues {
     provider_config: ProviderSetupConfig,
     github_token: String,
     anthropic_api_key: String,
+    gemini_api_key: String,
     openai_api_key: String,
     rust_log: String,
     binary_path: String,
@@ -338,6 +339,9 @@ fn collect_values(
         .expect("selected provider config should be present");
     let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
     let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let gemini_api_key = std::env::var("GEMINI_API_KEY")
+        .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+        .unwrap_or_default();
     let openai_api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let binary_path = detect_binary_path(explicit_binary_path);
@@ -358,6 +362,7 @@ fn collect_values(
         provider_config,
         github_token,
         anthropic_api_key,
+        gemini_api_key,
         openai_api_key,
         rust_log,
         binary_path,
@@ -858,6 +863,7 @@ fn render_env_file(mode: DeployMode, values: &SetupValues, workflow_path: &Path)
 KAIRASTRA_DEPLOY_MODE=native
 GITHUB_TOKEN={github_token}
 ANTHROPIC_API_KEY={anthropic_api_key}
+GEMINI_API_KEY={gemini_api_key}
 OPENAI_API_KEY={openai_api_key}
 WORKFLOW_PATH={workflow_path}
 KAIRASTRA_WORKSPACE_ROOT={workspace_root}
@@ -873,6 +879,7 @@ RUST_LOG={rust_log}
 "#,
             github_token = values.github_token,
             anthropic_api_key = values.anthropic_api_key,
+            gemini_api_key = values.gemini_api_key,
             openai_api_key = values.openai_api_key,
             workflow_path = workflow_abs,
             workspace_root = values.workspace_root,
@@ -891,6 +898,7 @@ RUST_LOG={rust_log}
 KAIRASTRA_DEPLOY_MODE=docker
 GITHUB_TOKEN={github_token}
 ANTHROPIC_API_KEY={anthropic_api_key}
+GEMINI_API_KEY={gemini_api_key}
 OPENAI_API_KEY={openai_api_key}
 WORKFLOW_FILE={workflow_path}
 SEED_REPO_PATH={seed_repo}
@@ -906,6 +914,7 @@ KAIRASTRA_AGENT_ASSIGNEE={assignee_login}
 "#,
             github_token = values.github_token,
             anthropic_api_key = values.anthropic_api_key,
+            gemini_api_key = values.gemini_api_key,
             openai_api_key = values.openai_api_key,
             workflow_path = workflow_abs,
             seed_repo = values.seed_repo,
@@ -962,6 +971,7 @@ mod tests {
     use crate::deploy::DeployMode;
     use crate::providers::claude::setup::ClaudeSetupConfig;
     use crate::providers::codex::setup::CodexSetupConfig;
+    use crate::providers::gemini::setup::GeminiSetupConfig;
     use crate::providers::ProviderSetupConfig;
     use std::fs;
     use std::path::Path;
@@ -982,6 +992,11 @@ mod tests {
                     model: "sonnet".to_string(),
                     reasoning_effort: "high".to_string(),
                 }),
+                ProviderSetupConfig::Gemini(GeminiSetupConfig {
+                    auth_mode: crate::auth::AuthMode::Subscription,
+                    model: "gemini-2.5-pro".to_string(),
+                    approval_mode: "yolo".to_string(),
+                }),
             ],
             github_owner: "openai".to_string(),
             github_repo: "kairastra".to_string(),
@@ -1001,6 +1016,7 @@ mod tests {
             }),
             github_token: String::new(),
             anthropic_api_key: String::new(),
+            gemini_api_key: String::new(),
             openai_api_key: String::new(),
             rust_log: "info".to_string(),
             binary_path: "/usr/local/bin/kairastra".to_string(),
@@ -1016,10 +1032,13 @@ mod tests {
         assert!(rendered.contains("providers:"));
         assert!(rendered.contains("  codex:"));
         assert!(rendered.contains("  claude:"));
+        assert!(rendered.contains("  gemini:"));
         assert!(rendered.contains("model: $KAIRASTRA_CODEX_MODEL"));
         assert!(rendered.contains("model: $KAIRASTRA_CLAUDE_MODEL"));
+        assert!(rendered.contains("model: $KAIRASTRA_GEMINI_MODEL"));
         assert!(rendered.contains("reasoning_effort: $KAIRASTRA_CODEX_REASONING_EFFORT"));
         assert!(rendered.contains("reasoning_effort: $KAIRASTRA_CLAUDE_REASONING_EFFORT"));
+        assert!(rendered.contains("approval_mode: $KAIRASTRA_GEMINI_APPROVAL_MODE"));
         assert!(rendered.contains("fast: $KAIRASTRA_CODEX_FAST"));
         assert!(rendered.contains("for support_dir in .codex .github; do"));
         assert!(
@@ -1051,6 +1070,7 @@ mod tests {
         assert!(rendered.contains("for support_dir in .codex .github; do"));
         assert!(rendered.contains("  codex:"));
         assert!(rendered.contains("  claude:"));
+        assert!(rendered.contains("  gemini:"));
         assert!(rendered.contains("model: $KAIRASTRA_CLAUDE_MODEL"));
         assert!(rendered.contains("reasoning_effort: $KAIRASTRA_CLAUDE_REASONING_EFFORT"));
     }
@@ -1070,6 +1090,9 @@ mod tests {
         assert!(rendered.contains("CLAUDE_AUTH_MODE=api_key"));
         assert!(rendered.contains("KAIRASTRA_CLAUDE_MODEL=sonnet"));
         assert!(rendered.contains("KAIRASTRA_CLAUDE_REASONING_EFFORT=high"));
+        assert!(rendered.contains("GEMINI_AUTH_MODE=subscription"));
+        assert!(rendered.contains("KAIRASTRA_GEMINI_MODEL=gemini-2.5-pro"));
+        assert!(rendered.contains("KAIRASTRA_GEMINI_APPROVAL_MODE=yolo"));
     }
 
     #[test]

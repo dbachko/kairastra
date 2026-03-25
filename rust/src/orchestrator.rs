@@ -1318,6 +1318,7 @@ fn classify_blocked_worker_failure(provider: &str, error: &str) -> Option<Blocke
         "Run Claude in a non-root environment or change `providers.claude.permission_mode` / `approval_policy` so Docker does not request bypass permissions, then move the issue back to `Todo` or `In Progress`.".to_string()
     } else if normalized.contains("failed to launch claude code")
         || normalized.contains("failed to launch codex app-server")
+        || normalized.contains("failed to launch gemini cli")
         || normalized.contains("no such file or directory")
         || normalized.contains("command not found")
     {
@@ -1399,6 +1400,7 @@ fn provider_display_name(provider: &str) -> &'static str {
     match provider {
         "claude" => "Claude",
         "codex" => "Codex",
+        "gemini" => "Gemini",
         _ => "provider",
     }
 }

@@ -5,7 +5,7 @@ PROVIDER ?=
 
 DOCKER_COMPOSE := docker compose -f $(COMPOSE_FILE) --env-file $(ENV_FILE)
 
-.PHONY: docker-build docker-up docker-down docker-logs docker-login docker-login-codex docker-login-claude
+.PHONY: docker-build docker-up docker-down docker-logs docker-login docker-login-codex docker-login-claude docker-login-gemini
 
 docker-build:
 	$(DOCKER_COMPOSE) build
@@ -31,3 +31,6 @@ docker-login-codex:
 
 docker-login-claude:
 	$(MAKE) docker-login PROVIDER=claude
+
+docker-login-gemini:
+	$(MAKE) docker-login PROVIDER=gemini

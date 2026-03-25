@@ -3,11 +3,13 @@ set -euo pipefail
 
 codex_auth_mode="${CODEX_AUTH_MODE:-auto}"
 claude_auth_mode="${CLAUDE_AUTH_MODE:-auto}"
+gemini_auth_mode="${GEMINI_AUTH_MODE:-auto}"
 kairastra_user="${KAIRASTRA_USER:-kairastra}"
 kairastra_home="${KAIRASTRA_HOME:-/home/kairastra}"
 workspace_root="${KAIRASTRA_WORKSPACE_ROOT:-/workspaces}"
 codex_auth_dir="/var/lib/kairastra-auth/codex"
 claude_auth_dir="/var/lib/kairastra-auth/claude"
+gemini_auth_dir="/var/lib/kairastra-auth/gemini"
 claude_oauth_token_file="$claude_auth_dir/oauth-token"
 
 case "$codex_auth_mode" in
@@ -26,6 +28,14 @@ case "$claude_auth_mode" in
     ;;
 esac
 
+case "$gemini_auth_mode" in
+  auto|api_key|subscription) ;;
+  *)
+    echo "Unsupported GEMINI_AUTH_MODE='$gemini_auth_mode' (expected auto|api_key|subscription)" >&2
+    exit 1
+    ;;
+esac
+
 run_as_kairastra() {
   HOME="$kairastra_home" \
   USER="$kairastra_user" \
@@ -35,7 +45,7 @@ run_as_kairastra() {
 }
 
 ensure_runtime_home() {
-  mkdir -p "$kairastra_home" "$workspace_root" "$codex_auth_dir" "$claude_auth_dir"
+  mkdir -p "$kairastra_home" "$workspace_root" "$codex_auth_dir" "$claude_auth_dir" "$gemini_auth_dir"
   mkdir -p "$kairastra_home/.local/bin"
 
   if [[ ! -e "$kairastra_home/.codex" ]]; then
@@ -46,6 +56,10 @@ ensure_runtime_home() {
     ln -s "$claude_auth_dir" "$kairastra_home/.claude"
   fi
 
+  if [[ ! -e "$kairastra_home/.gemini" ]]; then
+    ln -s "$gemini_auth_dir" "$kairastra_home/.gemini"
+  fi
+
   if [[ ! -e "$kairastra_home/.claude.json" ]]; then
     ln -s "$claude_auth_dir/.claude.json" "$kairastra_home/.claude.json"
   fi
@@ -54,7 +68,8 @@ ensure_runtime_home() {
     "$workspace_root" \
     "$kairastra_home" \
     "$codex_auth_dir" \
-    "$claude_auth_dir"
+    "$claude_auth_dir" \
+    "$gemini_auth_dir"
 
   if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
     printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" > "$claude_oauth_token_file"

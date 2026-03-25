@@ -26,6 +26,7 @@ At minimum:
 - the provider CLI or CLIs you intend to route to available in `PATH`:
   - `codex` for Codex
   - `claude` for Claude Code
+  - `gemini` for Gemini CLI
 - GitHub token with access to the target repo and project
 - A `WORKFLOW.md` file or a generated equivalent
 
@@ -155,6 +156,9 @@ cargo run -- auth status
 # For Claude instead:
 # cargo run -- auth --provider claude login --mode subscription
 # cargo run -- auth --provider claude status
+# For Gemini instead:
+# cargo run -- auth --provider gemini login --mode subscription
+# cargo run -- auth --provider gemini status
 ```
 
 If you use API-key auth:
@@ -165,6 +169,9 @@ cargo run -- auth login --mode api-key
 # For Claude instead:
 # export ANTHROPIC_API_KEY=...
 # cargo run -- auth --provider claude login --mode api-key
+# For Gemini instead:
+# export GEMINI_API_KEY=...
+# cargo run -- auth --provider gemini login --mode api-key
 ```
 
 ### Docker
@@ -186,9 +193,10 @@ make docker-login
 ```
 
 `make docker-login` opens a provider picker that shows which providers are already ready and which
-still need action. Both Codex and Claude can use subscription login in Docker, and API-key auth is
-still available when you want it. You can skip the picker with
-`make docker-login PROVIDER=codex` or `make docker-login PROVIDER=claude`.
+still need action. Codex, Claude, and Gemini can use subscription login in Docker, and API-key auth
+is still available when you want it. You can skip the picker with
+`make docker-login PROVIDER=codex`, `make docker-login PROVIDER=claude`, or
+`make docker-login PROVIDER=gemini`.
 For Claude subscription login in Docker, the command prints the OAuth URL and then renders a
 masked terminal prompt named `Paste Authentication Code` so you can paste the browser code back
 into the same terminal session. After submit, Kairastra prints progress lines while it waits for
@@ -241,6 +249,8 @@ What setup asks for:
 - whether to force Codex fast mode on
 - optional Claude model override
 - optional Claude thinking effort override: `low`, `medium`, or `high`
+- optional Gemini model override
+- Gemini approval mode override: `default`, `auto_edit`, `yolo`, or `plan`
 
 What setup writes:
 
@@ -289,15 +299,16 @@ Expected behavior:
 
 Supported runtime modes:
 
-- `auto`: prefer the matching provider API key env var when present (`OPENAI_API_KEY` for Codex, `ANTHROPIC_API_KEY` for Claude); otherwise rely on persisted login state or a saved Claude subscription token
+- `auto`: prefer the matching provider API key env var when present (`OPENAI_API_KEY` for Codex, `ANTHROPIC_API_KEY` for Claude, `GEMINI_API_KEY` for Gemini); otherwise rely on persisted login state or a saved Claude subscription token
 - `api_key`: require the matching provider API key env var
-- `subscription`: use persisted device-auth, account login state, or a saved Claude subscription token only
+- `subscription`: use persisted device-auth, account login state, saved Gemini login state, or a saved Claude subscription token only
 
 Status command:
 
 ```bash
 cargo run -- auth status
 cargo run -- auth --provider claude status
+cargo run -- auth --provider gemini status
 ```
 
 This reports:
@@ -306,8 +317,8 @@ This reports:
 - configured auth mode
 - inferred auth mode
 - whether the provider CLI is available locally
-- whether the provider's local auth state exists (`~/.codex` for Codex; for Claude, Kairastra treats `claude auth status --json` plus a saved `~/.claude/oauth-token` as authoritative, and the documented Linux/Windows credential path is `~/.claude/.credentials.json`)
-- whether the matching API key env var is set (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`)
+- whether the provider's local auth state exists (`~/.codex` for Codex; `~/.gemini/oauth_creds.json` for Gemini; for Claude, Kairastra treats `claude auth status --json` plus a saved `~/.claude/oauth-token` as authoritative, and the documented Linux/Windows credential path is `~/.claude/.credentials.json`)
+- whether the matching API key env var is set (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`)
 - a reminder about the matching Docker auth volume inside the container
 
 Login commands:
@@ -317,6 +328,8 @@ cargo run -- auth login --mode subscription
 cargo run -- auth login --mode api-key
 cargo run -- auth --provider claude login --mode subscription
 cargo run -- auth --provider claude login --mode api-key
+cargo run -- auth --provider gemini login --mode subscription
+cargo run -- auth --provider gemini login --mode api-key
 cargo run -- auth menu
 ```
 
@@ -345,6 +358,7 @@ Important details:
 - runtime home state persists in the `kairastra_home` volume.
 - Codex auth persists in the `kairastra_codex` volume and is linked into the runtime home.
 - Claude auth persists in the `kairastra_claude` volume and is linked into the runtime home.
+- Gemini auth persists in the `kairastra_gemini` volume and is linked into the runtime home.
 - a saved Claude long-lived OAuth token is stored at `~/.claude/oauth-token` inside that shared auth volume.
 - the container now runs Kairastra as a non-root `kairastra` user so Claude's bypass-permissions mode works.
 - Claude Code is installed from Anthropic's native Linux installer inside the image rather than the npm package.
@@ -356,6 +370,8 @@ Important details:
 - `CODEX_AUTH_MODE=api_key` plus `OPENAI_API_KEY` is the intended API-key path.
 - `CLAUDE_AUTH_MODE=subscription` plus `make docker-login PROVIDER=claude` is the intended Claude subscription path; in Docker Kairastra drives the browser OAuth flow itself and persists the resulting long-lived subscription token into the shared Claude auth volume.
 - `CLAUDE_AUTH_MODE=api_key` plus `ANTHROPIC_API_KEY` remains available when you want Anthropic Console billing instead of a Claude subscription login.
+- `GEMINI_AUTH_MODE=subscription` plus `make docker-login PROVIDER=gemini` is the intended Gemini Google-login path.
+- `GEMINI_AUTH_MODE=api_key` plus `GEMINI_API_KEY` remains available when you want non-interactive Gemini API auth.
 - `CLAUDE_CODE_OAUTH_TOKEN` is also supported directly when you want to pre-seed Docker/VPS auth from a token generated elsewhere.
 
 Available make targets:
@@ -367,6 +383,7 @@ Available make targets:
 - `make docker-login` opens an interactive provider picker and then runs the matching login flow when needed
 - `make docker-login PROVIDER=codex` goes straight to the Codex login flow
 - `make docker-login PROVIDER=claude` goes straight to the Claude subscription login flow
+- `make docker-login PROVIDER=gemini` goes straight to the Gemini login flow
 - the Claude Docker login helper prints a browser authorize URL directly and never drops you into Claude's raw terminal TUI
 - after you paste the browser auth code, Kairastra exchanges it directly and either saves the token or returns the exact HTTP error body from Anthropic instead of hanging
 
@@ -413,6 +430,8 @@ environment variables such as:
 - `KAIRASTRA_CODEX_MODEL`
 - `KAIRASTRA_CODEX_REASONING_EFFORT`
 - `KAIRASTRA_CODEX_FAST`
+- `KAIRASTRA_GEMINI_MODEL`
+- `KAIRASTRA_GEMINI_APPROVAL_MODE`
 
 If you provide `KAIRASTRA_GITHUB_PROJECT_URL` in the setup flow, Kairastra can derive the GitHub
 owner and Project v2 number automatically for URLs like
@@ -431,14 +450,16 @@ prompt used in this repo.
 Provider runtime controls:
 
 - `agent.provider` selects the default agent backend for the workflow. Supported values are
-  `codex` and `claude`.
-- label overrides such as `agent:claude` can route individual issues to a different configured provider.
+  `codex`, `claude`, and `gemini`.
+- label overrides such as `agent:claude` or `agent:gemini` can route individual issues to a different configured provider.
 - `providers.codex.model` sets the model Kairastra requests for the thread and subsequent turns.
 - `providers.codex.reasoning_effort` controls thinking depth. Valid values are `none`, `minimal`, `low`,
   `medium`, `high`, and `xhigh`.
 - `providers.codex.fast` is a boolean. `true` maps to Codex `serviceTier=fast`; `false` maps to
   `serviceTier=flex`.
 - `providers.claude.model` and `providers.claude.reasoning_effort` control Claude Code selection and depth.
+- `providers.gemini.model` sets the Gemini model override.
+- `providers.gemini.approval_mode` controls Gemini CLI approval handling. Valid values are `default`, `auto_edit`, `yolo`, and `plan`.
 
 ## GitHub bootstrap helper
 

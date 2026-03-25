@@ -190,6 +190,7 @@ fn provider_display_name(provider: &str) -> &'static str {
     match provider {
         "claude" => "Claude Code",
         "codex" => "Codex",
+        "gemini" => "Gemini CLI",
         _ => "Provider",
     }
 }
@@ -198,6 +199,7 @@ fn api_key_env_name(provider: &str) -> &'static str {
     match provider {
         "claude" => "ANTHROPIC_API_KEY",
         "codex" => "OPENAI_API_KEY",
+        "gemini" => "GEMINI_API_KEY",
         _ => "API_KEY",
     }
 }

@@ -12,12 +12,14 @@ FROM node:24-bookworm-slim AS runtime
 
 ARG CODEX_CLI_VERSION=0.114.0
 ARG CLAUDE_CODE_VERSION=2.1.81
+ARG GEMINI_CLI_VERSION=0.35.0
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates curl dbus dbus-user-session docker-compose docker.io gcc gh git gnome-keyring gosu jq libc6-dev libsecret-1-0 libsecret-tools make openssh-client pkg-config rsync \
     && npm install -g "@openai/codex@${CODEX_CLI_VERSION}" \
+    && npm install -g "@google/gemini-cli@${GEMINI_CLI_VERSION}" \
     && claude_bucket="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases" \
     && case "$(dpkg --print-architecture)" in \
         amd64) claude_arch="x64" ;; \
@@ -41,7 +43,7 @@ RUN apt-get update \
     && echo "${claude_checksum}  /tmp/claude" | sha256sum -c - \
     && install -m 0755 /tmp/claude /usr/local/bin/claude \
     && useradd --create-home --shell /bin/bash kairastra \
-    && mkdir -p /home/kairastra /var/lib/kairastra-auth/codex /var/lib/kairastra-auth/claude /workspaces \
+    && mkdir -p /home/kairastra /var/lib/kairastra-auth/codex /var/lib/kairastra-auth/claude /var/lib/kairastra-auth/gemini /workspaces \
     && chown -R kairastra:kairastra /home/kairastra /var/lib/kairastra-auth /workspaces \
     && rm -f /tmp/claude \
     && rm -rf /var/lib/apt/lists/*

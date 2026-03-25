@@ -22,7 +22,7 @@ This repository contains the Rust implementation of Kairastra for GitHub:
 
 - GitHub Issues plus Projects v2 as the work queue
 - per-issue isolated workspaces
-- multi-provider agent support (`codex` and `claude`)
+- multi-provider agent support (`codex`, `claude`, and `gemini`)
 - issue workpad comments, PR discovery, and review handoff logic
 - operator commands for setup, doctor checks, and auth bootstrap
 
