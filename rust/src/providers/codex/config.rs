@@ -197,24 +197,24 @@ providers:
 
     #[test]
     fn resolves_env_backed_model() {
-        env::set_var("SYMPHONY_CODEX_MODEL", "gpt-5.4");
-        let settings = settings("    model: $SYMPHONY_CODEX_MODEL");
+        env::set_var("KAIRASTRA_CODEX_MODEL", "gpt-5.4");
+        let settings = settings("    model: $KAIRASTRA_CODEX_MODEL");
         let config = load(&settings).unwrap();
         assert_eq!(config.model.as_deref(), Some("gpt-5.4"));
     }
 
     #[test]
     fn resolves_env_backed_reasoning_effort() {
-        env::set_var("SYMPHONY_CODEX_REASONING_EFFORT", "high");
-        let settings = settings("    reasoning_effort: $SYMPHONY_CODEX_REASONING_EFFORT");
+        env::set_var("KAIRASTRA_CODEX_REASONING_EFFORT", "high");
+        let settings = settings("    reasoning_effort: $KAIRASTRA_CODEX_REASONING_EFFORT");
         let config = load(&settings).unwrap();
         assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]
     fn resolves_env_backed_fast_flag() {
-        env::set_var("SYMPHONY_CODEX_FAST", "true");
-        let settings = settings("    fast: $SYMPHONY_CODEX_FAST");
+        env::set_var("KAIRASTRA_CODEX_FAST", "true");
+        let settings = settings("    fast: $KAIRASTRA_CODEX_FAST");
         let config = load(&settings).unwrap();
         assert_eq!(config.fast, Some(true));
     }

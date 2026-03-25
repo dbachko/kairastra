@@ -16,7 +16,7 @@ pub const AGENT_WORKPAD_HEADER: &str = "## Agent Workpad";
 pub const CODEX_WORKPAD_HEADER: &str = "## Codex Workpad";
 pub const CLAUDE_WORKPAD_HEADER: &str = "## Claude Workpad";
 pub const AGENT_BOOTSTRAP_NOTE: &str =
-    "Bootstrap created by Symphony runtime before the first agent turn.";
+    "Bootstrap created by Kairastra runtime before the first agent turn.";
 
 pub fn workpad_header(provider: &str) -> &'static str {
     match provider {

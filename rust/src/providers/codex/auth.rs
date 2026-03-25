@@ -10,7 +10,7 @@ pub const COMMAND_NAME: &str = "codex";
 const AUTH_DIR_NAME: &str = ".codex";
 const AUTH_MODE_ENV: &str = "CODEX_AUTH_MODE";
 const DOCKER_VOLUME_HINT: &str =
-    "Docker mode persists Codex auth through the symphony_rust_home and symphony_rust_codex volumes mounted for the non-root runtime user.";
+    "Docker mode persists Codex auth through the kairastra_home and kairastra_codex volumes mounted for the non-root runtime user.";
 
 pub fn inspect_status() -> AuthStatus {
     let configured_mode = AuthMode::from_env_var(AUTH_MODE_ENV);
@@ -93,7 +93,7 @@ pub fn run_login(mode: AuthMode) -> Result<()> {
 
 fn running_in_docker() -> bool {
     matches!(
-        std::env::var("SYMPHONY_DEPLOY_MODE"),
+        std::env::var("KAIRASTRA_DEPLOY_MODE"),
         Ok(value) if value.trim().eq_ignore_ascii_case("docker")
     )
 }
@@ -117,10 +117,10 @@ mod tests {
     #[test]
     fn detects_docker_mode_from_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("SYMPHONY_DEPLOY_MODE", "docker");
+        std::env::set_var("KAIRASTRA_DEPLOY_MODE", "docker");
         assert!(running_in_docker());
-        std::env::set_var("SYMPHONY_DEPLOY_MODE", "native");
+        std::env::set_var("KAIRASTRA_DEPLOY_MODE", "native");
         assert!(!running_in_docker());
-        std::env::remove_var("SYMPHONY_DEPLOY_MODE");
+        std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
     }
 }

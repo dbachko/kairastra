@@ -864,8 +864,8 @@ impl Orchestrator {
     }
 }
 
-const BLOCKER_SECTION_START: &str = "<!-- symphony-runtime-blocker:start -->";
-const BLOCKER_SECTION_END: &str = "<!-- symphony-runtime-blocker:end -->";
+const BLOCKER_SECTION_START: &str = "<!-- kairastra-runtime-blocker:start -->";
+const BLOCKER_SECTION_END: &str = "<!-- kairastra-runtime-blocker:end -->";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlockedWorkerFailure {
@@ -1328,7 +1328,7 @@ fn classify_blocked_worker_failure(provider: &str, error: &str) -> Option<Blocke
     } else if normalized.contains("invalid_workflow_config")
         || normalized.contains("unsupported_agent_provider")
     {
-        "Fix the Symphony workflow/provider configuration, then move the issue back to `Todo` or `In Progress`.".to_string()
+        "Fix the Kairastra workflow/provider configuration, then move the issue back to `Todo` or `In Progress`.".to_string()
     } else {
         return None;
     };

@@ -6,17 +6,17 @@ use clap::{Args, Parser, Subcommand};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use symphony_rust::auth::{inspect_status, run_login, run_login_menu, AuthMode};
-use symphony_rust::deploy::DeployMode;
-use symphony_rust::doctor::{run as run_doctor, DoctorFormat, DoctorOptions};
-use symphony_rust::github::GitHubTracker;
-use symphony_rust::orchestrator::Orchestrator;
-use symphony_rust::setup::{run as run_setup, SetupOptions};
-use symphony_rust::workflow::{default_workflow_path, WorkflowStore};
+use kairastra::auth::{inspect_status, run_login, run_login_menu, AuthMode};
+use kairastra::deploy::DeployMode;
+use kairastra::doctor::{run as run_doctor, DoctorFormat, DoctorOptions};
+use kairastra::github::GitHubTracker;
+use kairastra::orchestrator::Orchestrator;
+use kairastra::setup::{run as run_setup, SetupOptions};
+use kairastra::workflow::{default_workflow_path, WorkflowStore};
 
 #[derive(Debug, Parser)]
-#[command(name = "symphony-rust")]
-#[command(about = "Symphony GitHub orchestrator in Rust")]
+#[command(name = "kairastra")]
+#[command(about = "Kairastra GitHub orchestrator in Rust")]
 struct ModernCli {
     #[command(subcommand)]
     command: Command,
@@ -177,7 +177,7 @@ async fn run_orchestrator(workflow: Option<PathBuf>, once: bool) -> Result<()> {
     let workflow_store = Arc::new(WorkflowStore::new(workflow_path));
     let snapshot = workflow_store.current()?;
     if let Some(dashboard_url) = snapshot.settings.tracker_dashboard_url() {
-        info!(dashboard_url = %dashboard_url, "using GitHub dashboard for Symphony");
+        info!(dashboard_url = %dashboard_url, "using GitHub dashboard for Kairastra");
     } else {
         warn!("no GitHub dashboard URL configured; falling back to tracker-only polling");
     }

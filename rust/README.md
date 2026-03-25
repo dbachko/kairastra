@@ -8,10 +8,6 @@ with the runtime.
 Use this README as the practical setup and operations guide. The normative behavior still lives in
 [`SPEC.md`](../SPEC.md).
 
-Public docs in this repository use `Kairastra` as the product name. Commands, file names, service
-units, binaries, and env vars may still use historical `symphony` names until the runtime itself is
-renamed.
-
 ## What it does
 
 - Loads `WORKFLOW.md` front matter plus prompt template and keeps the last known good config on reload errors.
@@ -36,7 +32,7 @@ At minimum:
 For native VPS mode:
 
 - Linux host with `systemd`
-- A stable path to the built `symphony-rust` binary
+- A stable path to the built `kairastra` binary
 
 For Docker mode:
 
@@ -148,7 +144,7 @@ Example:
 cd rust
 cargo build
 cargo run -- setup --mode native
-cargo run -- doctor --workflow ../WORKFLOW.md --env-file ../symphony.env
+cargo run -- doctor --workflow ../WORKFLOW.md --env-file ../kairastra.env
 ```
 
 If you use subscription auth:
@@ -174,7 +170,7 @@ cargo run -- auth login --mode api-key
 ### Docker
 
 1. Copy `rust/.env.example` to `rust/.env`.
-2. Fill in `GITHUB_TOKEN` and the workflow-related `SYMPHONY_*` values.
+2. Fill in `GITHUB_TOKEN` and the workflow-related `KAIRASTRA_*` values.
 3. Point `WORKFLOW_FILE` at the workflow you want mounted.
 4. Start the stack.
 5. If you use subscription/device auth, run the Docker login helper once.
@@ -197,7 +193,7 @@ For Claude subscription login in Docker, the command prints the OAuth URL and th
 masked terminal prompt named `Paste Authentication Code` so you can paste the browser code back
 into the same terminal session. After submit, Kairastra prints progress lines while it waits for
 Claude to finish the login handshake.
-Docker also sets `SYMPHONY_DEPLOY_MODE=docker`, so `doctor` inside the container validates Docker
+Docker also sets `KAIRASTRA_DEPLOY_MODE=docker`, so `doctor` inside the container validates Docker
 prerequisites instead of looking for `systemctl`.
 
 ## Guided setup
@@ -255,11 +251,11 @@ What setup writes:
 Default output behavior:
 
 - Setup writes `WORKFLOW.md` by default unless `--workflow` is provided.
-- Native mode writes `symphony.env` and `symphony.service` by default.
+- Native mode writes `kairastra.env` and `kairastra.service` by default.
 - Docker mode writes `rust/.env.generated` when `rust/.env` already exists; otherwise it writes `rust/.env`.
 - Native mode auto-detects the systemd binary path. If the current executable is clearly a cargo
   build artifact under `target/debug` or `target/release`, setup falls back to
-  `/usr/local/bin/symphony-rust`. Override with `--binary-path` or `SYMPHONY_BINARY_PATH` when needed.
+  `/usr/local/bin/kairastra`. Override with `--binary-path` or `KAIRASTRA_BINARY_PATH` when needed.
 - Setup now detects whether you launched it from the repo root or from `rust/` and writes Docker
   env files to the Compose directory either way.
 
@@ -345,16 +341,16 @@ Important details:
 
 - `WORKFLOW_FILE` is mounted read-only at `/config/WORKFLOW.md`.
 - `SEED_REPO_PATH` is mounted read-only at `/seed-repo`.
-- workspaces live in the `symphony_rust_workspaces` volume.
-- runtime home state persists in the `symphony_rust_home` volume.
-- Codex auth persists in the `symphony_rust_codex` volume and is linked into the runtime home.
-- Claude auth persists in the `symphony_rust_claude` volume and is linked into the runtime home.
+- workspaces live in the `kairastra_workspaces` volume.
+- runtime home state persists in the `kairastra_home` volume.
+- Codex auth persists in the `kairastra_codex` volume and is linked into the runtime home.
+- Claude auth persists in the `kairastra_claude` volume and is linked into the runtime home.
 - a saved Claude long-lived OAuth token is stored at `~/.claude/oauth-token` inside that shared auth volume.
-- the container now runs Kairastra as a non-root `symphony` user so Claude's bypass-permissions mode works.
+- the container now runs Kairastra as a non-root `kairastra` user so Claude's bypass-permissions mode works.
 - Claude Code is installed from Anthropic's native Linux installer inside the image rather than the npm package.
-- Docker now starts a per-container D-Bus session plus a headless GNOME keyring for the `symphony` user so Claude subscription auth has a Linux secret store available in headless environments.
-- the headless keyring lives under the persisted runtime home volume; by default it is unlocked with an empty password inside the container session, and you can override that by setting `SYMPHONY_CLAUDE_KEYRING_PASSWORD`.
-- Compose now passes through the workflow-related `SYMPHONY_*` variables so env-backed workflow
+- Docker now starts a per-container D-Bus session plus a headless GNOME keyring for the `kairastra` user so Claude subscription auth has a Linux secret store available in headless environments.
+- the headless keyring lives under the persisted runtime home volume; by default it is unlocked with an empty password inside the container session, and you can override that by setting `KAIRASTRA_CLAUDE_KEYRING_PASSWORD`.
+- Compose now passes through the workflow-related `KAIRASTRA_*` variables so env-backed workflow
   fields resolve inside the container at runtime.
 - `CODEX_AUTH_MODE=subscription` plus `make docker-login PROVIDER=codex` is the intended Codex subscription/device-auth path.
 - `CODEX_AUTH_MODE=api_key` plus `OPENAI_API_KEY` is the intended API-key path.
@@ -382,11 +378,11 @@ the wizard writes artifacts, and the operator chooses when to promote them into 
 Typical flow:
 
 ```bash
-sudo cp symphony.service /etc/systemd/system/symphony.service
+sudo cp kairastra.service /etc/systemd/system/kairastra.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now symphony.service
-sudo systemctl status symphony.service
-journalctl -u symphony.service -f
+sudo systemctl enable --now kairastra.service
+sudo systemctl status kairastra.service
+journalctl -u kairastra.service -f
 ```
 
 The generated unit references:
@@ -395,8 +391,8 @@ The generated unit references:
 - the current working directory as `WorkingDirectory=...`
 - the auto-detected or overridden binary path via `ExecStart=<binary> run <workflow>`
 
-If your installed binary lives somewhere non-standard, pass `--binary-path /absolute/path/to/symphony-rust`
-to setup or export `SYMPHONY_BINARY_PATH` before running it.
+If your installed binary lives somewhere non-standard, pass `--binary-path /absolute/path/to/kairastra`
+to setup or export `KAIRASTRA_BINARY_PATH` before running it.
 
 ## Workflow and env files
 
@@ -404,29 +400,29 @@ The recommended workflow keeps secrets and machine-specific values outside the f
 environment variables such as:
 
 - `GITHUB_TOKEN`
-- `SYMPHONY_GITHUB_OWNER`
-- `SYMPHONY_GITHUB_REPO`
-- `SYMPHONY_GITHUB_PROJECT_NUMBER`
-- `SYMPHONY_GITHUB_PROJECT_URL`
-- `SYMPHONY_WORKSPACE_ROOT`
-- `SYMPHONY_GIT_CLONE_URL`
-- `SYMPHONY_SEED_REPO`
-- `SYMPHONY_AGENT_ASSIGNEE`
-- `SYMPHONY_CLAUDE_MODEL`
-- `SYMPHONY_CLAUDE_REASONING_EFFORT`
-- `SYMPHONY_CODEX_MODEL`
-- `SYMPHONY_CODEX_REASONING_EFFORT`
-- `SYMPHONY_CODEX_FAST`
+- `KAIRASTRA_GITHUB_OWNER`
+- `KAIRASTRA_GITHUB_REPO`
+- `KAIRASTRA_GITHUB_PROJECT_NUMBER`
+- `KAIRASTRA_GITHUB_PROJECT_URL`
+- `KAIRASTRA_WORKSPACE_ROOT`
+- `KAIRASTRA_GIT_CLONE_URL`
+- `KAIRASTRA_SEED_REPO`
+- `KAIRASTRA_AGENT_ASSIGNEE`
+- `KAIRASTRA_CLAUDE_MODEL`
+- `KAIRASTRA_CLAUDE_REASONING_EFFORT`
+- `KAIRASTRA_CODEX_MODEL`
+- `KAIRASTRA_CODEX_REASONING_EFFORT`
+- `KAIRASTRA_CODEX_FAST`
 
-If you provide `SYMPHONY_GITHUB_PROJECT_URL` in the setup flow, Kairastra can derive the GitHub
+If you provide `KAIRASTRA_GITHUB_PROJECT_URL` in the setup flow, Kairastra can derive the GitHub
 owner and Project v2 number automatically for URLs like
 `https://github.com/users/<owner>/projects/<number>` and
 `https://github.com/orgs/<owner>/projects/<number>`.
 
 The generated workflow also includes an `after_create` hook that:
 
-- clones the canonical repo when `SYMPHONY_GIT_CLONE_URL` is set
-- overlays `SYMPHONY_SEED_REPO` on top when present
+- clones the canonical repo when `KAIRASTRA_GIT_CLONE_URL` is set
+- overlays `KAIRASTRA_SEED_REPO` on top when present
 - sets the git author identity
 
 The checked-in [WORKFLOW.md](../WORKFLOW.md) remains a good reference for the richer review/handoff
@@ -456,9 +452,9 @@ python3 scripts/bootstrap_github_project.py
 
 It expects:
 
-- `SYMPHONY_GITHUB_OWNER`
-- `SYMPHONY_GITHUB_REPO`
-- `SYMPHONY_GITHUB_PROJECT_NUMBER`
+- `KAIRASTRA_GITHUB_OWNER`
+- `KAIRASTRA_GITHUB_REPO`
+- `KAIRASTRA_GITHUB_PROJECT_NUMBER`
 
 It ensures:
 
@@ -474,7 +470,7 @@ Useful commands once Kairastra is running:
 cargo run -- doctor --workflow /path/to/WORKFLOW.md --env-file /path/to/envfile
 cargo run -- auth status
 make -C rust docker-logs
-journalctl -u symphony.service -f
+journalctl -u kairastra.service -f
 ```
 
 If you are already inside the `rust/` directory, drop the `-C rust` prefix and run `make docker-logs`,

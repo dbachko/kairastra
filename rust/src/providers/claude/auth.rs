@@ -24,7 +24,7 @@ const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const OAUTH_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 const OAUTH_SCOPE: &str = "user:inference";
 const DOCKER_VOLUME_HINT: &str =
-    "Docker mode persists Claude auth through the symphony_rust_home and symphony_rust_claude volumes mounted for the non-root runtime user.";
+    "Docker mode persists Claude auth through the kairastra_home and kairastra_claude volumes mounted for the non-root runtime user.";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -214,7 +214,7 @@ fn read_logged_in_status() -> Result<bool> {
 
 fn running_in_docker() -> bool {
     matches!(
-        std::env::var("SYMPHONY_DEPLOY_MODE"),
+        std::env::var("KAIRASTRA_DEPLOY_MODE"),
         Ok(value) if value.trim().eq_ignore_ascii_case("docker")
     )
 }
@@ -437,7 +437,7 @@ fn oauth_code_exchange_request<'a>(
 
 fn oauth_client() -> Result<Client> {
     Client::builder()
-        .user_agent("symphony-rust/0.1")
+        .user_agent("kairastra/0.1")
         .build()
         .context("failed to build Claude OAuth client")
 }

@@ -15,7 +15,7 @@ chmod 700 "$runtime_dir"
 export XDG_RUNTIME_DIR="$runtime_dir"
 
 if command -v gnome-keyring-daemon >/dev/null 2>&1; then
-  keyring_password="${SYMPHONY_CLAUDE_KEYRING_PASSWORD:-}"
+  keyring_password="${KAIRASTRA_CLAUDE_KEYRING_PASSWORD:-}"
   eval "$(printf "%s\n" "$keyring_password" | gnome-keyring-daemon --unlock 2>/dev/null)"
   eval "$(printf "%s\n" "$keyring_password" | gnome-keyring-daemon --start --components=secrets 2>/dev/null)"
 fi

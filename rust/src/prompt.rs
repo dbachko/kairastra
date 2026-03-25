@@ -183,13 +183,13 @@ providers:
         let issue = Issue {
             id: "1".to_string(),
             project_item_id: None,
-            identifier: "dbachko/symphony-gh#1".to_string(),
+            identifier: "dbachko/kairastra#1".to_string(),
             title: "Dashboard prompt".to_string(),
             description: Some("body".to_string()),
             priority: None,
             state: "Todo".to_string(),
             branch_name: None,
-            url: Some("https://github.com/dbachko/symphony-gh/issues/1".to_string()),
+            url: Some("https://github.com/dbachko/kairastra/issues/1".to_string()),
             assignees: Vec::new(),
             labels: Vec::new(),
             blocked_by: Vec::new(),
@@ -209,13 +209,13 @@ providers:
         let issue = Issue {
             id: "1".to_string(),
             project_item_id: None,
-            identifier: "dbachko/symphony-gh#1".to_string(),
+            identifier: "dbachko/kairastra#1".to_string(),
             title: "Continuation".to_string(),
             description: None,
             priority: None,
             state: "In Progress".to_string(),
             branch_name: None,
-            url: Some("https://github.com/dbachko/symphony-gh/issues/1".to_string()),
+            url: Some("https://github.com/dbachko/kairastra/issues/1".to_string()),
             assignees: Vec::new(),
             labels: Vec::new(),
             blocked_by: Vec::new(),
@@ -223,7 +223,7 @@ providers:
             updated_at: None,
             workpad_comment_id: Some(99),
             workpad_comment_url: Some(
-                "https://github.com/dbachko/symphony-gh/issues/1#issuecomment-99".to_string(),
+                "https://github.com/dbachko/kairastra/issues/1#issuecomment-99".to_string(),
             ),
             workpad_comment_body: Some(format!(
                 "{AGENT_WORKPAD_HEADER}\n\n### Notes\n\n- {AGENT_BOOTSTRAP_NOTE}\n"
