@@ -31,7 +31,7 @@ pub struct GitHubTracker {
 impl GitHubTracker {
     pub fn new(settings: TrackerSettings) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_static("symphony-rust/0.1.0"));
+        headers.insert(USER_AGENT, HeaderValue::from_static("kairastra/0.1.0"));
         headers.insert(
             ACCEPT,
             HeaderValue::from_static("application/vnd.github+json"),
@@ -161,7 +161,7 @@ impl GitHubTracker {
             .unwrap_or_else(|| "Priority".to_string());
 
         let query = r#"
-query SymphonyProjectItems(
+query KairastraProjectItems(
   $owner: String!,
   $projectNumber: Int!,
   $after: String,
@@ -325,7 +325,7 @@ query SymphonyProjectItems(
             .unwrap_or_else(|| "Status".to_string());
 
         let query = r#"
-query SymphonyProjectStatusField($owner: String!, $projectNumber: Int!) {
+query KairastraProjectStatusField($owner: String!, $projectNumber: Int!) {
   organization(login: $owner) {
     projectV2(number: $projectNumber) {
       id
@@ -427,7 +427,7 @@ query SymphonyProjectStatusField($owner: String!, $projectNumber: Int!) {
 
         self.graphql_raw(
             r#"
-mutation SymphonyUpdateProjectItemStatus(
+mutation KairastraUpdateProjectItemStatus(
   $projectId: ID!,
   $itemId: ID!,
   $fieldId: ID!,
@@ -1558,7 +1558,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("SymphonyProjectItems"))
+            .and(body_string_contains("KairastraProjectItems"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
                     "organization": {
@@ -1575,14 +1575,14 @@ mod tests {
                                         "number": 42,
                                         "title": "Port tracker",
                                         "body": "body",
-                                        "url": "https://github.com/openai/symphony/issues/42",
+                                        "url": "https://github.com/openai/kairastra/issues/42",
                                         "state": "OPEN",
                                         "createdAt": "2026-03-13T00:00:00Z",
                                         "updatedAt": "2026-03-13T01:00:00Z",
                                         "assignees": { "nodes": [{ "login": "codex-bot" }] },
                                         "labels": { "nodes": [{ "name": "Backend" }] },
                                         "repository": {
-                                            "name": "symphony",
+                                            "name": "kairastra",
                                             "owner": { "login": "openai" }
                                         }
                                     }
@@ -1597,7 +1597,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(
-                "/repos/openai/symphony/issues/42/dependencies/blocked_by",
+                "/repos/openai/kairastra/issues/42/dependencies/blocked_by",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
             .mount(&server)
@@ -1628,7 +1628,7 @@ mod tests {
 
         let issues = tracker.fetch_candidate_issues().await.unwrap();
         assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].identifier, "openai/symphony#42");
+        assert_eq!(issues[0].identifier, "openai/kairastra#42");
         assert_eq!(issues[0].state, "Todo");
         assert_eq!(issues[0].priority, Some(1));
         assert_eq!(issues[0].assignees, vec!["codex-bot"]);
@@ -1732,7 +1732,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("SymphonyProjectItems"))
+            .and(body_string_contains("KairastraProjectItems"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
                     "organization": {
@@ -1749,14 +1749,14 @@ mod tests {
                                         "number": 42,
                                         "title": "Port tracker",
                                         "body": "body",
-                                        "url": "https://github.com/openai/symphony/issues/42",
+                                        "url": "https://github.com/openai/kairastra/issues/42",
                                         "state": "CLOSED",
                                         "createdAt": "2026-03-13T00:00:00Z",
                                         "updatedAt": "2026-03-13T01:00:00Z",
                                         "assignees": { "nodes": [] },
                                         "labels": { "nodes": [] },
                                         "repository": {
-                                            "name": "symphony",
+                                            "name": "kairastra",
                                             "owner": { "login": "openai" }
                                         }
                                     }
@@ -1799,7 +1799,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/repos/openai/symphony/issues"))
+            .and(path("/repos/openai/kairastra/issues"))
             .and(query_param("state", "open"))
             .and(query_param("page", "1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
@@ -1810,7 +1810,7 @@ mod tests {
                     "title": "Implement adapter",
                     "body": "details",
                     "state": "open",
-                    "html_url": "https://github.com/openai/symphony/issues/7",
+                    "html_url": "https://github.com/openai/kairastra/issues/7",
                     "assignees": [{ "login": "codex-bot" }],
                     "labels": [{ "name": "p2" }],
                     "created_at": "2026-03-13T00:00:00Z",
@@ -1821,7 +1821,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/repos/openai/symphony/issues"))
+            .and(path("/repos/openai/kairastra/issues"))
             .and(query_param("state", "open"))
             .and(query_param("page", "2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
@@ -1829,7 +1829,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/repos/openai/symphony/issues/7/issue-field-values"))
+            .and(path("/repos/openai/kairastra/issues/7/issue-field-values"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 { "field": { "name": "Status" }, "value": "Todo" },
                 { "field": { "name": "Priority" }, "value": 2 }
@@ -1839,7 +1839,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(
-                "/repos/openai/symphony/issues/7/dependencies/blocked_by",
+                "/repos/openai/kairastra/issues/7/dependencies/blocked_by",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {
@@ -1848,7 +1848,7 @@ mod tests {
                     "number": 3,
                     "state": "OPEN",
                     "repository": {
-                        "name": "symphony",
+                        "name": "kairastra",
                         "owner": { "login": "openai" }
                     }
                 }
@@ -1861,7 +1861,7 @@ mod tests {
                 r#"tracker:
   kind: github
   owner: openai
-  repo: symphony
+  repo: kairastra
   api_key: fake
   endpoint: {0}/graphql
   rest_endpoint: {0}
@@ -1881,14 +1881,14 @@ mod tests {
 
         let issues = tracker.fetch_candidate_issues().await.unwrap();
         assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].identifier, "openai/symphony#7");
+        assert_eq!(issues[0].identifier, "openai/kairastra#7");
         assert_eq!(issues[0].state, "Todo");
         assert_eq!(issues[0].priority, Some(2));
         assert_eq!(issues[0].assignees, vec!["codex-bot"]);
         assert_eq!(issues[0].blocked_by.len(), 1);
         assert_eq!(
             issues[0].blocked_by[0].identifier.as_deref(),
-            Some("openai/symphony#3")
+            Some("openai/kairastra#3")
         );
     }
 
@@ -1898,7 +1898,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("SymphonyProjectStatusField"))
+            .and(body_string_contains("KairastraProjectStatusField"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
                     "organization": {
@@ -1924,7 +1924,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("SymphonyUpdateProjectItemStatus"))
+            .and(body_string_contains("KairastraUpdateProjectItemStatus"))
             .and(body_string_contains("opt-progress"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
@@ -1938,7 +1938,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("SymphonyProjectItems"))
+            .and(body_string_contains("KairastraProjectItems"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
                     "organization": {
@@ -1955,14 +1955,14 @@ mod tests {
                                         "number": 42,
                                         "title": "Port tracker",
                                         "body": "body",
-                                        "url": "https://github.com/openai/symphony/issues/42",
+                                        "url": "https://github.com/openai/kairastra/issues/42",
                                         "state": "OPEN",
                                         "createdAt": "2026-03-13T00:00:00Z",
                                         "updatedAt": "2026-03-13T01:00:00Z",
                                         "assignees": { "nodes": [] },
                                         "labels": { "nodes": [] },
                                         "repository": {
-                                            "name": "symphony",
+                                            "name": "kairastra",
                                             "owner": { "login": "openai" }
                                         }
                                     }
@@ -1998,13 +1998,13 @@ mod tests {
         let issue = crate::model::Issue {
             id: "issue-node-1".to_string(),
             project_item_id: Some("item-1".to_string()),
-            identifier: "openai/symphony#42".to_string(),
+            identifier: "openai/kairastra#42".to_string(),
             title: "Port tracker".to_string(),
             description: Some("body".to_string()),
             priority: None,
             state: "Todo".to_string(),
             branch_name: None,
-            url: Some("https://github.com/openai/symphony/issues/42".to_string()),
+            url: Some("https://github.com/openai/kairastra/issues/42".to_string()),
             assignees: Vec::new(),
             labels: Vec::new(),
             blocked_by: Vec::new(),
@@ -2028,7 +2028,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/repos/openai/symphony/commits/abc123/check-runs"))
+            .and(path("/repos/openai/kairastra/commits/abc123/check-runs"))
             .and(query_param("per_page", "100"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "check_runs": [
@@ -2043,7 +2043,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/repos/openai/symphony/commits/abc123/status"))
+            .and(path("/repos/openai/kairastra/commits/abc123/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "statuses": []
             })))
@@ -2055,7 +2055,7 @@ mod tests {
                 r#"tracker:
   kind: github
   owner: openai
-  repo: symphony
+  repo: kairastra
   api_key: fake
   endpoint: {0}/graphql
   rest_endpoint: {0}
@@ -2068,7 +2068,7 @@ mod tests {
         .unwrap();
 
         let summary = tracker
-            .pull_request_checks_summary("openai", "symphony", "abc123")
+            .pull_request_checks_summary("openai", "kairastra", "abc123")
             .await
             .unwrap();
 
@@ -2082,7 +2082,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/repos/openai/symphony/commits/def456/check-runs"))
+            .and(path("/repos/openai/kairastra/commits/def456/check-runs"))
             .and(query_param("per_page", "100"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "check_runs": [
@@ -2097,7 +2097,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/repos/openai/symphony/commits/def456/status"))
+            .and(path("/repos/openai/kairastra/commits/def456/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "statuses": []
             })))
@@ -2109,7 +2109,7 @@ mod tests {
                 r#"tracker:
   kind: github
   owner: openai
-  repo: symphony
+  repo: kairastra
   api_key: fake
   endpoint: {0}/graphql
   rest_endpoint: {0}
@@ -2122,7 +2122,7 @@ mod tests {
         .unwrap();
 
         let summary = tracker
-            .pull_request_checks_summary("openai", "symphony", "def456")
+            .pull_request_checks_summary("openai", "kairastra", "def456")
             .await
             .unwrap();
 
@@ -2137,7 +2137,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("SymphonyProjectStatusField"))
+            .and(body_string_contains("KairastraProjectStatusField"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
                     "organization": {
@@ -2163,7 +2163,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("SymphonyUpdateProjectItemStatus"))
+            .and(body_string_contains("KairastraUpdateProjectItemStatus"))
             .and(body_string_contains("opt-done"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
@@ -2177,7 +2177,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("SymphonyProjectItems"))
+            .and(body_string_contains("KairastraProjectItems"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
                     "organization": {
@@ -2194,14 +2194,14 @@ mod tests {
                                         "number": 42,
                                         "title": "Port tracker",
                                         "body": "body",
-                                        "url": "https://github.com/openai/symphony/issues/42",
+                                        "url": "https://github.com/openai/kairastra/issues/42",
                                         "state": "CLOSED",
                                         "createdAt": "2026-03-13T00:00:00Z",
                                         "updatedAt": "2026-03-13T01:00:00Z",
                                         "assignees": { "nodes": [] },
                                         "labels": { "nodes": [] },
                                         "repository": {
-                                            "name": "symphony",
+                                            "name": "kairastra",
                                             "owner": { "login": "openai" }
                                         }
                                     }
@@ -2237,13 +2237,13 @@ mod tests {
         let issue = crate::model::Issue {
             id: "issue-node-1".to_string(),
             project_item_id: Some("item-1".to_string()),
-            identifier: "openai/symphony#42".to_string(),
+            identifier: "openai/kairastra#42".to_string(),
             title: "Port tracker".to_string(),
             description: Some("body".to_string()),
             priority: None,
             state: "Closed".to_string(),
             branch_name: None,
-            url: Some("https://github.com/openai/symphony/issues/42".to_string()),
+            url: Some("https://github.com/openai/kairastra/issues/42".to_string()),
             assignees: Vec::new(),
             labels: Vec::new(),
             blocked_by: Vec::new(),
@@ -2267,18 +2267,18 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/repos/openai/symphony/issues/42/comments"))
+            .and(path("/repos/openai/kairastra/issues/42/comments"))
             .and(query_param("per_page", "100"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {
                     "id": 7,
                     "body": "noise",
-                    "html_url": "https://github.com/openai/symphony/issues/42#issuecomment-7"
+                    "html_url": "https://github.com/openai/kairastra/issues/42#issuecomment-7"
                 },
                 {
                     "id": 9,
                     "body": "## Agent Workpad\n\nexisting",
-                    "html_url": "https://github.com/openai/symphony/issues/42#issuecomment-9"
+                    "html_url": "https://github.com/openai/kairastra/issues/42#issuecomment-9"
                 }
             ])))
             .mount(&server)
@@ -2292,7 +2292,7 @@ mod tests {
   api_key: fake
   endpoint: {0}/graphql
   rest_endpoint: {0}
-  repo: symphony
+  repo: kairastra
   mode: issues_only
 "#,
                 server.uri()
@@ -2304,13 +2304,13 @@ mod tests {
         let issue = Issue {
             id: "issue-node-42".to_string(),
             project_item_id: None,
-            identifier: "openai/symphony#42".to_string(),
+            identifier: "openai/kairastra#42".to_string(),
             title: "Issue".to_string(),
             description: None,
             priority: None,
             state: "Todo".to_string(),
             branch_name: None,
-            url: Some("https://github.com/openai/symphony/issues/42".to_string()),
+            url: Some("https://github.com/openai/kairastra/issues/42".to_string()),
             assignees: Vec::new(),
             labels: Vec::new(),
             blocked_by: Vec::new(),
@@ -2329,7 +2329,7 @@ mod tests {
         assert_eq!(updated.workpad_comment_id, Some(9));
         assert_eq!(
             updated.workpad_comment_url.as_deref(),
-            Some("https://github.com/openai/symphony/issues/42#issuecomment-9")
+            Some("https://github.com/openai/kairastra/issues/42#issuecomment-9")
         );
     }
 
@@ -2338,19 +2338,19 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/repos/openai/symphony/issues/42/comments"))
+            .and(path("/repos/openai/kairastra/issues/42/comments"))
             .and(query_param("per_page", "100"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
             .mount(&server)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/repos/openai/symphony/issues/42/comments"))
+            .and(path("/repos/openai/kairastra/issues/42/comments"))
             .and(body_string_contains("## Agent Workpad"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": 11,
                 "body": "## Agent Workpad\n\ncreated",
-                "html_url": "https://github.com/openai/symphony/issues/42#issuecomment-11"
+                "html_url": "https://github.com/openai/kairastra/issues/42#issuecomment-11"
             })))
             .mount(&server)
             .await;
@@ -2363,7 +2363,7 @@ mod tests {
   api_key: fake
   endpoint: {0}/graphql
   rest_endpoint: {0}
-  repo: symphony
+  repo: kairastra
   mode: issues_only
 "#,
                 server.uri()
@@ -2375,13 +2375,13 @@ mod tests {
         let issue = Issue {
             id: "issue-node-42".to_string(),
             project_item_id: None,
-            identifier: "openai/symphony#42".to_string(),
+            identifier: "openai/kairastra#42".to_string(),
             title: "Issue".to_string(),
             description: None,
             priority: None,
             state: "Todo".to_string(),
             branch_name: None,
-            url: Some("https://github.com/openai/symphony/issues/42".to_string()),
+            url: Some("https://github.com/openai/kairastra/issues/42".to_string()),
             assignees: Vec::new(),
             labels: Vec::new(),
             blocked_by: Vec::new(),
@@ -2400,7 +2400,7 @@ mod tests {
         assert_eq!(updated.workpad_comment_id, Some(11));
         assert_eq!(
             updated.workpad_comment_url.as_deref(),
-            Some("https://github.com/openai/symphony/issues/42#issuecomment-11")
+            Some("https://github.com/openai/kairastra/issues/42#issuecomment-11")
         );
     }
 }

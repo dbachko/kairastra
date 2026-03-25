@@ -40,16 +40,16 @@ RUN apt-get update \
     && curl -fsSL -o /tmp/claude "${claude_bucket}/${claude_version}/${claude_platform}/claude" \
     && echo "${claude_checksum}  /tmp/claude" | sha256sum -c - \
     && install -m 0755 /tmp/claude /usr/local/bin/claude \
-    && useradd --create-home --shell /bin/bash symphony \
-    && mkdir -p /home/symphony /var/lib/symphony-auth/codex /var/lib/symphony-auth/claude /workspaces \
-    && chown -R symphony:symphony /home/symphony /var/lib/symphony-auth /workspaces \
+    && useradd --create-home --shell /bin/bash kairastra \
+    && mkdir -p /home/kairastra /var/lib/kairastra-auth/codex /var/lib/kairastra-auth/claude /workspaces \
+    && chown -R kairastra:kairastra /home/kairastra /var/lib/kairastra-auth /workspaces \
     && rm -f /tmp/claude \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/cargo /usr/local/cargo
 COPY --from=builder /usr/local/rustup /usr/local/rustup
 COPY --from=builder /usr/local/cargo/bin/ /usr/local/bin/
-COPY --from=builder /src/rust/target/release/symphony-rust /usr/local/bin/symphony-rust
+COPY --from=builder /src/rust/target/release/kairastra /usr/local/bin/kairastra
 COPY rust/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY rust/docker-user-session.sh /usr/local/bin/docker-user-session.sh
 COPY rust/docker-compose-shim /usr/local/bin/docker
@@ -58,11 +58,11 @@ RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh /usr/local/bin/docker-user-se
 WORKDIR /app
 
 ENV RUSTUP_HOME=/usr/local/rustup
-ENV SYMPHONY_USER=symphony
-ENV SYMPHONY_HOME=/home/symphony
+ENV KAIRASTRA_USER=kairastra
+ENV KAIRASTRA_HOME=/home/kairastra
 ENV PATH=/usr/local/cargo/bin:${PATH}
 ENV RUST_LOG=info
-ENV SYMPHONY_WORKSPACE_ROOT=/workspaces
+ENV KAIRASTRA_WORKSPACE_ROOT=/workspaces
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["run"]

@@ -3,10 +3,10 @@ tracker:
   kind: github
   mode: projects_v2
   api_key: $GITHUB_TOKEN
-  owner: $SYMPHONY_GITHUB_OWNER
-  repo: $SYMPHONY_GITHUB_REPO
-  project_v2_number: $SYMPHONY_GITHUB_PROJECT_NUMBER
-  project_url: $SYMPHONY_GITHUB_PROJECT_URL
+  owner: $KAIRASTRA_GITHUB_OWNER
+  repo: $KAIRASTRA_GITHUB_REPO
+  project_v2_number: $KAIRASTRA_GITHUB_PROJECT_NUMBER
+  project_url: $KAIRASTRA_GITHUB_PROJECT_URL
   status_source:
     type: project_field
     name: Status
@@ -25,7 +25,7 @@ tracker:
     - Duplicate
     - Done
 workspace:
-  root: $SYMPHONY_WORKSPACE_ROOT
+  root: $KAIRASTRA_WORKSPACE_ROOT
 hooks:
   after_create: |
     set -euo pipefail
@@ -46,29 +46,29 @@ hooks:
       if command -v rsync >/dev/null 2>&1; then
         rsync -a --delete --exclude '.git' "${seed_repo}/" ./
       else
-        echo "rsync is required when overlaying SYMPHONY_SEED_REPO on top of a remote clone." >&2
+        echo "rsync is required when overlaying KAIRASTRA_SEED_REPO on top of a remote clone." >&2
         exit 1
       fi
     }
 
-    if [ -n "${SYMPHONY_GIT_CLONE_URL:-}" ]; then
-      clone_with_auth "$SYMPHONY_GIT_CLONE_URL"
-      if [ -n "${SYMPHONY_SEED_REPO:-}" ] && [ -d "$SYMPHONY_SEED_REPO" ]; then
-        overlay_seed_repo "$SYMPHONY_SEED_REPO"
+    if [ -n "${KAIRASTRA_GIT_CLONE_URL:-}" ]; then
+      clone_with_auth "$KAIRASTRA_GIT_CLONE_URL"
+      if [ -n "${KAIRASTRA_SEED_REPO:-}" ] && [ -d "$KAIRASTRA_SEED_REPO" ]; then
+        overlay_seed_repo "$KAIRASTRA_SEED_REPO"
       fi
-    elif [ -n "${SYMPHONY_SEED_REPO:-}" ] && [ -d "$SYMPHONY_SEED_REPO/.git" ]; then
-      git clone "$SYMPHONY_SEED_REPO" .
+    elif [ -n "${KAIRASTRA_SEED_REPO:-}" ] && [ -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+      git clone "$KAIRASTRA_SEED_REPO" .
     else
-      echo "Set SYMPHONY_GIT_CLONE_URL, or point SYMPHONY_SEED_REPO at a git checkout, before running Symphony." >&2
+      echo "Set KAIRASTRA_GIT_CLONE_URL, or point KAIRASTRA_SEED_REPO at a git checkout, before running Kairastra." >&2
       exit 1
     fi
 
-    if [ -n "${SYMPHONY_GIT_PUSH_URL:-}" ]; then
-      git remote set-url origin "$SYMPHONY_GIT_PUSH_URL"
+    if [ -n "${KAIRASTRA_GIT_PUSH_URL:-}" ]; then
+      git remote set-url origin "$KAIRASTRA_GIT_PUSH_URL"
     fi
 
-    git config user.name "${SYMPHONY_GIT_AUTHOR_NAME:-Symphony}"
-    git config user.email "${SYMPHONY_GIT_AUTHOR_EMAIL:-symphony@users.noreply.github.com}"
+    git config user.name "${KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}"
+    git config user.email "${KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}"
 agent:
   provider: codex
   max_concurrent_agents: 4
@@ -83,8 +83,8 @@ providers:
       networkAccess: true
   claude:
     command: claude
-    model: $SYMPHONY_CLAUDE_MODEL
-    reasoning_effort: $SYMPHONY_CLAUDE_REASONING_EFFORT
+    model: $KAIRASTRA_CLAUDE_MODEL
+    reasoning_effort: $KAIRASTRA_CLAUDE_REASONING_EFFORT
     approval_policy: never
 ---
 

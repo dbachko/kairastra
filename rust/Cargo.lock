@@ -895,6 +895,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "kairastra"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "clap",
+ "dialoguer",
+ "dirs",
+ "getrandom 0.3.4",
+ "liquid",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
+]
+
+[[package]]
 name = "kstring"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1617,31 +1642,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "symphony-rust"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "clap",
- "dialoguer",
- "dirs",
- "getrandom 0.3.4",
- "liquid",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wiremock",
-]
 
 [[package]]
 name = "syn"

@@ -159,8 +159,8 @@ providers:
 
     #[test]
     fn resolves_env_backed_model() {
-        env::set_var("SYMPHONY_CLAUDE_MODEL", "sonnet");
-        let settings = settings("    model: $SYMPHONY_CLAUDE_MODEL");
+        env::set_var("KAIRASTRA_CLAUDE_MODEL", "sonnet");
+        let settings = settings("    model: $KAIRASTRA_CLAUDE_MODEL");
         let config = load(&settings).unwrap();
         assert_eq!(config.model.as_deref(), Some("sonnet"));
     }

@@ -1,6 +1,6 @@
 COMPOSE_FILE := compose.yml
 ENV_FILE := .env
-SERVICE := symphony-rust
+SERVICE := kairastra
 PROVIDER ?=
 
 DOCKER_COMPOSE := docker compose -f $(COMPOSE_FILE) --env-file $(ENV_FILE)

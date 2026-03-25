@@ -1,8 +1,8 @@
-# Integrating `obra/superpowers` Into Symphony
+# Integrating `obra/superpowers` Into Kairastra
 
 ## Summary
 
-This document evaluates how Symphony should expose the [`obra/superpowers`](https://github.com/obra/superpowers)
+This document evaluates how Kairastra should expose the [`obra/superpowers`](https://github.com/obra/superpowers)
 skill pack to Codex runs and recommends a staged integration plan.
 
 Recommendation: do not enable every superpower by default and do not force users to hand-pick each
@@ -12,25 +12,25 @@ want them.
 
 ## Current Repo Context
 
-Symphony already has two distinct skill layers:
+Kairastra already has two distinct skill layers:
 
-- Repository-local workflow skills in `.codex/skills/` that support Symphony's issue lifecycle.
+- Repository-local workflow skills in `.codex/skills/` that support Kairastra's issue lifecycle.
 - Operator environment setup in `rust/src/setup.rs`, `rust/README.md`, `rust/.env.example`, and
   `WORKFLOW.md`.
 
 That split matters because `superpowers` is not a repository feature in the same sense as the local
-Symphony skills. Upstream documents it as an operator-installed skill bundle for Codex:
+Kairastra skills. Upstream documents it as an operator-installed skill bundle for Codex:
 
 - clone `obra/superpowers`
 - symlink or copy the relevant skill directories into `~/.agents/skills/`
 - optionally install `collab` if the user wants the subagent-related skills
 
-For Symphony, that means the integration point is the runtime environment used by Codex
+For Kairastra, that means the integration point is the runtime environment used by Codex
 (native host or Docker container), not the issue workspace repository alone.
 
 ## Goals
 
-- Make useful superpowers available to Symphony-managed Codex sessions.
+- Make useful superpowers available to Kairastra-managed Codex sessions.
 - Keep setup predictable for first-time operators.
 - Avoid surprising behavior changes from enabling a very large skill catalog by default.
 - Preserve a clear boundary between checked-in repo skills and user-environment skill bundles.
@@ -83,7 +83,7 @@ Pros:
 Cons:
 
 - Too much friction for first-run setup.
-- Requires Symphony to maintain an internal catalog of upstream skills and dependencies.
+- Requires Kairastra to maintain an internal catalog of upstream skills and dependencies.
 - Fragile when upstream renames, removes, or adds skills.
 - Hard to explain in a non-interactive setup flow.
 
@@ -135,12 +135,12 @@ For non-interactive setup:
 
 - default to disabled unless an explicit environment variable opts in
 - support values such as:
-  - `SYMPHONY_SUPERPOWERS_MODE=off|core|full`
-  - `SYMPHONY_SUPERPOWERS_ENABLE_COLLAB=true|false`
+  - `KAIRASTRA_SUPERPOWERS_MODE=off|core|full`
+  - `KAIRASTRA_SUPERPOWERS_ENABLE_COLLAB=true|false`
 
 ### Runtime behavior
 
-Symphony should not depend on the internet at issue-run time for this feature. Instead:
+Kairastra should not depend on the internet at issue-run time for this feature. Instead:
 
 - setup records the desired mode in generated config
 - runtime bootstrap ensures the pinned upstream repo is present in a stable tool location
@@ -149,12 +149,12 @@ Symphony should not depend on the internet at issue-run time for this feature. I
 
 This should happen in the environment where Codex actually runs:
 
-- native mode: on the VPS user account that launches Symphony
+- native mode: on the VPS user account that launches Kairastra
 - Docker mode: inside the container filesystem or a mounted persistent tools volume
 
 ### Repository behavior
 
-Keep the checked-in `.codex/skills/` directory focused on Symphony's own repo-specific workflows.
+Keep the checked-in `.codex/skills/` directory focused on Kairastra's own repo-specific workflows.
 Do not mix upstream `superpowers` skill contents into this repo tree. The repo should only store:
 
 - configuration knobs
@@ -168,18 +168,18 @@ Do not mix upstream `superpowers` skill contents into this repo tree. The repo s
 
 Extend `rust/src/setup.rs` and generated config outputs with:
 
-- `SYMPHONY_SUPERPOWERS_MODE`
-- `SYMPHONY_SUPERPOWERS_REF`
-- `SYMPHONY_SUPERPOWERS_ENABLE_COLLAB`
-- `SYMPHONY_SUPERPOWERS_HOME`
+- `KAIRASTRA_SUPERPOWERS_MODE`
+- `KAIRASTRA_SUPERPOWERS_REF`
+- `KAIRASTRA_SUPERPOWERS_ENABLE_COLLAB`
+- `KAIRASTRA_SUPERPOWERS_HOME`
 
 Suggested defaults:
 
-- `SYMPHONY_SUPERPOWERS_MODE=off`
-- `SYMPHONY_SUPERPOWERS_REF=<pinned commit or tag>`
-- `SYMPHONY_SUPERPOWERS_ENABLE_COLLAB=false`
-- `SYMPHONY_SUPERPOWERS_HOME=/opt/symphony/superpowers` in native mode
-- `SYMPHONY_SUPERPOWERS_HOME=/opt/superpowers` in Docker mode
+- `KAIRASTRA_SUPERPOWERS_MODE=off`
+- `KAIRASTRA_SUPERPOWERS_REF=<pinned commit or tag>`
+- `KAIRASTRA_SUPERPOWERS_ENABLE_COLLAB=false`
+- `KAIRASTRA_SUPERPOWERS_HOME=/opt/kairastra/superpowers` in native mode
+- `KAIRASTRA_SUPERPOWERS_HOME=/opt/superpowers` in Docker mode
 
 ### 2. Introduce a curated manifest for the core set
 
@@ -188,7 +188,7 @@ Add a checked-in manifest file, for example:
 - `docs/plans/` for the initial spec only
 - later implementation: `.codex/superpowers-core.txt` or `rust/config/superpowers-core.txt`
 
-The manifest should contain the upstream skill directory names Symphony considers safe and broadly
+The manifest should contain the upstream skill directory names Kairastra considers safe and broadly
 useful for most runs. This avoids baking the core list directly into Rust source and keeps updates
 reviewable.
 
@@ -205,14 +205,14 @@ Add a dedicated bootstrap script that:
 
 - clones or updates `obra/superpowers` at the pinned ref
 - optionally verifies the repo state after fetch
-- clears and recreates a managed Symphony-owned skill link directory
+- clears and recreates a managed Kairastra-owned skill link directory
 - links either the curated core manifest or all upstream skills into the Codex-visible location
 - optionally links `collab`-dependent skills only when requested and dependency checks pass
 
-Prefer a single Symphony-managed destination such as:
+Prefer a single Kairastra-managed destination such as:
 
-- native: `~/.agents/skills/symphony-superpowers/`
-- Docker: `/root/.agents/skills/symphony-superpowers/`
+- native: `~/.agents/skills/kairastra-superpowers/`
+- Docker: `/root/.agents/skills/kairastra-superpowers/`
 
 Then point the runtime bootstrap at that managed directory instead of scattering symlinks directly
 across the base skills folder.
@@ -237,7 +237,7 @@ less deterministic, and harder to cache.
 
 ### 5. Add doctor coverage
 
-Extend `doctor` so that when `SYMPHONY_SUPERPOWERS_MODE != off` it checks:
+Extend `doctor` so that when `KAIRASTRA_SUPERPOWERS_MODE != off` it checks:
 
 - the upstream checkout exists
 - the pinned ref is resolvable
@@ -273,7 +273,7 @@ Native mode:
 2. Enable `superpowers` in `core` mode.
 3. Run `cargo run -- doctor`.
 4. Confirm the managed skill directory exists and links resolve.
-5. Start a Codex-backed Symphony run and verify Codex sees the installed skills.
+5. Start a Codex-backed Kairastra run and verify Codex sees the installed skills.
 
 Docker mode:
 
@@ -285,7 +285,7 @@ Docker mode:
 
 Upgrade path:
 
-1. Change `SYMPHONY_SUPERPOWERS_REF` to a newer pinned ref.
+1. Change `KAIRASTRA_SUPERPOWERS_REF` to a newer pinned ref.
 2. Re-run the installer/bootstrap path.
 3. Verify links still resolve and the curated core manifest still matches upstream paths.
 
@@ -297,7 +297,7 @@ Adopt Option C:
 - offer `core` and `full` modes in setup
 - ship a curated core manifest
 - install the upstream repo into the runtime environment, not into each issue workspace
-- keep repo-local Symphony skills separate from upstream `superpowers`
+- keep repo-local Kairastra skills separate from upstream `superpowers`
 
-This gives Symphony a controlled, supportable integration path without turning first-run setup into
+This gives Kairastra a controlled, supportable integration path without turning first-run setup into
 a long skill-selection wizard or forcing every operator onto the full upstream bundle.

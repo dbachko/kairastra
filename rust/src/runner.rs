@@ -126,7 +126,7 @@ pub async fn run_issue(
             info!(issue_identifier = %issue.identifier, turn = turn_number, "agent turn complete");
 
             // The selected agent may have updated the persistent workpad comment during the turn.
-            // Refresh it before adding Symphony's runtime section so we never clobber
+            // Refresh it before adding Kairastra's runtime section so we never clobber
             // the latest plan/checklist content with a stale bootstrap copy.
             if current_issue.workpad_comment_id.is_some() {
                 current_issue = tracker.refresh_workpad_comment(&current_issue).await?;
@@ -314,8 +314,8 @@ fn workpad_has_progress(issue: &Issue) -> bool {
     is_workpad_comment(body) && body.contains("[x]") && !is_bootstrap_workpad(body)
 }
 
-const RUNTIME_STATUS_START: &str = "<!-- symphony-runtime-status:start -->";
-const RUNTIME_STATUS_END: &str = "<!-- symphony-runtime-status:end -->";
+const RUNTIME_STATUS_START: &str = "<!-- kairastra-runtime-status:start -->";
+const RUNTIME_STATUS_END: &str = "<!-- kairastra-runtime-status:end -->";
 
 async fn synthesize_runtime_workpad(
     workspace: &std::path::Path,
@@ -479,13 +479,13 @@ mod tests {
         Issue {
             id: "1".to_string(),
             project_item_id: None,
-            identifier: "dbachko/symphony-gh#1".to_string(),
+            identifier: "dbachko/kairastra#1".to_string(),
             title: "Issue".to_string(),
             description: None,
             priority: None,
             state: "In Progress".to_string(),
             branch_name: None,
-            url: Some("https://github.com/dbachko/symphony-gh/issues/1".to_string()),
+            url: Some("https://github.com/dbachko/kairastra/issues/1".to_string()),
             assignees: Vec::new(),
             labels: Vec::new(),
             blocked_by: Vec::new(),
@@ -493,7 +493,7 @@ mod tests {
             updated_at: None,
             workpad_comment_id: Some(1),
             workpad_comment_url: Some(
-                "https://github.com/dbachko/symphony-gh/issues/1#issuecomment-1".to_string(),
+                "https://github.com/dbachko/kairastra/issues/1#issuecomment-1".to_string(),
             ),
             workpad_comment_body: body.map(ToString::to_string),
         }
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn bootstrap_workpad_does_not_count_as_progress() {
         let issue = issue_with_workpad(Some(
-            "## Agent Workpad\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- Bootstrap created by Symphony runtime before the first agent turn.\n",
+            "## Agent Workpad\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- Bootstrap created by Kairastra runtime before the first agent turn.\n",
         ));
         assert!(!workpad_has_progress(&issue));
     }
@@ -538,7 +538,7 @@ mod tests {
         let original = "## Agent Workpad\n\n### Plan\n\n- [x] 1. Real plan item\n\n### Validation\n\n- [ ] `cargo test`\n";
         let merged = merge_runtime_status_section(
             original,
-            "<!-- symphony-runtime-status:start -->\n### Runtime Status\n\n- Branch: demo\n<!-- symphony-runtime-status:end -->",
+            "<!-- kairastra-runtime-status:start -->\n### Runtime Status\n\n- Branch: demo\n<!-- kairastra-runtime-status:end -->",
         );
 
         assert!(merged.contains("- [x] 1. Real plan item"));
@@ -554,7 +554,7 @@ mod tests {
         );
         let merged = merge_runtime_status_section(
             &original,
-            "<!-- symphony-runtime-status:start -->\n### Runtime Status\n\n- Branch: new\n<!-- symphony-runtime-status:end -->",
+            "<!-- kairastra-runtime-status:start -->\n### Runtime Status\n\n- Branch: new\n<!-- kairastra-runtime-status:end -->",
         );
 
         assert!(merged.contains("- [x] 1. Real plan item"));

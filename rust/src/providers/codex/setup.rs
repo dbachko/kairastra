@@ -18,21 +18,21 @@ pub fn collect(non_interactive: bool) -> Result<CodexSetupConfig> {
     let model = ask_string(
         &theme,
         "Provider model (optional)",
-        std::env::var("SYMPHONY_CODEX_MODEL").unwrap_or_default(),
+        std::env::var("KAIRASTRA_CODEX_MODEL").unwrap_or_default(),
         non_interactive,
         true,
     )?;
     let reasoning_effort = ask_string(
         &theme,
         "Thinking effort (optional: none|minimal|low|medium|high|xhigh)",
-        std::env::var("SYMPHONY_CODEX_REASONING_EFFORT").unwrap_or_default(),
+        std::env::var("KAIRASTRA_CODEX_REASONING_EFFORT").unwrap_or_default(),
         non_interactive,
         true,
     )?;
     let fast = ask_bool(
         &theme,
         "Enable provider fast mode",
-        env_bool("SYMPHONY_CODEX_FAST").unwrap_or(false),
+        env_bool("KAIRASTRA_CODEX_FAST").unwrap_or(false),
         non_interactive,
     )?;
 
@@ -48,9 +48,9 @@ pub fn render_workflow_section(config: &CodexSetupConfig) -> String {
     let _ = config;
     r#"  codex:
     command: codex app-server
-    model: $SYMPHONY_CODEX_MODEL
-    reasoning_effort: $SYMPHONY_CODEX_REASONING_EFFORT
-    fast: $SYMPHONY_CODEX_FAST
+    model: $KAIRASTRA_CODEX_MODEL
+    reasoning_effort: $KAIRASTRA_CODEX_REASONING_EFFORT
+    fast: $KAIRASTRA_CODEX_FAST
     approval_policy: never
     thread_sandbox: workspace-write
     turn_sandbox_policy:
@@ -62,12 +62,12 @@ pub fn render_workflow_section(config: &CodexSetupConfig) -> String {
 pub fn render_env_section(mode: DeployMode, config: &CodexSetupConfig) -> String {
     let mut lines = vec![
         format!("CODEX_AUTH_MODE={}", config.auth_mode),
-        format!("SYMPHONY_CODEX_MODEL={}", config.model),
+        format!("KAIRASTRA_CODEX_MODEL={}", config.model),
         format!(
-            "SYMPHONY_CODEX_REASONING_EFFORT={}",
+            "KAIRASTRA_CODEX_REASONING_EFFORT={}",
             config.reasoning_effort
         ),
-        format!("SYMPHONY_CODEX_FAST={}", config.fast),
+        format!("KAIRASTRA_CODEX_FAST={}", config.fast),
     ];
 
     if mode == DeployMode::Docker {

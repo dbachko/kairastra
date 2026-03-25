@@ -21,12 +21,12 @@ STATUS_OPTIONS = [
     {
         "name": "Todo",
         "color": "BLUE",
-        "description": "Queued for Symphony to pick up.",
+        "description": "Queued for Kairastra to pick up.",
     },
     {
         "name": "In Progress",
         "color": "YELLOW",
-        "description": "Actively being worked by Symphony.",
+        "description": "Actively being worked by Kairastra.",
     },
     {
         "name": "Human Review",
@@ -62,9 +62,9 @@ STATUS_OPTIONS = [
 
 DEFAULT_LABELS = [
     {
-        "name": "symphony",
+        "name": "kairastra",
         "color": "5319e7",
-        "description": "Tracked by the Symphony orchestration workflow.",
+        "description": "Tracked by the Kairastra orchestration workflow.",
     },
     {
         "name": "agent:codex",
@@ -111,22 +111,22 @@ class BootstrapError(RuntimeError):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Bootstrap a GitHub Project and repo for Symphony orchestration."
+        description="Bootstrap a GitHub Project and repo for Kairastra orchestration."
     )
     parser.add_argument(
         "--owner",
-        default=os.getenv("SYMPHONY_GITHUB_OWNER"),
+        default=os.getenv("KAIRASTRA_GITHUB_OWNER"),
         help="GitHub user or org that owns the Project.",
     )
     parser.add_argument(
         "--repo",
-        default=os.getenv("SYMPHONY_GITHUB_REPO"),
+        default=os.getenv("KAIRASTRA_GITHUB_REPO"),
         help="GitHub repository name for issue labels.",
     )
     parser.add_argument(
         "--project-number",
         type=int,
-        default=_env_int("SYMPHONY_GITHUB_PROJECT_NUMBER"),
+        default=_env_int("KAIRASTRA_GITHUB_PROJECT_NUMBER"),
         help="GitHub Project v2 number.",
     )
     parser.add_argument(
@@ -137,7 +137,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-labels",
         action="store_true",
-        help="Do not create or update the default Symphony label pack.",
+        help="Do not create or update the default Kairastra label pack.",
     )
     parser.add_argument(
         "--dry-run",
@@ -149,9 +149,9 @@ def parse_args() -> argparse.Namespace:
     missing = [
         name
         for name, value in (
-            ("--owner / SYMPHONY_GITHUB_OWNER", args.owner),
-            ("--repo / SYMPHONY_GITHUB_REPO", args.repo),
-            ("--project-number / SYMPHONY_GITHUB_PROJECT_NUMBER", args.project_number),
+            ("--owner / KAIRASTRA_GITHUB_OWNER", args.owner),
+            ("--repo / KAIRASTRA_GITHUB_REPO", args.repo),
+            ("--project-number / KAIRASTRA_GITHUB_PROJECT_NUMBER", args.project_number),
         )
         if not value
     ]
@@ -250,7 +250,7 @@ def ensure_status_field(
 
     current_names = [option.get("name") for option in status_field.get("options", [])]
     if current_names == desired_names:
-        return Action("Status field already matches the Symphony workflow states.", False)
+        return Action("Status field already matches the Kairastra workflow states.", False)
 
     summary = (
         "update Status field options from "

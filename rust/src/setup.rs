@@ -86,11 +86,11 @@ pub async fn run(options: SetupOptions) -> Result<()> {
         println!("- systemd unit: {}", path.display());
         println!("Next steps:");
         println!(
-            "1. Install the unit: sudo cp {} /etc/systemd/system/symphony.service",
+            "1. Install the unit: sudo cp {} /etc/systemd/system/kairastra.service",
             path.display()
         );
         println!("2. Reload systemd: sudo systemctl daemon-reload");
-        println!("3. Start Symphony: sudo systemctl enable --now symphony.service");
+        println!("3. Start Kairastra: sudo systemctl enable --now kairastra.service");
     } else {
         println!("Next steps:");
         println!(
@@ -188,7 +188,7 @@ fn resolve_env_file_path(
     }
 
     match mode {
-        DeployMode::Native => layout.repo_root.join("symphony.env"),
+        DeployMode::Native => layout.repo_root.join("kairastra.env"),
         DeployMode::Docker => {
             let default = layout.rust_dir.join(".env");
             if default.exists() {
@@ -203,7 +203,7 @@ fn resolve_env_file_path(
 fn resolve_service_path(layout: &SetupLayout, explicit: Option<&PathBuf>) -> PathBuf {
     explicit
         .cloned()
-        .unwrap_or_else(|| layout.repo_root.join("symphony.service"))
+        .unwrap_or_else(|| layout.repo_root.join("kairastra.service"))
 }
 
 fn docker_make_command(layout: &SetupLayout, target: &str) -> String {
@@ -228,10 +228,10 @@ fn collect_values(
 ) -> Result<SetupValues> {
     let cwd = std::env::current_dir()?;
     let theme = ColorfulTheme::default();
-    let env_github_owner = std::env::var("SYMPHONY_GITHUB_OWNER").unwrap_or_default();
-    let env_github_repo = std::env::var("SYMPHONY_GITHUB_REPO").unwrap_or_default();
-    let env_project_number = std::env::var("SYMPHONY_GITHUB_PROJECT_NUMBER").unwrap_or_default();
-    let env_project_url = std::env::var("SYMPHONY_GITHUB_PROJECT_URL").unwrap_or_default();
+    let env_github_owner = std::env::var("KAIRASTRA_GITHUB_OWNER").unwrap_or_default();
+    let env_github_repo = std::env::var("KAIRASTRA_GITHUB_REPO").unwrap_or_default();
+    let env_project_number = std::env::var("KAIRASTRA_GITHUB_PROJECT_NUMBER").unwrap_or_default();
+    let env_project_url = std::env::var("KAIRASTRA_GITHUB_PROJECT_URL").unwrap_or_default();
 
     let github_project_url = ask_string(
         &theme,
@@ -285,7 +285,7 @@ fn collect_values(
         &theme,
         "Workspace root",
         match mode {
-            DeployMode::Native => "/var/lib/symphony/workspaces".to_string(),
+            DeployMode::Native => "/var/lib/kairastra/workspaces".to_string(),
             DeployMode::Docker => "/workspaces".to_string(),
         },
         non_interactive,
@@ -294,7 +294,7 @@ fn collect_values(
     let seed_repo = ask_string(
         &theme,
         "Seed repo path",
-        std::env::var("SYMPHONY_SEED_REPO")
+        std::env::var("KAIRASTRA_SEED_REPO")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| cwd.display().to_string()),
@@ -304,14 +304,14 @@ fn collect_values(
     let git_clone_url = ask_string(
         &theme,
         "Canonical clone URL (optional)",
-        std::env::var("SYMPHONY_GIT_CLONE_URL").unwrap_or_default(),
+        std::env::var("KAIRASTRA_GIT_CLONE_URL").unwrap_or_default(),
         non_interactive,
         true,
     )?;
     let assignee_login = ask_string(
         &theme,
         "Dispatch only assigned issues for login (optional)",
-        std::env::var("SYMPHONY_AGENT_ASSIGNEE").unwrap_or_default(),
+        std::env::var("KAIRASTRA_AGENT_ASSIGNEE").unwrap_or_default(),
         non_interactive,
         true,
     )?;
@@ -380,7 +380,7 @@ fn collect_provider_configs(
 }
 
 fn choose_provider(theme: &ColorfulTheme, non_interactive: bool) -> Result<String> {
-    let env_provider = std::env::var("SYMPHONY_AGENT_PROVIDER")
+    let env_provider = std::env::var("KAIRASTRA_AGENT_PROVIDER")
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
@@ -409,7 +409,7 @@ fn detect_binary_path(explicit: Option<&PathBuf>) -> String {
         return path.display().to_string();
     }
 
-    if let Ok(path) = std::env::var("SYMPHONY_BINARY_PATH") {
+    if let Ok(path) = std::env::var("KAIRASTRA_BINARY_PATH") {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -423,7 +423,7 @@ fn detect_binary_path(explicit: Option<&PathBuf>) -> String {
         }
     }
 
-    "/usr/local/bin/symphony-rust".to_string()
+    "/usr/local/bin/kairastra".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,7 +565,7 @@ fn render_workflow(values: &SetupValues) -> String {
     let assignee_line = if values.assignee_login.trim().is_empty() {
         String::new()
     } else {
-        "  assignee_login: $SYMPHONY_AGENT_ASSIGNEE\n".to_string()
+        "  assignee_login: $KAIRASTRA_AGENT_ASSIGNEE\n".to_string()
     };
     let provider_sections = values
         .provider_configs
@@ -591,10 +591,10 @@ tracker:
   kind: github
   mode: projects_v2
   api_key: $GITHUB_TOKEN
-  owner: $SYMPHONY_GITHUB_OWNER
-  repo: $SYMPHONY_GITHUB_REPO
-  project_v2_number: $SYMPHONY_GITHUB_PROJECT_NUMBER
-  project_url: $SYMPHONY_GITHUB_PROJECT_URL
+  owner: $KAIRASTRA_GITHUB_OWNER
+  repo: $KAIRASTRA_GITHUB_REPO
+  project_v2_number: $KAIRASTRA_GITHUB_PROJECT_NUMBER
+  project_url: $KAIRASTRA_GITHUB_PROJECT_URL
   status_source:
     type: project_field
     name: Status
@@ -613,7 +613,7 @@ tracker:
     - Duplicate
     - Done
 workspace:
-  root: $SYMPHONY_WORKSPACE_ROOT
+  root: $KAIRASTRA_WORKSPACE_ROOT
 hooks:
   after_create: |
     set -euo pipefail
@@ -634,7 +634,7 @@ hooks:
       if command -v rsync >/dev/null 2>&1; then
         rsync -a --delete --exclude '.git' "${{seed_repo}}/" ./
       else
-        echo "rsync is required when overlaying SYMPHONY_SEED_REPO on top of a remote clone." >&2
+        echo "rsync is required when overlaying KAIRASTRA_SEED_REPO on top of a remote clone." >&2
         exit 1
       fi
     }}
@@ -680,8 +680,8 @@ hooks:
       if [ -e "$support_dir" ]; then
         return 0
       fi
-      if [ -n "${{SYMPHONY_SEED_REPO:-}}" ] && [ -e "${{SYMPHONY_SEED_REPO}}/$support_dir" ]; then
-        cp -R "${{SYMPHONY_SEED_REPO}}/$support_dir" "$support_dir"
+      if [ -n "${{KAIRASTRA_SEED_REPO:-}}" ] && [ -e "${{KAIRASTRA_SEED_REPO}}/$support_dir" ]; then
+        cp -R "${{KAIRASTRA_SEED_REPO}}/$support_dir" "$support_dir"
       fi
     }}
 
@@ -696,38 +696,38 @@ hooks:
     }}
 
     adopt_seed_repo_origin() {{
-      if [ -z "${{SYMPHONY_SEED_REPO:-}}" ] || [ ! -d "$SYMPHONY_SEED_REPO/.git" ]; then
+      if [ -z "${{KAIRASTRA_SEED_REPO:-}}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
         return 0
       fi
-      source_remote="$(git -C "$SYMPHONY_SEED_REPO" config --get remote.origin.url || true)"
+      source_remote="$(git -C "$KAIRASTRA_SEED_REPO" config --get remote.origin.url || true)"
       current_remote="$(git config --get remote.origin.url || true)"
-      if [ -n "$source_remote" ] && {{ [ "$current_remote" = "$SYMPHONY_SEED_REPO" ] || [ -z "$current_remote" ]; }}; then
+      if [ -n "$source_remote" ] && {{ [ "$current_remote" = "$KAIRASTRA_SEED_REPO" ] || [ -z "$current_remote" ]; }}; then
         git remote set-url origin "$source_remote"
       fi
     }}
 
-    if [ -n "${{SYMPHONY_GIT_CLONE_URL:-}}" ]; then
-      clone_with_auth "$SYMPHONY_GIT_CLONE_URL"
-      if [ -n "${{SYMPHONY_SEED_REPO:-}}" ] && [ -d "$SYMPHONY_SEED_REPO" ]; then
-        overlay_seed_repo "$SYMPHONY_SEED_REPO"
+    if [ -n "${{KAIRASTRA_GIT_CLONE_URL:-}}" ]; then
+      clone_with_auth "$KAIRASTRA_GIT_CLONE_URL"
+      if [ -n "${{KAIRASTRA_SEED_REPO:-}}" ] && [ -d "$KAIRASTRA_SEED_REPO" ]; then
+        overlay_seed_repo "$KAIRASTRA_SEED_REPO"
       fi
-    elif [ -n "${{SYMPHONY_SEED_REPO:-}}" ] && [ -d "$SYMPHONY_SEED_REPO/.git" ]; then
-      git clone "$SYMPHONY_SEED_REPO" .
+    elif [ -n "${{KAIRASTRA_SEED_REPO:-}}" ] && [ -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+      git clone "$KAIRASTRA_SEED_REPO" .
       adopt_seed_repo_origin
     else
-      echo "Set SYMPHONY_GIT_CLONE_URL, or point SYMPHONY_SEED_REPO at a git checkout, before running Symphony." >&2
+      echo "Set KAIRASTRA_GIT_CLONE_URL, or point KAIRASTRA_SEED_REPO at a git checkout, before running Kairastra." >&2
       exit 1
     fi
 
-    if [ -n "${{SYMPHONY_GIT_PUSH_URL:-}}" ]; then
-      git remote set-url --push origin "$SYMPHONY_GIT_PUSH_URL"
+    if [ -n "${{KAIRASTRA_GIT_PUSH_URL:-}}" ]; then
+      git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
     fi
 
     require_workspace_support_dirs
     configure_github_auth
 
-    git config user.name "${{SYMPHONY_GIT_AUTHOR_NAME:-Symphony}}"
-    git config user.email "${{SYMPHONY_GIT_AUTHOR_EMAIL:-symphony@users.noreply.github.com}}"
+    git config user.name "${{KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}}"
+    git config user.email "${{KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}}"
   before_run: |
     set -euo pipefail
 
@@ -738,8 +738,8 @@ hooks:
       if [ -e "$support_dir" ]; then
         return 0
       fi
-      if [ -n "${{SYMPHONY_SEED_REPO:-}}" ] && [ -e "${{SYMPHONY_SEED_REPO}}/$support_dir" ]; then
-        cp -R "${{SYMPHONY_SEED_REPO}}/$support_dir" "$support_dir"
+      if [ -n "${{KAIRASTRA_SEED_REPO:-}}" ] && [ -e "${{KAIRASTRA_SEED_REPO}}/$support_dir" ]; then
+        cp -R "${{KAIRASTRA_SEED_REPO}}/$support_dir" "$support_dir"
       fi
     }}
 
@@ -790,12 +790,12 @@ hooks:
     }}
 
     adopt_seed_repo_origin() {{
-      if [ -z "${{SYMPHONY_SEED_REPO:-}}" ] || [ ! -d "$SYMPHONY_SEED_REPO/.git" ]; then
+      if [ -z "${{KAIRASTRA_SEED_REPO:-}}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
         return 0
       fi
-      source_remote="$(git -C "$SYMPHONY_SEED_REPO" config --get remote.origin.url || true)"
+      source_remote="$(git -C "$KAIRASTRA_SEED_REPO" config --get remote.origin.url || true)"
       current_remote="$(git config --get remote.origin.url || true)"
-      if [ -n "$source_remote" ] && {{ [ "$current_remote" = "$SYMPHONY_SEED_REPO" ] || [ -z "$current_remote" ]; }}; then
+      if [ -n "$source_remote" ] && {{ [ "$current_remote" = "$KAIRASTRA_SEED_REPO" ] || [ -z "$current_remote" ]; }}; then
         git remote set-url origin "$source_remote"
       fi
     }}
@@ -803,14 +803,14 @@ hooks:
     require_workspace_support_dirs
     adopt_seed_repo_origin
 
-    if [ -n "${{SYMPHONY_GIT_PUSH_URL:-}}" ]; then
-      git remote set-url --push origin "$SYMPHONY_GIT_PUSH_URL"
+    if [ -n "${{KAIRASTRA_GIT_PUSH_URL:-}}" ]; then
+      git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
     fi
 
     configure_github_auth
 
-    git config user.name "${{SYMPHONY_GIT_AUTHOR_NAME:-Symphony}}"
-    git config user.email "${{SYMPHONY_GIT_AUTHOR_EMAIL:-symphony@users.noreply.github.com}}"
+    git config user.name "${{KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}}"
+    git config user.email "${{KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}}"
 agent:
   provider: {provider}
   max_concurrent_agents: {max_concurrent_agents}
@@ -854,20 +854,20 @@ fn render_env_file(mode: DeployMode, values: &SetupValues, workflow_path: &Path)
         .join("\n");
     match mode {
         DeployMode::Native => format!(
-            r#"# Generated by `symphony-rust setup`
-SYMPHONY_DEPLOY_MODE=native
+            r#"# Generated by `kairastra setup`
+KAIRASTRA_DEPLOY_MODE=native
 GITHUB_TOKEN={github_token}
 ANTHROPIC_API_KEY={anthropic_api_key}
 OPENAI_API_KEY={openai_api_key}
 WORKFLOW_PATH={workflow_path}
-SYMPHONY_WORKSPACE_ROOT={workspace_root}
-SYMPHONY_GITHUB_OWNER={github_owner}
-SYMPHONY_GITHUB_REPO={github_repo}
-SYMPHONY_GITHUB_PROJECT_NUMBER={github_project_number}
-SYMPHONY_GITHUB_PROJECT_URL={github_project_url}
-SYMPHONY_GIT_CLONE_URL={git_clone_url}
-SYMPHONY_SEED_REPO={seed_repo}
-SYMPHONY_AGENT_ASSIGNEE={assignee_login}
+KAIRASTRA_WORKSPACE_ROOT={workspace_root}
+KAIRASTRA_GITHUB_OWNER={github_owner}
+KAIRASTRA_GITHUB_REPO={github_repo}
+KAIRASTRA_GITHUB_PROJECT_NUMBER={github_project_number}
+KAIRASTRA_GITHUB_PROJECT_URL={github_project_url}
+KAIRASTRA_GIT_CLONE_URL={git_clone_url}
+KAIRASTRA_SEED_REPO={seed_repo}
+KAIRASTRA_AGENT_ASSIGNEE={assignee_login}
 {provider_env}
 RUST_LOG={rust_log}
 "#,
@@ -887,21 +887,21 @@ RUST_LOG={rust_log}
             rust_log = values.rust_log,
         ),
         DeployMode::Docker => format!(
-            r#"# Generated by `symphony-rust setup`
-SYMPHONY_DEPLOY_MODE=docker
+            r#"# Generated by `kairastra setup`
+KAIRASTRA_DEPLOY_MODE=docker
 GITHUB_TOKEN={github_token}
 ANTHROPIC_API_KEY={anthropic_api_key}
 OPENAI_API_KEY={openai_api_key}
 WORKFLOW_FILE={workflow_path}
 SEED_REPO_PATH={seed_repo}
-SYMPHONY_WORKSPACE_ROOT={workspace_root}
+KAIRASTRA_WORKSPACE_ROOT={workspace_root}
 RUST_LOG={rust_log}
-SYMPHONY_GITHUB_OWNER={github_owner}
-SYMPHONY_GITHUB_REPO={github_repo}
-SYMPHONY_GITHUB_PROJECT_NUMBER={github_project_number}
-SYMPHONY_GITHUB_PROJECT_URL={github_project_url}
-SYMPHONY_GIT_CLONE_URL={git_clone_url}
-SYMPHONY_AGENT_ASSIGNEE={assignee_login}
+KAIRASTRA_GITHUB_OWNER={github_owner}
+KAIRASTRA_GITHUB_REPO={github_repo}
+KAIRASTRA_GITHUB_PROJECT_NUMBER={github_project_number}
+KAIRASTRA_GITHUB_PROJECT_URL={github_project_url}
+KAIRASTRA_GIT_CLONE_URL={git_clone_url}
+KAIRASTRA_AGENT_ASSIGNEE={assignee_login}
 {provider_env}
 "#,
             github_token = values.github_token,
@@ -925,7 +925,7 @@ SYMPHONY_AGENT_ASSIGNEE={assignee_login}
 fn render_systemd_unit(values: &SetupValues, workflow_path: &Path, env_file: &Path) -> String {
     format!(
         r#"[Unit]
-Description=Symphony Rust orchestrator
+Description=Kairastra Rust orchestrator
 After=network-online.target
 Wants=network-online.target
 
@@ -984,12 +984,12 @@ mod tests {
                 }),
             ],
             github_owner: "openai".to_string(),
-            github_repo: "symphony".to_string(),
+            github_repo: "kairastra".to_string(),
             github_project_number: "7".to_string(),
             github_project_url: "https://github.com/users/openai/projects/7".to_string(),
             workspace_root: "/workspaces".to_string(),
             seed_repo: "/seed".to_string(),
-            git_clone_url: "https://github.com/openai/symphony.git".to_string(),
+            git_clone_url: "https://github.com/openai/kairastra.git".to_string(),
             assignee_login: "codex-bot".to_string(),
             max_concurrent_agents: "4".to_string(),
             max_turns: "20".to_string(),
@@ -1003,31 +1003,31 @@ mod tests {
             anthropic_api_key: String::new(),
             openai_api_key: String::new(),
             rust_log: "info".to_string(),
-            binary_path: "/usr/local/bin/symphony-rust".to_string(),
+            binary_path: "/usr/local/bin/kairastra".to_string(),
         }
     }
 
     #[test]
     fn workflow_template_uses_env_placeholders() {
         let rendered = render_workflow(&sample_values());
-        assert!(rendered.contains("owner: $SYMPHONY_GITHUB_OWNER"));
+        assert!(rendered.contains("owner: $KAIRASTRA_GITHUB_OWNER"));
         assert!(rendered.contains("provider: codex"));
-        assert!(rendered.contains("assignee_login: $SYMPHONY_AGENT_ASSIGNEE"));
+        assert!(rendered.contains("assignee_login: $KAIRASTRA_AGENT_ASSIGNEE"));
         assert!(rendered.contains("providers:"));
         assert!(rendered.contains("  codex:"));
         assert!(rendered.contains("  claude:"));
-        assert!(rendered.contains("model: $SYMPHONY_CODEX_MODEL"));
-        assert!(rendered.contains("model: $SYMPHONY_CLAUDE_MODEL"));
-        assert!(rendered.contains("reasoning_effort: $SYMPHONY_CODEX_REASONING_EFFORT"));
-        assert!(rendered.contains("reasoning_effort: $SYMPHONY_CLAUDE_REASONING_EFFORT"));
-        assert!(rendered.contains("fast: $SYMPHONY_CODEX_FAST"));
+        assert!(rendered.contains("model: $KAIRASTRA_CODEX_MODEL"));
+        assert!(rendered.contains("model: $KAIRASTRA_CLAUDE_MODEL"));
+        assert!(rendered.contains("reasoning_effort: $KAIRASTRA_CODEX_REASONING_EFFORT"));
+        assert!(rendered.contains("reasoning_effort: $KAIRASTRA_CLAUDE_REASONING_EFFORT"));
+        assert!(rendered.contains("fast: $KAIRASTRA_CODEX_FAST"));
         assert!(rendered.contains("for support_dir in .codex .github; do"));
         assert!(
             rendered.contains("Workspace bootstrap missing required repository support directory")
         );
-        assert!(rendered.contains("git -C \"$SYMPHONY_SEED_REPO\" config --get remote.origin.url"));
+        assert!(rendered.contains("git -C \"$KAIRASTRA_SEED_REPO\" config --get remote.origin.url"));
         assert!(rendered.contains("adopt_seed_repo_origin"));
-        assert!(rendered.contains("git remote set-url --push origin \"$SYMPHONY_GIT_PUSH_URL\""));
+        assert!(rendered.contains("git remote set-url --push origin \"$KAIRASTRA_GIT_PUSH_URL\""));
         assert!(rendered.contains("git config --get remote.origin.pushurl || true"));
         assert!(rendered.contains("http.https://github.com/.extraheader"));
         assert!(rendered.contains("before_run: |"));
@@ -1051,8 +1051,8 @@ mod tests {
         assert!(rendered.contains("for support_dir in .codex .github; do"));
         assert!(rendered.contains("  codex:"));
         assert!(rendered.contains("  claude:"));
-        assert!(rendered.contains("model: $SYMPHONY_CLAUDE_MODEL"));
-        assert!(rendered.contains("reasoning_effort: $SYMPHONY_CLAUDE_REASONING_EFFORT"));
+        assert!(rendered.contains("model: $KAIRASTRA_CLAUDE_MODEL"));
+        assert!(rendered.contains("reasoning_effort: $KAIRASTRA_CLAUDE_REASONING_EFFORT"));
     }
 
     #[test]
@@ -1064,12 +1064,12 @@ mod tests {
         );
         assert!(rendered.contains("WORKFLOW_FILE="));
         assert!(rendered.contains("CODEX_AUTH_MODE=subscription"));
-        assert!(rendered.contains("SYMPHONY_CODEX_MODEL=gpt-5.4"));
-        assert!(rendered.contains("SYMPHONY_CODEX_REASONING_EFFORT=high"));
-        assert!(rendered.contains("SYMPHONY_CODEX_FAST=true"));
+        assert!(rendered.contains("KAIRASTRA_CODEX_MODEL=gpt-5.4"));
+        assert!(rendered.contains("KAIRASTRA_CODEX_REASONING_EFFORT=high"));
+        assert!(rendered.contains("KAIRASTRA_CODEX_FAST=true"));
         assert!(rendered.contains("CLAUDE_AUTH_MODE=api_key"));
-        assert!(rendered.contains("SYMPHONY_CLAUDE_MODEL=sonnet"));
-        assert!(rendered.contains("SYMPHONY_CLAUDE_REASONING_EFFORT=high"));
+        assert!(rendered.contains("KAIRASTRA_CLAUDE_MODEL=sonnet"));
+        assert!(rendered.contains("KAIRASTRA_CLAUDE_REASONING_EFFORT=high"));
     }
 
     #[test]
@@ -1077,9 +1077,9 @@ mod tests {
         let rendered = render_systemd_unit(
             &sample_values(),
             Path::new("WORKFLOW.md"),
-            Path::new("symphony.env"),
+            Path::new("kairastra.env"),
         );
-        assert!(rendered.contains("ExecStart=/usr/local/bin/symphony-rust run"));
+        assert!(rendered.contains("ExecStart=/usr/local/bin/kairastra run"));
     }
 
     #[test]
@@ -1100,14 +1100,14 @@ mod tests {
 
     #[test]
     fn rejects_unrecognized_project_url() {
-        assert!(super::parse_project_url("https://github.com/openai/symphony").is_none());
+        assert!(super::parse_project_url("https://github.com/openai/kairastra").is_none());
     }
 
     #[test]
     fn parses_repo_input_from_url() {
-        let parsed = super::parse_repo_input("https://github.com/openai/symphony-gh").unwrap();
+        let parsed = super::parse_repo_input("https://github.com/openai/kairastra").unwrap();
         assert_eq!(parsed.owner.as_deref(), Some("openai"));
-        assert_eq!(parsed.repo, "symphony-gh");
+        assert_eq!(parsed.repo, "kairastra");
     }
 
     #[test]

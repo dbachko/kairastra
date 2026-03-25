@@ -17,14 +17,14 @@ pub fn collect(non_interactive: bool) -> Result<ClaudeSetupConfig> {
     let model = ask_string(
         &theme,
         "Provider model (optional)",
-        std::env::var("SYMPHONY_CLAUDE_MODEL").unwrap_or_default(),
+        std::env::var("KAIRASTRA_CLAUDE_MODEL").unwrap_or_default(),
         non_interactive,
         true,
     )?;
     let reasoning_effort = ask_string(
         &theme,
         "Thinking effort (optional: low|medium|high)",
-        std::env::var("SYMPHONY_CLAUDE_REASONING_EFFORT").unwrap_or_default(),
+        std::env::var("KAIRASTRA_CLAUDE_REASONING_EFFORT").unwrap_or_default(),
         non_interactive,
         true,
     )?;
@@ -40,8 +40,8 @@ pub fn render_workflow_section(config: &ClaudeSetupConfig) -> String {
     let _ = config;
     r#"  claude:
     command: claude
-    model: $SYMPHONY_CLAUDE_MODEL
-    reasoning_effort: $SYMPHONY_CLAUDE_REASONING_EFFORT
+    model: $KAIRASTRA_CLAUDE_MODEL
+    reasoning_effort: $KAIRASTRA_CLAUDE_REASONING_EFFORT
     approval_policy: never"#
         .to_string()
 }
@@ -49,9 +49,9 @@ pub fn render_workflow_section(config: &ClaudeSetupConfig) -> String {
 pub fn render_env_section(_mode: DeployMode, config: &ClaudeSetupConfig) -> String {
     [
         format!("CLAUDE_AUTH_MODE={}", config.auth_mode),
-        format!("SYMPHONY_CLAUDE_MODEL={}", config.model),
+        format!("KAIRASTRA_CLAUDE_MODEL={}", config.model),
         format!(
-            "SYMPHONY_CLAUDE_REASONING_EFFORT={}",
+            "KAIRASTRA_CLAUDE_REASONING_EFFORT={}",
             config.reasoning_effort
         ),
     ]

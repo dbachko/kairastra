@@ -42,7 +42,7 @@ Default: `30000`
 
 - `root`
 
-Default: OS temp dir plus `symphony_workspaces` if omitted.
+Default: OS temp dir plus `kairastra_workspaces` if omitted.
 
 ### `hooks`
 

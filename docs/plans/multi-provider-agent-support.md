@@ -2,7 +2,7 @@
 
 ## Summary
 
-This document proposes a staged implementation plan for letting Symphony orchestrate multiple
+This document proposes a staged implementation plan for letting Kairastra orchestrate multiple
 coding-agent backends instead of only Codex. The initial target providers are:
 
 - Codex (existing backend)
@@ -39,7 +39,7 @@ wrong for it.
 
 ## Goals
 
-- Let Symphony run the same orchestration loop against different coding-agent providers.
+- Let Kairastra run the same orchestration loop against different coding-agent providers.
 - Preserve the existing orchestrator behavior for claims, retries, continuation, and concurrency.
 - Keep Codex as the first-class existing backend with no functional regression.
 - Add a clean path for Claude Code and Gemini without entangling provider-specific logic in the
@@ -59,7 +59,7 @@ wrong for it.
 
 ### Decision 1: Introduce a first-class provider abstraction
 
-Symphony should define an internal backend trait that represents a live agent session rather than
+Kairastra should define an internal backend trait that represents a live agent session rather than
 hard-coding Codex app-server semantics into the runner.
 
 Illustrative shape:
@@ -129,7 +129,7 @@ Per-issue or per-state routing can be added later, but it should not complicate 
 ### Decision 4: Prefer adapters over protocol emulation inside the orchestrator
 
 Each provider backend should own its own translation layer from the provider's native CLI or SDK
-behavior into Symphony's normalized `AgentEvent` stream and `TurnResult`.
+behavior into Kairastra's normalized `AgentEvent` stream and `TurnResult`.
 
 Do not teach the orchestrator or generic runner about provider-specific wire formats.
 
@@ -330,13 +330,13 @@ This backend should land first as a no-behavior-change refactor.
 ### Claude backend
 
 Claude support should be implemented behind a dedicated backend that uses Claude's native
-non-interactive or SDK-backed execution model and maps it into Symphony's session and turn contract.
+non-interactive or SDK-backed execution model and maps it into Kairastra's session and turn contract.
 
 Important design points:
 
 - Claude may not match Codex's session/thread model exactly.
 - If persistent threads are not available or are awkward, the backend can emulate continuity at the
-  Symphony layer by carrying forward prompt context, but this should be explicit and documented.
+  Kairastra layer by carrying forward prompt context, but this should be explicit and documented.
 - Approval and tool-call semantics may differ and must be normalized inside the backend.
 
 ### Gemini backend
@@ -344,7 +344,7 @@ Important design points:
 Gemini support should follow the same pattern as Claude:
 
 - use Gemini's native CLI or SDK execution model
-- normalize structured streaming or JSON output into Symphony events
+- normalize structured streaming or JSON output into Kairastra events
 - keep provider-specific auth and invocation logic inside the backend
 
 Gemini may prove easier than Claude for CLI automation if structured machine-readable output is
@@ -393,7 +393,7 @@ Deliverables:
 
 Exit criteria:
 
-- Symphony can run a workflow with `agent.provider: claude`
+- Kairastra can run a workflow with `agent.provider: claude`
 - worker completion, retry, timeout, and continuation semantics work end to end
 
 ### Phase 4: Gemini backend
@@ -407,7 +407,7 @@ Deliverables:
 
 Exit criteria:
 
-- Symphony can run a workflow with `agent.provider: gemini`
+- Kairastra can run a workflow with `agent.provider: gemini`
 - worker completion, retry, timeout, and continuation semantics work end to end
 
 ### Phase 5: Optional routing and capability expansion

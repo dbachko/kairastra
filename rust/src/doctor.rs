@@ -174,7 +174,7 @@ fn resolve_workflow_path(explicit: Option<&PathBuf>) -> Option<PathBuf> {
 }
 
 fn infer_mode() -> DeployMode {
-    match std::env::var("SYMPHONY_DEPLOY_MODE")
+    match std::env::var("KAIRASTRA_DEPLOY_MODE")
         .unwrap_or_default()
         .trim()
         .to_lowercase()
@@ -313,7 +313,7 @@ fn check_workspace_root(path: &Path) -> DoctorCheck {
 }
 
 fn print_text_report(report: &DoctorReport) {
-    println!("Symphony doctor report");
+    println!("Kairastra doctor report");
     println!("mode: {}", report.mode.as_str());
     if let Some(path) = report.workflow_path.as_ref() {
         println!("workflow: {}", path.display());
@@ -339,10 +339,10 @@ mod tests {
 
     #[test]
     fn infer_mode_prefers_explicit_env() {
-        std::env::set_var("SYMPHONY_DEPLOY_MODE", "docker");
+        std::env::set_var("KAIRASTRA_DEPLOY_MODE", "docker");
         assert_eq!(infer_mode(), DeployMode::Docker);
-        std::env::set_var("SYMPHONY_DEPLOY_MODE", "native");
+        std::env::set_var("KAIRASTRA_DEPLOY_MODE", "native");
         assert_eq!(infer_mode(), DeployMode::Native);
-        std::env::remove_var("SYMPHONY_DEPLOY_MODE");
+        std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
     }
 }

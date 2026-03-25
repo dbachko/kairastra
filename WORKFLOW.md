@@ -3,10 +3,10 @@ tracker:
   kind: github
   mode: projects_v2
   api_key: $GITHUB_TOKEN
-  owner: $SYMPHONY_GITHUB_OWNER
-  repo: $SYMPHONY_GITHUB_REPO
-  project_v2_number: $SYMPHONY_GITHUB_PROJECT_NUMBER
-  project_url: $SYMPHONY_GITHUB_PROJECT_URL
+  owner: $KAIRASTRA_GITHUB_OWNER
+  repo: $KAIRASTRA_GITHUB_REPO
+  project_v2_number: $KAIRASTRA_GITHUB_PROJECT_NUMBER
+  project_url: $KAIRASTRA_GITHUB_PROJECT_URL
   status_source:
     type: project_field
     name: Status
@@ -27,7 +27,7 @@ tracker:
 polling:
   interval_ms: 5000
 workspace:
-  root: $SYMPHONY_WORKSPACE_ROOT
+  root: $KAIRASTRA_WORKSPACE_ROOT
 hooks:
   after_create: |
     set -euo pipefail
@@ -48,7 +48,7 @@ hooks:
       if command -v rsync >/dev/null 2>&1; then
         rsync -a --delete --exclude '.git' "${seed_repo}/" ./
       else
-        echo "rsync is required when overlaying SYMPHONY_SEED_REPO on top of a remote clone." >&2
+        echo "rsync is required when overlaying KAIRASTRA_SEED_REPO on top of a remote clone." >&2
         exit 1
       fi
     }
@@ -94,8 +94,8 @@ hooks:
       if [ -e "$support_dir" ]; then
         return 0
       fi
-      if [ -n "${SYMPHONY_SEED_REPO:-}" ] && [ -e "$SYMPHONY_SEED_REPO/$support_dir" ]; then
-        cp -R "$SYMPHONY_SEED_REPO/$support_dir" "$support_dir"
+      if [ -n "${KAIRASTRA_SEED_REPO:-}" ] && [ -e "$KAIRASTRA_SEED_REPO/$support_dir" ]; then
+        cp -R "$KAIRASTRA_SEED_REPO/$support_dir" "$support_dir"
       fi
     }
 
@@ -110,43 +110,43 @@ hooks:
     }
 
     adopt_seed_repo_origin() {
-      if [ -z "${SYMPHONY_SEED_REPO:-}" ] || [ ! -d "$SYMPHONY_SEED_REPO/.git" ]; then
+      if [ -z "${KAIRASTRA_SEED_REPO:-}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
         return 0
       fi
-      source_remote="$(git -C "$SYMPHONY_SEED_REPO" config --get remote.origin.url || true)"
+      source_remote="$(git -C "$KAIRASTRA_SEED_REPO" config --get remote.origin.url || true)"
       current_remote="$(git config --get remote.origin.url || true)"
-      if [ -n "$source_remote" ] && { [ "$current_remote" = "$SYMPHONY_SEED_REPO" ] || [ -z "$current_remote" ]; }; then
+      if [ -n "$source_remote" ] && { [ "$current_remote" = "$KAIRASTRA_SEED_REPO" ] || [ -z "$current_remote" ]; }; then
         git remote set-url origin "$source_remote"
       fi
     }
 
-    if [ -n "${SYMPHONY_GIT_CLONE_URL:-}" ]; then
-      clone_with_auth "$SYMPHONY_GIT_CLONE_URL"
-      if [ -n "${SYMPHONY_SEED_REPO:-}" ] && [ -d "$SYMPHONY_SEED_REPO" ]; then
-        overlay_seed_repo "$SYMPHONY_SEED_REPO"
+    if [ -n "${KAIRASTRA_GIT_CLONE_URL:-}" ]; then
+      clone_with_auth "$KAIRASTRA_GIT_CLONE_URL"
+      if [ -n "${KAIRASTRA_SEED_REPO:-}" ] && [ -d "$KAIRASTRA_SEED_REPO" ]; then
+        overlay_seed_repo "$KAIRASTRA_SEED_REPO"
       fi
-    elif [ -n "${SYMPHONY_SEED_REPO:-}" ] && [ -d "$SYMPHONY_SEED_REPO/.git" ]; then
-      git clone "$SYMPHONY_SEED_REPO" .
+    elif [ -n "${KAIRASTRA_SEED_REPO:-}" ] && [ -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+      git clone "$KAIRASTRA_SEED_REPO" .
       adopt_seed_repo_origin
     else
-      echo "Set SYMPHONY_GIT_CLONE_URL, or point SYMPHONY_SEED_REPO at a git checkout, before running Symphony." >&2
+      echo "Set KAIRASTRA_GIT_CLONE_URL, or point KAIRASTRA_SEED_REPO at a git checkout, before running Kairastra." >&2
       exit 1
     fi
 
-    if [ -n "${SYMPHONY_GIT_PUSH_URL:-}" ]; then
-      git remote set-url --push origin "$SYMPHONY_GIT_PUSH_URL"
+    if [ -n "${KAIRASTRA_GIT_PUSH_URL:-}" ]; then
+      git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
     fi
 
     require_workspace_support_dirs
     configure_github_auth
 
     if git rev-parse --verify origin/main >/dev/null 2>&1 && ! git merge-base HEAD origin/main >/dev/null 2>&1; then
-      echo "Workspace history does not share a merge base with origin/main. Configure SYMPHONY_GIT_CLONE_URL to the canonical remote and use SYMPHONY_SEED_REPO only as an overlay." >&2
+      echo "Workspace history does not share a merge base with origin/main. Configure KAIRASTRA_GIT_CLONE_URL to the canonical remote and use KAIRASTRA_SEED_REPO only as an overlay." >&2
       exit 1
     fi
 
-    git config user.name "${SYMPHONY_GIT_AUTHOR_NAME:-Symphony}"
-    git config user.email "${SYMPHONY_GIT_AUTHOR_EMAIL:-symphony@users.noreply.github.com}"
+    git config user.name "${KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}"
+    git config user.email "${KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}"
   before_run: |
     set -euo pipefail
 
@@ -157,8 +157,8 @@ hooks:
       if [ -e "$support_dir" ]; then
         return 0
       fi
-      if [ -n "${SYMPHONY_SEED_REPO:-}" ] && [ -e "$SYMPHONY_SEED_REPO/$support_dir" ]; then
-        cp -R "$SYMPHONY_SEED_REPO/$support_dir" "$support_dir"
+      if [ -n "${KAIRASTRA_SEED_REPO:-}" ] && [ -e "$KAIRASTRA_SEED_REPO/$support_dir" ]; then
+        cp -R "$KAIRASTRA_SEED_REPO/$support_dir" "$support_dir"
       fi
     }
 
@@ -209,12 +209,12 @@ hooks:
     }
 
     adopt_seed_repo_origin() {
-      if [ -z "${SYMPHONY_SEED_REPO:-}" ] || [ ! -d "$SYMPHONY_SEED_REPO/.git" ]; then
+      if [ -z "${KAIRASTRA_SEED_REPO:-}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
         return 0
       fi
-      source_remote="$(git -C "$SYMPHONY_SEED_REPO" config --get remote.origin.url || true)"
+      source_remote="$(git -C "$KAIRASTRA_SEED_REPO" config --get remote.origin.url || true)"
       current_remote="$(git config --get remote.origin.url || true)"
-      if [ -n "$source_remote" ] && { [ "$current_remote" = "$SYMPHONY_SEED_REPO" ] || [ -z "$current_remote" ]; }; then
+      if [ -n "$source_remote" ] && { [ "$current_remote" = "$KAIRASTRA_SEED_REPO" ] || [ -z "$current_remote" ]; }; then
         git remote set-url origin "$source_remote"
       fi
     }
@@ -222,14 +222,14 @@ hooks:
     require_workspace_support_dirs
     adopt_seed_repo_origin
 
-    if [ -n "${SYMPHONY_GIT_PUSH_URL:-}" ]; then
-      git remote set-url --push origin "$SYMPHONY_GIT_PUSH_URL"
+    if [ -n "${KAIRASTRA_GIT_PUSH_URL:-}" ]; then
+      git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
     fi
 
     configure_github_auth
 
-    git config user.name "${SYMPHONY_GIT_AUTHOR_NAME:-Symphony}"
-    git config user.email "${SYMPHONY_GIT_AUTHOR_EMAIL:-symphony@users.noreply.github.com}"
+    git config user.name "${KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}"
+    git config user.email "${KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}"
 agent:
   provider: codex
   max_concurrent_agents: 10
@@ -244,8 +244,8 @@ providers:
       networkAccess: true
   claude:
     command: claude
-    model: $SYMPHONY_CLAUDE_MODEL
-    reasoning_effort: $SYMPHONY_CLAUDE_REASONING_EFFORT
+    model: $KAIRASTRA_CLAUDE_MODEL
+    reasoning_effort: $KAIRASTRA_CLAUDE_REASONING_EFFORT
     approval_policy: never
 ---
 
@@ -377,7 +377,7 @@ The agent should be able to talk to GitHub through the injected `github_graphql`
 4. Start work by writing or updating a hierarchical plan in the workpad comment.
 5. Ensure the workpad includes a compact environment stamp at the top as a code fence line:
    - Format: `<host>:<abs-workdir>@<short-sha>`
-   - Example: `devbox-01:/home/dev-user/code/symphony-workspaces/issue-32@7bdde33`
+   - Example: `devbox-01:/home/dev-user/code/kairastra-workspaces/issue-32@7bdde33`
    - Do not include metadata already inferable from issue fields such as issue ID, status, branch, or PR link.
 6. Add explicit acceptance criteria and TODOs in checklist form in the same comment.
    - If changes are user-facing, include a UI walkthrough acceptance criterion that describes the end-to-end user path to validate.
@@ -456,7 +456,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work
 12. Only then move the issue to `Human Review`.
     - Exception: if blocked by missing required non-GitHub tools or auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
-    - Symphony's runtime handoff gate also enforces this and keeps the issue in `In Progress` while the PR is missing, the workpad is still bootstrap-only, or GitHub Actions / required PR checks are not green.
+    - Kairastra's runtime handoff gate also enforces this and keeps the issue in `In Progress` while the PR is missing, the workpad is still bootstrap-only, or GitHub Actions / required PR checks are not green.
 13. For `Todo` issues that already had a PR attached at kickoff:
     - ensure all existing PR feedback was reviewed and resolved
     - ensure the branch was pushed with any required updates

@@ -9,7 +9,7 @@ use serde_yaml::Value as YamlValue;
 use crate::model::WorkflowDefinition;
 
 const DEFAULT_POLL_INTERVAL_MS: u64 = 30_000;
-const DEFAULT_WORKSPACE_ROOT: &str = "symphony_workspaces";
+const DEFAULT_WORKSPACE_ROOT: &str = "kairastra_workspaces";
 const DEFAULT_HOOK_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_CONCURRENT_AGENTS: usize = 10;
 const DEFAULT_MAX_TURNS: usize = 20;
@@ -677,16 +677,16 @@ agent:
     #[test]
     fn resolves_env_backed_owner_and_repo() {
         env::set_var("GITHUB_TOKEN", "token-123");
-        env::set_var("SYMPHONY_GITHUB_OWNER", "openai");
-        env::set_var("SYMPHONY_GITHUB_REPO", "symphony");
+        env::set_var("KAIRASTRA_GITHUB_OWNER", "openai");
+        env::set_var("KAIRASTRA_GITHUB_REPO", "kairastra");
 
         let definition = WorkflowDefinition {
             config: serde_yaml::from_str(
                 r#"
 tracker:
   kind: github
-  owner: $SYMPHONY_GITHUB_OWNER
-  repo: $SYMPHONY_GITHUB_REPO
+  owner: $KAIRASTRA_GITHUB_OWNER
+  repo: $KAIRASTRA_GITHUB_REPO
   project_v2_number: 7
 agent:
   provider: codex
@@ -700,13 +700,13 @@ providers:
 
         let settings = Settings::from_workflow(&definition).unwrap();
         assert_eq!(settings.tracker.owner, "openai");
-        assert_eq!(settings.tracker.repo.as_deref(), Some("symphony"));
+        assert_eq!(settings.tracker.repo.as_deref(), Some("kairastra"));
     }
 
     #[test]
     fn resolves_env_backed_agent_assignee_login() {
         env::set_var("GITHUB_TOKEN", "token-123");
-        env::set_var("SYMPHONY_AGENT_ASSIGNEE", "Codex-Bot");
+        env::set_var("KAIRASTRA_AGENT_ASSIGNEE", "Codex-Bot");
         let definition = WorkflowDefinition {
             config: serde_yaml::from_str(
                 r#"
@@ -716,7 +716,7 @@ tracker:
   project_v2_number: 7
 agent:
   provider: codex
-  assignee_login: $SYMPHONY_AGENT_ASSIGNEE
+  assignee_login: $KAIRASTRA_AGENT_ASSIGNEE
 providers:
   codex: {}
 "#,
@@ -737,9 +737,9 @@ providers:
     #[test]
     fn resolves_env_backed_project_number_and_dashboard_url() {
         env::set_var("GITHUB_TOKEN", "token-123");
-        env::set_var("SYMPHONY_PROJECT_NUMBER", "19");
+        env::set_var("KAIRASTRA_PROJECT_NUMBER", "19");
         env::set_var(
-            "SYMPHONY_PROJECT_URL",
+            "KAIRASTRA_PROJECT_URL",
             "https://github.com/users/dbachko/projects/19",
         );
         let definition = WorkflowDefinition {
@@ -748,8 +748,8 @@ providers:
 tracker:
   kind: github
   owner: dbachko
-  project_v2_number: $SYMPHONY_PROJECT_NUMBER
-  project_url: $SYMPHONY_PROJECT_URL
+  project_v2_number: $KAIRASTRA_PROJECT_NUMBER
+  project_url: $KAIRASTRA_PROJECT_URL
 agent:
   provider: codex
 providers:

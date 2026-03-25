@@ -208,8 +208,8 @@ impl CodexSession {
                     "experimentalApi": true
                 },
                 "clientInfo": {
-                    "name": "symphony-rust",
-                    "title": "Symphony Rust",
+                    "name": "kairastra",
+                    "title": "Kairastra Rust",
                     "version": "0.1.0"
                 }
             }
@@ -866,7 +866,7 @@ fn dynamic_tool_specs() -> JsonValue {
     json!([
         {
             "name": "github_graphql",
-            "description": "Execute a raw GraphQL query or mutation against GitHub using Symphony's configured auth.",
+            "description": "Execute a raw GraphQL query or mutation against GitHub using Kairastra's configured auth.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
