@@ -60,7 +60,10 @@ ensure_runtime_home() {
     ln -s "$gemini_auth_dir" "$kairastra_home/.gemini"
   fi
 
-  if [[ ! -e "$kairastra_home/.claude.json" ]]; then
+  # ~/.claude.json can legitimately be a symlink to a file that Claude has not
+  # created yet. In that case `-e` is false, but we still must not recreate the
+  # link on every startup.
+  if [[ ! -e "$kairastra_home/.claude.json" && ! -L "$kairastra_home/.claude.json" ]]; then
     ln -s "$claude_auth_dir/.claude.json" "$kairastra_home/.claude.json"
   fi
 
