@@ -192,6 +192,10 @@ make docker-up
 make docker-login
 ```
 
+`make docker-up` now runs a Docker-scoped `doctor` preflight before starting the long-lived
+service, so missing workflow env vars or invalid tracker settings fail once at startup instead of
+triggering a Compose restart loop.
+
 `make docker-login` opens a provider picker that shows which providers are already ready and which
 still need action. Codex, Claude, and Gemini can use subscription login in Docker, and API-key auth
 is still available when you want it. You can skip the picker with

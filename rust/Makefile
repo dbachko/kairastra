@@ -6,7 +6,7 @@ COMPOSE_PROJECT ?= $(notdir $(CURDIR))
 
 DOCKER_COMPOSE := docker compose -p $(COMPOSE_PROJECT) -f $(COMPOSE_FILE) --env-file $(ENV_FILE)
 
-.PHONY: docker-build docker-up docker-down docker-logs docker-login docker-login-codex docker-login-claude docker-login-gemini docker-clean-oneoff
+.PHONY: docker-build docker-up docker-down docker-logs docker-login docker-login-codex docker-login-claude docker-login-gemini docker-clean-oneoff docker-doctor
 
 docker-clean-oneoff:
 	@ids="$$(docker ps -aq --filter label=com.docker.compose.project=$(COMPOSE_PROJECT) --filter label=com.docker.compose.oneoff=True)"; \
@@ -17,8 +17,11 @@ docker-clean-oneoff:
 docker-build:
 	$(DOCKER_COMPOSE) build
 
-docker-up:
-	$(DOCKER_COMPOSE) up -d --build
+docker-doctor: docker-clean-oneoff
+	$(DOCKER_COMPOSE) run --rm --remove-orphans $(SERVICE) doctor --workflow /config/WORKFLOW.md
+
+docker-up: docker-build docker-doctor
+	$(DOCKER_COMPOSE) up -d
 
 docker-down: docker-clean-oneoff
 	$(DOCKER_COMPOSE) down --remove-orphans
