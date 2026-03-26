@@ -10,6 +10,7 @@ use kairastra::auth::{inspect_status, run_login, run_login_menu, AuthMode};
 use kairastra::deploy::DeployMode;
 use kairastra::doctor::{run as run_doctor, DoctorFormat, DoctorOptions};
 use kairastra::github::GitHubTracker;
+use kairastra::github_mcp;
 use kairastra::orchestrator::Orchestrator;
 use kairastra::setup::{run as run_setup, SetupOptions};
 use kairastra::workflow::{default_workflow_path, WorkflowStore};
@@ -28,6 +29,7 @@ enum Command {
     Setup(SetupArgs),
     Doctor(DoctorArgs),
     Auth(AuthArgs),
+    GithubMcp,
 }
 
 #[derive(Debug, Args)]
@@ -162,6 +164,7 @@ async fn main() -> Result<()> {
             provider,
             command: AuthCommand::Menu,
         }) => run_login_menu(provider.as_deref()),
+        Command::GithubMcp => github_mcp::run().await,
     }
 }
 

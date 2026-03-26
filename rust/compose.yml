@@ -6,6 +6,7 @@ services:
       args:
         CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.114.0}
         CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-2.1.81}
+        GEMINI_CLI_VERSION: ${GEMINI_CLI_VERSION:-0.35.0}
     environment:
       KAIRASTRA_DEPLOY_MODE: docker
       KAIRASTRA_USER: ${KAIRASTRA_USER:-kairastra}
@@ -13,9 +14,12 @@ services:
       GITHUB_TOKEN: ${GITHUB_TOKEN}
       CODEX_AUTH_MODE: ${CODEX_AUTH_MODE:-auto}
       CLAUDE_AUTH_MODE: ${CLAUDE_AUTH_MODE:-auto}
+      GEMINI_AUTH_MODE: ${GEMINI_AUTH_MODE:-auto}
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       KAIRASTRA_CLAUDE_KEYRING_PASSWORD: ${KAIRASTRA_CLAUDE_KEYRING_PASSWORD:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       WORKFLOW_PATH: /config/WORKFLOW.md
       KAIRASTRA_WORKSPACE_ROOT: ${KAIRASTRA_WORKSPACE_ROOT:-/workspaces}
@@ -29,6 +33,8 @@ services:
       KAIRASTRA_CODEX_FAST: ${KAIRASTRA_CODEX_FAST:-false}
       KAIRASTRA_CLAUDE_MODEL: ${KAIRASTRA_CLAUDE_MODEL:-}
       KAIRASTRA_CLAUDE_REASONING_EFFORT: ${KAIRASTRA_CLAUDE_REASONING_EFFORT:-}
+      KAIRASTRA_GEMINI_MODEL: ${KAIRASTRA_GEMINI_MODEL:-}
+      KAIRASTRA_GEMINI_APPROVAL_MODE: ${KAIRASTRA_GEMINI_APPROVAL_MODE:-yolo}
       KAIRASTRA_GIT_CLONE_URL: ${KAIRASTRA_GIT_CLONE_URL:-}
       KAIRASTRA_GIT_PUSH_URL: ${KAIRASTRA_GIT_PUSH_URL:-}
       KAIRASTRA_AGENT_ASSIGNEE: ${KAIRASTRA_AGENT_ASSIGNEE:-}
@@ -42,6 +48,7 @@ services:
       - kairastra_home:${KAIRASTRA_HOME:-/home/kairastra}
       - kairastra_codex:/var/lib/kairastra-auth/codex
       - kairastra_claude:/var/lib/kairastra-auth/claude
+      - kairastra_gemini:/var/lib/kairastra-auth/gemini
     restart: unless-stopped
 
 volumes:
@@ -49,3 +56,4 @@ volumes:
   kairastra_home:
   kairastra_codex:
   kairastra_claude:
+  kairastra_gemini:

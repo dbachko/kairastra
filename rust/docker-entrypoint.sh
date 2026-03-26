@@ -3,11 +3,13 @@ set -euo pipefail
 
 codex_auth_mode="${CODEX_AUTH_MODE:-auto}"
 claude_auth_mode="${CLAUDE_AUTH_MODE:-auto}"
+gemini_auth_mode="${GEMINI_AUTH_MODE:-auto}"
 kairastra_user="${KAIRASTRA_USER:-kairastra}"
 kairastra_home="${KAIRASTRA_HOME:-/home/kairastra}"
 workspace_root="${KAIRASTRA_WORKSPACE_ROOT:-/workspaces}"
 codex_auth_dir="/var/lib/kairastra-auth/codex"
 claude_auth_dir="/var/lib/kairastra-auth/claude"
+gemini_auth_dir="/var/lib/kairastra-auth/gemini"
 claude_oauth_token_file="$claude_auth_dir/oauth-token"
 
 case "$codex_auth_mode" in
@@ -26,6 +28,14 @@ case "$claude_auth_mode" in
     ;;
 esac
 
+case "$gemini_auth_mode" in
+  auto|api_key|subscription) ;;
+  *)
+    echo "Unsupported GEMINI_AUTH_MODE='$gemini_auth_mode' (expected auto|api_key|subscription)" >&2
+    exit 1
+    ;;
+esac
+
 run_as_kairastra() {
   HOME="$kairastra_home" \
   USER="$kairastra_user" \
@@ -34,8 +44,51 @@ run_as_kairastra() {
     gosu "$kairastra_user" "$@"
 }
 
+seed_gemini_cli_defaults() {
+  local gemini_settings_file="$gemini_auth_dir/settings.json"
+  local gemini_trusted_folders_file="$gemini_auth_dir/trustedFolders.json"
+  local tmp_file
+
+  tmp_file="$(mktemp)"
+  if [[ -f "$gemini_settings_file" ]]; then
+    if jq '.general = ((.general // {}) + {"enableAutoUpdate": false, "enableAutoUpdateNotification": false})' "$gemini_settings_file" > "$tmp_file" 2>/dev/null; then
+      mv "$tmp_file" "$gemini_settings_file"
+    else
+      rm -f "$tmp_file"
+    fi
+  else
+    cat > "$tmp_file" <<'EOF'
+{
+  "general": {
+    "enableAutoUpdate": false,
+    "enableAutoUpdateNotification": false
+  }
+}
+EOF
+    mv "$tmp_file" "$gemini_settings_file"
+  fi
+
+  tmp_file="$(mktemp)"
+  if [[ -f "$gemini_trusted_folders_file" ]]; then
+    if jq 'if has("/app") then . else . + {"/app":"TRUST_FOLDER"} end' "$gemini_trusted_folders_file" > "$tmp_file" 2>/dev/null; then
+      mv "$tmp_file" "$gemini_trusted_folders_file"
+    else
+      rm -f "$tmp_file"
+    fi
+  else
+    cat > "$tmp_file" <<'EOF'
+{
+  "/app": "TRUST_FOLDER"
+}
+EOF
+    mv "$tmp_file" "$gemini_trusted_folders_file"
+  fi
+
+  chmod 600 "$gemini_settings_file" "$gemini_trusted_folders_file" 2>/dev/null || true
+}
+
 ensure_runtime_home() {
-  mkdir -p "$kairastra_home" "$workspace_root" "$codex_auth_dir" "$claude_auth_dir"
+  mkdir -p "$kairastra_home" "$workspace_root" "$codex_auth_dir" "$claude_auth_dir" "$gemini_auth_dir"
   mkdir -p "$kairastra_home/.local/bin"
 
   if [[ ! -e "$kairastra_home/.codex" ]]; then
@@ -46,15 +99,25 @@ ensure_runtime_home() {
     ln -s "$claude_auth_dir" "$kairastra_home/.claude"
   fi
 
-  if [[ ! -e "$kairastra_home/.claude.json" ]]; then
+  if [[ ! -e "$kairastra_home/.gemini" ]]; then
+    ln -s "$gemini_auth_dir" "$kairastra_home/.gemini"
+  fi
+
+  # ~/.claude.json can legitimately be a symlink to a file that Claude has not
+  # created yet. In that case `-e` is false, but we still must not recreate the
+  # link on every startup.
+  if [[ ! -e "$kairastra_home/.claude.json" && ! -L "$kairastra_home/.claude.json" ]]; then
     ln -s "$claude_auth_dir/.claude.json" "$kairastra_home/.claude.json"
   fi
+
+  seed_gemini_cli_defaults
 
   chown -R "$kairastra_user:$kairastra_user" \
     "$workspace_root" \
     "$kairastra_home" \
     "$codex_auth_dir" \
-    "$claude_auth_dir"
+    "$claude_auth_dir" \
+    "$gemini_auth_dir"
 
   if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
     printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" > "$claude_oauth_token_file"

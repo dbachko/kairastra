@@ -638,28 +638,9 @@ impl Orchestrator {
                         usage_delta = Some(apply_token_usage(running, usage));
                     }
                     rate_limits = extract_rate_limits(&event.payload);
-                    let is_codex = running.provider.eq_ignore_ascii_case("codex");
-                    if is_codex {
-                        log_codex_event(&running.identifier, &event);
-                    }
-                    match event.event {
-                        AgentEventKind::SessionStarted => {
-                            running.turn_count = running.turn_count.max(1);
-                        }
-                        AgentEventKind::TurnFailed
-                        | AgentEventKind::TurnCancelled
-                        | AgentEventKind::TurnInputRequired
-                        | AgentEventKind::ApprovalRequired
-                        | AgentEventKind::TurnEndedWithError => {
-                            if !is_codex {
-                                warn!(
-                                    issue_identifier = %running.identifier,
-                                    payload = %event.payload,
-                                    "worker emitted terminal app-server event"
-                                );
-                            }
-                        }
-                        _ => {}
+                    log_provider_event(&running.provider, &running.identifier, &event);
+                    if let AgentEventKind::SessionStarted = event.event {
+                        running.turn_count = running.turn_count.max(1);
                     }
                 }
                 if let Some(delta) = usage_delta {
@@ -883,6 +864,126 @@ struct BlockedIssueContext<'a> {
     blocked: &'a BlockedWorkerFailure,
 }
 
+fn log_provider_event(provider: &str, issue_identifier: &str, event: &AgentEvent) {
+    if provider.eq_ignore_ascii_case("codex") {
+        log_codex_event(issue_identifier, event);
+    } else {
+        log_generic_agent_event(provider, issue_identifier, event);
+    }
+}
+
+fn log_generic_agent_event(provider: &str, issue_identifier: &str, event: &AgentEvent) {
+    match event.event {
+        AgentEventKind::SessionStarted => {
+            let session_id = event
+                .payload
+                .get("session_id")
+                .and_then(JsonValue::as_str)
+                .or(event.session_id.as_deref())
+                .unwrap_or("unknown");
+            info!(
+                issue_identifier = %issue_identifier,
+                provider,
+                session_id,
+                "agent session started"
+            );
+        }
+        AgentEventKind::Notification => {
+            log_generic_notification(provider, issue_identifier, &event.payload)
+        }
+        AgentEventKind::TurnCompleted => {
+            if let Some(usage) = extract_token_usage(&event.payload) {
+                info!(
+                    issue_identifier = %issue_identifier,
+                    provider,
+                    input_tokens = usage.input_tokens,
+                    output_tokens = usage.output_tokens,
+                    total_tokens = usage.total_tokens,
+                    "agent turn completed"
+                );
+            } else {
+                info!(
+                    issue_identifier = %issue_identifier,
+                    provider,
+                    "agent turn completed"
+                );
+            }
+        }
+        AgentEventKind::ApprovalRequired => {
+            warn!(
+                issue_identifier = %issue_identifier,
+                provider,
+                payload = %event.payload,
+                "agent approval required"
+            );
+        }
+        AgentEventKind::TurnInputRequired => {
+            warn!(
+                issue_identifier = %issue_identifier,
+                provider,
+                payload = %event.payload,
+                "agent turn input required"
+            );
+        }
+        AgentEventKind::TurnFailed
+        | AgentEventKind::TurnCancelled
+        | AgentEventKind::TurnEndedWithError => {
+            warn!(
+                issue_identifier = %issue_identifier,
+                provider,
+                payload = %event.payload,
+                "agent turn ended with error"
+            );
+        }
+        AgentEventKind::ToolCallCompleted => {
+            let (tool_name, tool_id) = tool_log_fields(&event.payload);
+            info!(
+                issue_identifier = %issue_identifier,
+                provider,
+                tool_name = tool_name.unwrap_or("unknown"),
+                tool_id = tool_id.unwrap_or("unknown"),
+                "agent tool completed"
+            );
+        }
+        AgentEventKind::ToolCallFailed => {
+            let (tool_name, tool_id) = tool_log_fields(&event.payload);
+            warn!(
+                issue_identifier = %issue_identifier,
+                provider,
+                tool_name = tool_name.unwrap_or("unknown"),
+                tool_id = tool_id.unwrap_or("unknown"),
+                payload = %event.payload,
+                "agent tool failed"
+            );
+        }
+        AgentEventKind::UnsupportedToolCall => {
+            warn!(
+                issue_identifier = %issue_identifier,
+                provider,
+                payload = %event.payload,
+                "agent requested unsupported tool"
+            );
+        }
+        AgentEventKind::ToolInputAutoAnswered => {
+            info!(
+                issue_identifier = %issue_identifier,
+                provider,
+                payload = %event.payload,
+                "agent tool input auto-answered"
+            );
+        }
+        AgentEventKind::Malformed => {
+            warn!(
+                issue_identifier = %issue_identifier,
+                provider,
+                payload = %event.payload,
+                "agent emitted malformed payload"
+            );
+        }
+        AgentEventKind::ApprovalAutoApproved | AgentEventKind::OtherMessage => {}
+    }
+}
+
 fn log_codex_event(issue_identifier: &str, event: &AgentEvent) {
     match event.event {
         AgentEventKind::SessionStarted => {
@@ -954,6 +1055,36 @@ fn log_codex_event(issue_identifier: &str, event: &AgentEvent) {
         AgentEventKind::Notification => log_codex_notification(issue_identifier, &event.payload),
         _ => {}
     }
+}
+
+fn log_generic_notification(provider: &str, issue_identifier: &str, payload: &serde_json::Value) {
+    let (tool_name, tool_id) = tool_log_fields(payload);
+    let Some(tool_name) = tool_name else {
+        return;
+    };
+
+    info!(
+        issue_identifier = %issue_identifier,
+        provider,
+        tool_name,
+        tool_id = tool_id.unwrap_or("unknown"),
+        "agent tool started"
+    );
+}
+
+fn tool_log_fields(payload: &JsonValue) -> (Option<&str>, Option<&str>) {
+    let tool_name = payload
+        .get("tool_name")
+        .and_then(JsonValue::as_str)
+        .or_else(|| payload.get("name").and_then(JsonValue::as_str))
+        .or_else(|| payload.get("tool").and_then(JsonValue::as_str));
+    let tool_id = payload
+        .get("tool_id")
+        .and_then(JsonValue::as_str)
+        .or_else(|| payload.get("tool_use_id").and_then(JsonValue::as_str))
+        .or_else(|| payload.get("id").and_then(JsonValue::as_str));
+
+    (tool_name, tool_id)
 }
 
 fn log_codex_notification(issue_identifier: &str, payload: &serde_json::Value) {
@@ -1318,6 +1449,7 @@ fn classify_blocked_worker_failure(provider: &str, error: &str) -> Option<Blocke
         "Run Claude in a non-root environment or change `providers.claude.permission_mode` / `approval_policy` so Docker does not request bypass permissions, then move the issue back to `Todo` or `In Progress`.".to_string()
     } else if normalized.contains("failed to launch claude code")
         || normalized.contains("failed to launch codex app-server")
+        || normalized.contains("failed to launch gemini cli")
         || normalized.contains("no such file or directory")
         || normalized.contains("command not found")
     {
@@ -1399,6 +1531,7 @@ fn provider_display_name(provider: &str) -> &'static str {
     match provider {
         "claude" => "Claude",
         "codex" => "Codex",
+        "gemini" => "Gemini",
         _ => "provider",
     }
 }
@@ -1663,8 +1796,9 @@ mod tests {
     use super::{
         classify_blocked_worker_failure, classify_provider_selection_block, extract_rate_limits,
         extract_token_usage, issue_eligible, issue_provider, issue_sort_key, merge_blocker_section,
-        render_blocked_failure_workpad, select_dispatchable, usage_delta, IssueProviderSelection,
-        RuntimeState, TokenUsage, BLOCKER_SECTION_END, BLOCKER_SECTION_START,
+        render_blocked_failure_workpad, select_dispatchable, tool_log_fields, usage_delta,
+        IssueProviderSelection, RuntimeState, TokenUsage, BLOCKER_SECTION_END,
+        BLOCKER_SECTION_START,
     };
     use crate::workflow::WorkflowSnapshot;
 
@@ -2039,5 +2173,29 @@ providers:
         assert!(body.starts_with("## Claude Workpad"));
         assert!(body.contains("/workspaces/openai_repo_55"));
         assert!(body.contains("issues/55"));
+    }
+
+    #[test]
+    fn tool_log_fields_support_gemini_payloads() {
+        let payload = json!({
+            "tool_name": "mcp_kairastra_github_github_rest",
+            "tool_id": "tool-123"
+        });
+
+        let (tool_name, tool_id) = tool_log_fields(&payload);
+        assert_eq!(tool_name, Some("mcp_kairastra_github_github_rest"));
+        assert_eq!(tool_id, Some("tool-123"));
+    }
+
+    #[test]
+    fn tool_log_fields_support_claude_payloads() {
+        let payload = json!({
+            "name": "github_rest",
+            "tool_use_id": "toolu_abc"
+        });
+
+        let (tool_name, tool_id) = tool_log_fields(&payload);
+        assert_eq!(tool_name, Some("github_rest"));
+        assert_eq!(tool_id, Some("toolu_abc"));
     }
 }

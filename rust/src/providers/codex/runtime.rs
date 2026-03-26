@@ -6,7 +6,6 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use reqwest::Method;
 use serde_json::{json, Value as JsonValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -17,6 +16,10 @@ use tracing::{debug, warn};
 use crate::agent::{AgentBackend, AgentEvent, AgentEventKind, AgentSession, TurnResult};
 use crate::config::Settings;
 use crate::github::GitHubTracker;
+use crate::github_tools::{
+    execute_github_graphql as execute_shared_github_graphql,
+    execute_github_rest as execute_shared_github_rest, tool_schemas,
+};
 use crate::model::Issue;
 
 use super::config::CodexConfig;
@@ -863,61 +866,11 @@ fn needs_input(method: &str, payload: &JsonValue) -> bool {
 }
 
 fn dynamic_tool_specs() -> JsonValue {
-    json!([
-        {
-            "name": "github_graphql",
-            "description": "Execute a raw GraphQL query or mutation against GitHub using Kairastra's configured auth.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["query"],
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "GraphQL query or mutation document."
-                    },
-                    "variables": {
-                        "type": ["object", "null"],
-                        "additionalProperties": true
-                    }
-                }
-            }
-        },
-        {
-            "name": "github_rest",
-            "description": "Execute a small allow-listed set of GitHub REST endpoints.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["method", "path"],
-                "properties": {
-                    "method": { "type": "string" },
-                    "path": { "type": "string" },
-                    "body": { "type": ["object", "null"], "additionalProperties": true }
-                }
-            }
-        }
-    ])
+    JsonValue::Array(tool_schemas())
 }
 
 async fn execute_github_graphql(tracker: &GitHubTracker, arguments: JsonValue) -> JsonValue {
-    let query = arguments
-        .get("query")
-        .and_then(JsonValue::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let Some(query) = query else {
-        return dynamic_tool_failure(json!({
-            "error": { "message": "`github_graphql` requires a non-empty `query` string." }
-        }));
-    };
-
-    let variables = arguments
-        .get("variables")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    match tracker.graphql_raw(query, variables).await {
+    match execute_shared_github_graphql(tracker, arguments).await {
         Ok(response) => dynamic_tool_response(true, response),
         Err(error) => dynamic_tool_failure(json!({
             "error": { "message": error.to_string() }
@@ -926,53 +879,12 @@ async fn execute_github_graphql(tracker: &GitHubTracker, arguments: JsonValue) -
 }
 
 async fn execute_github_rest(tracker: &GitHubTracker, arguments: JsonValue) -> JsonValue {
-    let method = arguments
-        .get("method")
-        .and_then(JsonValue::as_str)
-        .map(|value| value.to_uppercase());
-    let path = arguments.get("path").and_then(JsonValue::as_str);
-
-    let (Some(method), Some(path)) = (method, path) else {
-        return dynamic_tool_failure(json!({
-            "error": {
-                "message": "`github_rest` expects `method` and `path`."
-            }
-        }));
-    };
-
-    if !rest_path_allowed(path) {
-        return dynamic_tool_failure(json!({
-            "error": {
-                "message": format!("REST path not allow-listed: {path}")
-            }
-        }));
-    }
-
-    let method = match method.as_str() {
-        "GET" => Method::GET,
-        "POST" => Method::POST,
-        "PATCH" => Method::PATCH,
-        other => {
-            return dynamic_tool_failure(json!({
-                "error": {
-                    "message": format!("Unsupported github_rest method: {other}")
-                }
-            }))
-        }
-    };
-
-    let body = arguments.get("body").cloned();
-
-    match tracker.rest_json(method, path, body).await {
+    match execute_shared_github_rest(tracker, arguments).await {
         Ok(response) => dynamic_tool_response(true, response),
         Err(error) => dynamic_tool_failure(json!({
             "error": { "message": error.to_string() }
         })),
     }
-}
-
-fn rest_path_allowed(path: &str) -> bool {
-    path.contains("/issues/") || path.contains("/pulls/")
 }
 
 fn dynamic_tool_response(success: bool, payload: JsonValue) -> JsonValue {
