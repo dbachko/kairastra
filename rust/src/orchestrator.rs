@@ -639,11 +639,8 @@ impl Orchestrator {
                     }
                     rate_limits = extract_rate_limits(&event.payload);
                     log_provider_event(&running.provider, &running.identifier, &event);
-                    match event.event {
-                        AgentEventKind::SessionStarted => {
-                            running.turn_count = running.turn_count.max(1);
-                        }
-                        _ => {}
+                    if let AgentEventKind::SessionStarted = event.event {
+                        running.turn_count = running.turn_count.max(1);
                     }
                 }
                 if let Some(delta) = usage_delta {
