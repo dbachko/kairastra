@@ -1,5 +1,9 @@
+use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -11,6 +15,10 @@ const AUTH_DIR_NAME: &str = ".gemini";
 const AUTH_FILE_NAME: &str = "oauth_creds.json";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const AUTH_MODE_ENV: &str = "GEMINI_AUTH_MODE";
+const SUBSCRIPTION_AUTH_TYPES: &[&str] = &["oauth-personal", "google", "login_with_google"];
+const API_KEY_AUTH_TYPE: &str = "gemini-api-key";
+const GEMINI_LOGIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const GEMINI_LOGIN_SETTLE_DELAY: Duration = Duration::from_millis(750);
 const DOCKER_VOLUME_HINT: &str =
     "Docker mode persists Gemini auth through the kairastra_home and kairastra_gemini volumes mounted for the non-root runtime user.";
 
@@ -30,6 +38,14 @@ struct GeminiAuthConfig {
     selected_type: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeminiLoginState {
+    auth_file_present: bool,
+    auth_file_size: Option<u64>,
+    auth_file_modified: Option<SystemTime>,
+    selected_type: Option<String>,
+}
+
 pub fn inspect_status() -> AuthStatus {
     let configured_mode = AuthMode::from_env_var(AUTH_MODE_ENV);
     let api_key_present = gemini_api_key_present();
@@ -41,9 +57,9 @@ pub fn inspect_status() -> AuthStatus {
         AuthMode::ApiKey => AuthMode::ApiKey,
         AuthMode::Subscription => AuthMode::Subscription,
         AuthMode::Auto => {
-            if api_key_present || selected_type.as_deref() == Some("gemini-api-key") {
+            if api_key_present || selected_type.as_deref() == Some(API_KEY_AUTH_TYPE) {
                 AuthMode::ApiKey
-            } else if auth_file_present || selected_type.as_deref() == Some("oauth-personal") {
+            } else if auth_file_present || is_subscription_selected_type(selected_type.as_deref()) {
                 AuthMode::Subscription
             } else {
                 AuthMode::Auto
@@ -70,17 +86,41 @@ pub fn run_login(mode: AuthMode) -> Result<()> {
 
     match mode {
         AuthMode::Subscription => {
-            let status = Command::new(command)
+            let baseline = read_login_state();
+            eprintln!(
+                "Gemini opens its own interactive auth UI. Kairastra will close it once the login is saved."
+            );
+            eprintln!("If you are re-authenticating over an existing login, type /quit when you are done.");
+
+            let mut child = Command::new(command)
                 .args(["--prompt-interactive", "/auth"])
                 .env_remove("GEMINI_API_KEY")
                 .env_remove("GOOGLE_API_KEY")
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
-                .status()
+                .spawn()
                 .context("failed to launch `gemini --prompt-interactive /auth`")?;
-            if !status.success() {
-                return Err(anyhow!("gemini_login_failed"));
+
+            loop {
+                if login_completed_since(&baseline, &read_login_state()) {
+                    eprintln!();
+                    eprintln!("Gemini login saved. Closing Gemini CLI...");
+                    thread::sleep(GEMINI_LOGIN_SETTLE_DELAY);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    restore_terminal_after_forced_exit();
+                    break;
+                }
+
+                if let Some(status) = child.try_wait().context("failed to poll Gemini login")? {
+                    if !status.success() && !login_completed_since(&baseline, &read_login_state()) {
+                        return Err(anyhow!("gemini_login_failed"));
+                    }
+                    break;
+                }
+
+                thread::sleep(GEMINI_LOGIN_POLL_INTERVAL);
             }
         }
         AuthMode::ApiKey => {
@@ -110,6 +150,38 @@ fn settings_file_path() -> PathBuf {
     PathBuf::from(AUTH_DIR_NAME).join(SETTINGS_FILE_NAME)
 }
 
+fn read_login_state() -> GeminiLoginState {
+    let auth_path = auth_file_path();
+    let auth_metadata = fs::metadata(&auth_path)
+        .ok()
+        .filter(|metadata| metadata.is_file());
+
+    GeminiLoginState {
+        auth_file_present: auth_metadata.is_some(),
+        auth_file_size: auth_metadata.as_ref().map(|metadata| metadata.len()),
+        auth_file_modified: auth_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok()),
+        selected_type: read_selected_auth_type(),
+    }
+}
+
+fn login_completed_since(baseline: &GeminiLoginState, current: &GeminiLoginState) -> bool {
+    current != baseline
+        && current.auth_file_present
+        && current.auth_file_size.unwrap_or(0) > 0
+        && is_subscription_selected_type(current.selected_type.as_deref())
+}
+
+fn is_subscription_selected_type(selected_type: Option<&str>) -> bool {
+    SUBSCRIPTION_AUTH_TYPES.contains(&selected_type.unwrap_or_default())
+}
+
+fn restore_terminal_after_forced_exit() {
+    let _ = io::stderr().write_all(b"\x1b[?1049l\x1b[?25h\x1b[0m\r\n");
+    let _ = io::stderr().flush();
+}
+
 fn read_selected_auth_type() -> Option<String> {
     let contents = std::fs::read_to_string(settings_file_path()).ok()?;
     let parsed = serde_json::from_str::<GeminiSettingsFile>(&contents).ok()?;
@@ -134,8 +206,12 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
-    use super::inspect_status;
+    use super::{
+        inspect_status, is_subscription_selected_type, login_completed_since, read_login_state,
+        run_login,
+    };
     use crate::auth::AuthMode;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -204,5 +280,89 @@ mod tests {
         assert_eq!(status.inferred_mode, AuthMode::Subscription);
         assert!(status.auth_file_present);
         assert!(status.credentials_present);
+    }
+
+    #[test]
+    fn supports_legacy_google_selected_type() {
+        assert!(is_subscription_selected_type(Some("oauth-personal")));
+        assert!(is_subscription_selected_type(Some("google")));
+        assert!(is_subscription_selected_type(Some("login_with_google")));
+        assert!(!is_subscription_selected_type(Some("gemini-api-key")));
+    }
+
+    #[test]
+    fn login_completion_requires_changed_subscription_state() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+        let gemini_dir = home_dir.join(".gemini");
+        fs::create_dir_all(&gemini_dir).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let baseline = read_login_state();
+
+        fs::write(gemini_dir.join("oauth_creds.json"), "{\"token\":\"abc\"}").unwrap();
+        fs::write(
+            gemini_dir.join("settings.json"),
+            r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#,
+        )
+        .unwrap();
+
+        let current = read_login_state();
+        assert!(login_completed_since(&baseline, &current));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn login_returns_after_new_credentials_are_written() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        let home_dir = dir.path().join("home");
+        let gemini_dir = home_dir.join(".gemini");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&gemini_dir).unwrap();
+
+        let script_path = bin_dir.join("gemini");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+set -eu
+mkdir -p "$HOME/.gemini"
+sleep 1
+cat > "$HOME/.gemini/oauth_creds.json" <<'EOF'
+{"token":"abc"}
+EOF
+cat > "$HOME/.gemini/settings.json" <<'EOF'
+{"security":{"auth":{"selectedType":"oauth-personal"}}}
+EOF
+sleep 30
+"#,
+        )
+        .unwrap();
+
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).unwrap();
+
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin_dir.clone()];
+        paths.extend(std::env::split_paths(&original_path));
+        let composed_path = std::env::join_paths(paths).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let _path = EnvVarGuard::set("PATH", composed_path);
+        let _api_key = EnvVarGuard::unset("GEMINI_API_KEY");
+        let _google_api_key = EnvVarGuard::unset("GOOGLE_API_KEY");
+
+        let start = Instant::now();
+        run_login(AuthMode::Subscription).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(10));
+
+        let status = inspect_status();
+        assert_eq!(status.inferred_mode, AuthMode::Subscription);
+        assert!(status.auth_file_present);
     }
 }

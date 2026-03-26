@@ -44,6 +44,49 @@ run_as_kairastra() {
     gosu "$kairastra_user" "$@"
 }
 
+seed_gemini_cli_defaults() {
+  local gemini_settings_file="$gemini_auth_dir/settings.json"
+  local gemini_trusted_folders_file="$gemini_auth_dir/trustedFolders.json"
+  local tmp_file
+
+  tmp_file="$(mktemp)"
+  if [[ -f "$gemini_settings_file" ]]; then
+    if jq '.general = ((.general // {}) + {"enableAutoUpdate": false, "enableAutoUpdateNotification": false})' "$gemini_settings_file" > "$tmp_file" 2>/dev/null; then
+      mv "$tmp_file" "$gemini_settings_file"
+    else
+      rm -f "$tmp_file"
+    fi
+  else
+    cat > "$tmp_file" <<'EOF'
+{
+  "general": {
+    "enableAutoUpdate": false,
+    "enableAutoUpdateNotification": false
+  }
+}
+EOF
+    mv "$tmp_file" "$gemini_settings_file"
+  fi
+
+  tmp_file="$(mktemp)"
+  if [[ -f "$gemini_trusted_folders_file" ]]; then
+    if jq 'if has("/app") then . else . + {"/app":"TRUST_FOLDER"} end' "$gemini_trusted_folders_file" > "$tmp_file" 2>/dev/null; then
+      mv "$tmp_file" "$gemini_trusted_folders_file"
+    else
+      rm -f "$tmp_file"
+    fi
+  else
+    cat > "$tmp_file" <<'EOF'
+{
+  "/app": "TRUST_FOLDER"
+}
+EOF
+    mv "$tmp_file" "$gemini_trusted_folders_file"
+  fi
+
+  chmod 600 "$gemini_settings_file" "$gemini_trusted_folders_file" 2>/dev/null || true
+}
+
 ensure_runtime_home() {
   mkdir -p "$kairastra_home" "$workspace_root" "$codex_auth_dir" "$claude_auth_dir" "$gemini_auth_dir"
   mkdir -p "$kairastra_home/.local/bin"
@@ -66,6 +109,8 @@ ensure_runtime_home() {
   if [[ ! -e "$kairastra_home/.claude.json" && ! -L "$kairastra_home/.claude.json" ]]; then
     ln -s "$claude_auth_dir/.claude.json" "$kairastra_home/.claude.json"
   fi
+
+  seed_gemini_cli_defaults
 
   chown -R "$kairastra_user:$kairastra_user" \
     "$workspace_root" \

@@ -201,6 +201,10 @@ For Claude subscription login in Docker, the command prints the OAuth URL and th
 masked terminal prompt named `Paste Authentication Code` so you can paste the browser code back
 into the same terminal session. After submit, Kairastra prints progress lines while it waits for
 Claude to finish the login handshake.
+For Gemini subscription login in Docker, Kairastra seeds Gemini's `/app` trust entry and disables
+Gemini CLI auto-update prompts in the container. Gemini still renders its own auth UI, but
+Kairastra now closes that session automatically once a new login is saved. If you intentionally
+re-auth over an existing saved Gemini login, finish with `/quit`.
 Docker also sets `KAIRASTRA_DEPLOY_MODE=docker`, so `doctor` inside the container validates Docker
 prerequisites instead of looking for `systemctl`.
 
