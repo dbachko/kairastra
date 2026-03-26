@@ -209,6 +209,9 @@ For Gemini subscription login in Docker, Kairastra seeds Gemini's `/app` trust e
 Gemini CLI auto-update prompts in the container. Gemini still renders its own auth UI, but
 Kairastra now closes that session automatically once a new login is saved. If you intentionally
 re-auth over an existing saved Gemini login, finish with `/quit`.
+For Gemini issue execution, Kairastra also auto-registers a trusted `kairastra_github` MCP server
+in `~/.gemini/settings.json`, so Gemini gets working `github_graphql` and `github_rest` tools
+without any manual Gemini CLI setup.
 Docker also sets `KAIRASTRA_DEPLOY_MODE=docker`, so `doctor` inside the container validates Docker
 prerequisites instead of looking for `systemctl`.
 

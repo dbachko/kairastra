@@ -88,6 +88,9 @@ impl GeminiSession {
         prompt: &str,
         on_event: &UnboundedSender<AgentEvent>,
     ) -> Result<TurnResult> {
+        super::mcp::ensure_github_mcp_server()
+            .context("failed to configure Gemini GitHub MCP server")?;
+
         self.turn_counter += 1;
         let turn_id = format!("turn-{}", self.turn_counter);
 

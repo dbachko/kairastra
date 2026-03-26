@@ -5,6 +5,8 @@ pub mod deploy;
 pub mod doctor;
 pub mod envfile;
 pub mod github;
+pub mod github_mcp;
+pub mod github_tools;
 pub mod model;
 pub mod orchestrator;
 pub mod prompt;
