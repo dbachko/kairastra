@@ -192,6 +192,46 @@ make docker-up
 make docker-login
 ```
 
+### Remote Docker bootstrap over SSH
+
+If Docker is already installed on the remote machine, use the bootstrap script instead of manually
+copying the repo around. This is the supported path for a remote Mac mini or other Docker host.
+
+Example from your local machine:
+
+```bash
+ssh -t user@mac-mini 'curl -fsSL https://raw.githubusercontent.com/dbachko/kairastra/main/scripts/install-remote-docker.sh | bash'
+```
+
+What it does:
+
+- creates a managed install root under `~/kairastra` by default
+- clones the repo into `~/kairastra/repo`
+- keeps generated operator config in `~/kairastra/config`
+- builds the Docker image from that managed checkout
+- opens the existing interactive `kairastra setup --mode docker` wizard in your SSH terminal
+- runs `doctor`
+- starts the stack with `docker compose up -d`
+- opens `auth menu` on first install or explicit reconfigure unless you pass `--skip-auth`
+
+Useful flags:
+
+```bash
+bash install-remote-docker.sh --install-dir ~/kairastra
+bash install-remote-docker.sh --reconfigure
+bash install-remote-docker.sh --skip-auth
+bash install-remote-docker.sh --repo https://github.com/dbachko/kairastra.git --ref main
+```
+
+After the first install, the same script is available on the remote host at:
+
+```bash
+~/kairastra/repo/scripts/install-remote-docker.sh
+```
+
+Re-running that script updates the managed checkout to the requested ref, rebuilds the image, runs
+Docker doctor checks, and refreshes the stack without replacing persisted Docker volumes.
+
 `make docker-up` now runs a Docker-scoped `doctor` preflight before starting the long-lived
 service, so missing workflow env vars or invalid tracker settings fail once at startup instead of
 triggering a Compose restart loop.
