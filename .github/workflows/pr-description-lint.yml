@@ -34,7 +34,9 @@ jobs:
             fi
           done
 
-          if grep -En '<!--|TODO|TBD' /tmp/pr_body.md; then
-            echo "PR description still contains placeholders" >&2
+          # Allow additional sections (for example, automation summaries), but
+          # block obvious unfinished placeholders.
+          if grep -Ein '\bTODO\b|\bTBD\b' /tmp/pr_body.md; then
+            echo "PR description still contains TODO/TBD placeholders" >&2
             exit 1
           fi
