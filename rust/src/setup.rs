@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 
+use crate::config::GitHubMode;
 use crate::deploy::DeployMode;
 use crate::doctor::{self, DoctorFormat, DoctorOptions};
 use crate::providers::{self, ProviderSetupConfig};
@@ -20,10 +21,12 @@ pub struct SetupOptions {
 
 #[derive(Debug, Clone)]
 struct SetupValues {
+    tracker_mode: GitHubMode,
     provider: String,
     provider_configs: Vec<ProviderSetupConfig>,
     github_owner: String,
     github_repo: String,
+    github_project_owner: String,
     github_project_number: String,
     github_project_url: String,
     workspace_root: String,
@@ -231,17 +234,10 @@ fn collect_values(
     let theme = ColorfulTheme::default();
     let env_github_owner = std::env::var("KAIRASTRA_GITHUB_OWNER").unwrap_or_default();
     let env_github_repo = std::env::var("KAIRASTRA_GITHUB_REPO").unwrap_or_default();
+    let env_project_owner = std::env::var("KAIRASTRA_GITHUB_PROJECT_OWNER").unwrap_or_default();
     let env_project_number = std::env::var("KAIRASTRA_GITHUB_PROJECT_NUMBER").unwrap_or_default();
     let env_project_url = std::env::var("KAIRASTRA_GITHUB_PROJECT_URL").unwrap_or_default();
 
-    let github_project_url = ask_string(
-        &theme,
-        "GitHub Project URL (optional, can auto-fill owner and number)",
-        env_project_url,
-        non_interactive,
-        true,
-    )?;
-    let parsed_project = parse_project_url(&github_project_url);
     let repo_input = ask_string(
         &theme,
         "GitHub repo (name or GitHub URL)",
@@ -250,12 +246,29 @@ fn collect_values(
         false,
     )?;
     let parsed_repo = parse_repo_input(&repo_input);
+    let tracker_mode = choose_tracker_mode(
+        &theme,
+        non_interactive,
+        !env_project_number.trim().is_empty() || !env_project_url.trim().is_empty(),
+    )?;
+    let github_project_url = if tracker_mode == GitHubMode::ProjectsV2 {
+        ask_string(
+            &theme,
+            "GitHub Project URL (optional, auto-fills project owner and number)",
+            env_project_url,
+            non_interactive,
+            true,
+        )?
+    } else {
+        String::new()
+    };
+    let parsed_project = parse_project_url(&github_project_url);
     let github_owner = if !env_github_owner.trim().is_empty() {
         env_github_owner
-    } else if let Some(parsed) = parsed_project.as_ref() {
-        parsed.owner.clone()
     } else if let Some(parsed) = parsed_repo.as_ref().and_then(|parsed| parsed.owner.clone()) {
         parsed
+    } else if let Some(parsed) = parsed_project.as_ref() {
+        parsed.owner.clone()
     } else {
         ask_string(
             &theme,
@@ -269,18 +282,39 @@ fn collect_values(
         .as_ref()
         .map(|parsed| parsed.repo.clone())
         .unwrap_or(repo_input);
-    let github_project_number = if !env_project_number.trim().is_empty() {
-        env_project_number
-    } else if let Some(parsed) = parsed_project.as_ref() {
-        parsed.project_number.clone()
+    let github_project_owner = if tracker_mode == GitHubMode::ProjectsV2 {
+        if !env_project_owner.trim().is_empty() {
+            env_project_owner
+        } else if let Some(parsed) = parsed_project.as_ref() {
+            parsed.owner.clone()
+        } else {
+            ask_string(
+                &theme,
+                "GitHub Project owner (leave blank to use GitHub owner)",
+                github_owner.clone(),
+                non_interactive,
+                false,
+            )?
+        }
     } else {
-        ask_string(
-            &theme,
-            "GitHub Project v2 number",
-            String::new(),
-            non_interactive,
-            false,
-        )?
+        String::new()
+    };
+    let github_project_number = if tracker_mode == GitHubMode::ProjectsV2 {
+        if !env_project_number.trim().is_empty() {
+            env_project_number
+        } else if let Some(parsed) = parsed_project.as_ref() {
+            parsed.project_number.clone()
+        } else {
+            ask_string(
+                &theme,
+                "GitHub Project v2 number",
+                String::new(),
+                non_interactive,
+                false,
+            )?
+        }
+    } else {
+        String::new()
     };
     let workspace_root = ask_string(
         &theme,
@@ -347,10 +381,12 @@ fn collect_values(
     let binary_path = detect_binary_path(explicit_binary_path);
 
     Ok(SetupValues {
+        tracker_mode,
         provider,
         provider_configs,
         github_owner,
         github_repo,
+        github_project_owner,
         github_project_number,
         github_project_url,
         workspace_root,
@@ -367,6 +403,33 @@ fn collect_values(
         rust_log,
         binary_path,
     })
+}
+
+fn choose_tracker_mode(
+    theme: &ColorfulTheme,
+    non_interactive: bool,
+    prefer_projects_v2: bool,
+) -> Result<GitHubMode> {
+    if non_interactive {
+        return Ok(if prefer_projects_v2 {
+            GitHubMode::ProjectsV2
+        } else {
+            GitHubMode::IssuesOnly
+        });
+    }
+
+    let options = [GitHubMode::IssuesOnly, GitHubMode::ProjectsV2];
+    let labels = [
+        "Repository issues only (recommended)",
+        "GitHub Project v2 queue",
+    ];
+    let default = if prefer_projects_v2 { 1 } else { 0 };
+    let selection = Select::with_theme(theme)
+        .with_prompt("Queue source")
+        .items(&labels)
+        .default(default)
+        .interact()?;
+    Ok(options[selection])
 }
 
 fn collect_provider_configs(
@@ -589,15 +652,15 @@ fn render_workflow(values: &SetupValues) -> String {
         }
     }
     let support_dirs = support_dirs.join(" ");
-
-    format!(
-        r#"---
-tracker:
+    let tracker_block = match values.tracker_mode {
+        GitHubMode::ProjectsV2 => {
+            r#"tracker:
   kind: github
   mode: projects_v2
   api_key: $GITHUB_TOKEN
   owner: $KAIRASTRA_GITHUB_OWNER
   repo: $KAIRASTRA_GITHUB_REPO
+  project_owner: $KAIRASTRA_GITHUB_PROJECT_OWNER
   project_v2_number: $KAIRASTRA_GITHUB_PROJECT_NUMBER
   project_url: $KAIRASTRA_GITHUB_PROJECT_URL
   status_source:
@@ -616,7 +679,27 @@ tracker:
     - Cancelled
     - Canceled
     - Duplicate
-    - Done
+    - Done"#
+        }
+        GitHubMode::IssuesOnly => {
+            r#"tracker:
+  kind: github
+  mode: issues_only
+  api_key: $GITHUB_TOKEN
+  owner: $KAIRASTRA_GITHUB_OWNER
+  repo: $KAIRASTRA_GITHUB_REPO
+  status_source:
+    type: github_state
+  active_states:
+    - Open
+  terminal_states:
+    - Closed"#
+        }
+    };
+
+    format!(
+        r#"---
+{tracker_block}
 workspace:
   root: $KAIRASTRA_WORKSPACE_ROOT
 hooks:
@@ -839,6 +922,7 @@ Description:
 No description provided.
 {{% endif %}}
 "#,
+        tracker_block = tracker_block,
         provider = values.provider,
         max_concurrent_agents = values.max_concurrent_agents,
         max_turns = values.max_turns,
@@ -848,8 +932,20 @@ No description provided.
     )
 }
 
+fn render_project_env_lines(values: &SetupValues) -> String {
+    if values.tracker_mode != GitHubMode::ProjectsV2 {
+        return String::new();
+    }
+
+    format!(
+        "KAIRASTRA_GITHUB_PROJECT_OWNER={}\nKAIRASTRA_GITHUB_PROJECT_NUMBER={}\nKAIRASTRA_GITHUB_PROJECT_URL={}\n",
+        values.github_project_owner, values.github_project_number, values.github_project_url
+    )
+}
+
 fn render_env_file(mode: DeployMode, values: &SetupValues, workflow_path: &Path) -> String {
     let workflow_abs = absolute_display_path(workflow_path);
+    let project_env_lines = render_project_env_lines(values);
     let provider_env = values
         .provider_configs
         .iter()
@@ -869,9 +965,7 @@ WORKFLOW_PATH={workflow_path}
 KAIRASTRA_WORKSPACE_ROOT={workspace_root}
 KAIRASTRA_GITHUB_OWNER={github_owner}
 KAIRASTRA_GITHUB_REPO={github_repo}
-KAIRASTRA_GITHUB_PROJECT_NUMBER={github_project_number}
-KAIRASTRA_GITHUB_PROJECT_URL={github_project_url}
-KAIRASTRA_GIT_CLONE_URL={git_clone_url}
+{project_env_lines}KAIRASTRA_GIT_CLONE_URL={git_clone_url}
 KAIRASTRA_SEED_REPO={seed_repo}
 KAIRASTRA_AGENT_ASSIGNEE={assignee_login}
 {provider_env}
@@ -885,8 +979,7 @@ RUST_LOG={rust_log}
             workspace_root = values.workspace_root,
             github_owner = values.github_owner,
             github_repo = values.github_repo,
-            github_project_number = values.github_project_number,
-            github_project_url = values.github_project_url,
+            project_env_lines = project_env_lines,
             git_clone_url = values.git_clone_url,
             seed_repo = values.seed_repo,
             assignee_login = values.assignee_login,
@@ -906,9 +999,7 @@ KAIRASTRA_WORKSPACE_ROOT={workspace_root}
 RUST_LOG={rust_log}
 KAIRASTRA_GITHUB_OWNER={github_owner}
 KAIRASTRA_GITHUB_REPO={github_repo}
-KAIRASTRA_GITHUB_PROJECT_NUMBER={github_project_number}
-KAIRASTRA_GITHUB_PROJECT_URL={github_project_url}
-KAIRASTRA_GIT_CLONE_URL={git_clone_url}
+{project_env_lines}KAIRASTRA_GIT_CLONE_URL={git_clone_url}
 KAIRASTRA_AGENT_ASSIGNEE={assignee_login}
 {provider_env}
 "#,
@@ -922,8 +1013,7 @@ KAIRASTRA_AGENT_ASSIGNEE={assignee_login}
             rust_log = values.rust_log,
             github_owner = values.github_owner,
             github_repo = values.github_repo,
-            github_project_number = values.github_project_number,
-            github_project_url = values.github_project_url,
+            project_env_lines = project_env_lines,
             git_clone_url = values.git_clone_url,
             assignee_login = values.assignee_login,
             provider_env = provider_env,
@@ -968,6 +1058,7 @@ fn absolute_display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{render_env_file, render_systemd_unit, render_workflow, SetupValues};
+    use crate::config::GitHubMode;
     use crate::deploy::DeployMode;
     use crate::providers::claude::setup::ClaudeSetupConfig;
     use crate::providers::codex::setup::CodexSetupConfig;
@@ -979,6 +1070,7 @@ mod tests {
 
     fn sample_values() -> SetupValues {
         SetupValues {
+            tracker_mode: GitHubMode::ProjectsV2,
             provider: "codex".to_string(),
             provider_configs: vec![
                 ProviderSetupConfig::Codex(CodexSetupConfig {
@@ -1000,8 +1092,9 @@ mod tests {
             ],
             github_owner: "openai".to_string(),
             github_repo: "kairastra".to_string(),
+            github_project_owner: "dbachko".to_string(),
             github_project_number: "7".to_string(),
-            github_project_url: "https://github.com/users/openai/projects/7".to_string(),
+            github_project_url: "https://github.com/users/dbachko/projects/7".to_string(),
             workspace_root: "/workspaces".to_string(),
             seed_repo: "/seed".to_string(),
             git_clone_url: "https://github.com/openai/kairastra.git".to_string(),
@@ -1027,6 +1120,7 @@ mod tests {
     fn workflow_template_uses_env_placeholders() {
         let rendered = render_workflow(&sample_values());
         assert!(rendered.contains("owner: $KAIRASTRA_GITHUB_OWNER"));
+        assert!(rendered.contains("project_owner: $KAIRASTRA_GITHUB_PROJECT_OWNER"));
         assert!(rendered.contains("provider: codex"));
         assert!(rendered.contains("assignee_login: $KAIRASTRA_AGENT_ASSIGNEE"));
         assert!(rendered.contains("providers:"));
@@ -1083,6 +1177,7 @@ mod tests {
             Path::new("WORKFLOW.md"),
         );
         assert!(rendered.contains("WORKFLOW_FILE="));
+        assert!(rendered.contains("KAIRASTRA_GITHUB_PROJECT_OWNER=dbachko"));
         assert!(rendered.contains("CODEX_AUTH_MODE=subscription"));
         assert!(rendered.contains("KAIRASTRA_CODEX_MODEL=gpt-5.4"));
         assert!(rendered.contains("KAIRASTRA_CODEX_REASONING_EFFORT=high"));
@@ -1159,5 +1254,32 @@ mod tests {
         let path = super::resolve_workflow_path(&layout, None);
 
         assert_eq!(path, dir.path().join("WORKFLOW.md"));
+    }
+
+    #[test]
+    fn issues_only_workflow_uses_repo_first_defaults() {
+        let mut values = sample_values();
+        values.tracker_mode = GitHubMode::IssuesOnly;
+
+        let rendered = render_workflow(&values);
+        assert!(rendered.contains("mode: issues_only"));
+        assert!(rendered.contains("type: github_state"));
+        assert!(rendered.contains("- Open"));
+        assert!(!rendered.contains("project_v2_number"));
+        assert!(!rendered.contains("project_owner"));
+        assert!(!rendered.contains("type: project_field"));
+    }
+
+    #[test]
+    fn issues_only_env_omits_project_specific_values() {
+        let mut values = sample_values();
+        values.tracker_mode = GitHubMode::IssuesOnly;
+
+        let rendered = render_env_file(DeployMode::Native, &values, Path::new("WORKFLOW.md"));
+        assert!(rendered.contains("KAIRASTRA_GITHUB_OWNER=openai"));
+        assert!(rendered.contains("KAIRASTRA_GITHUB_REPO=kairastra"));
+        assert!(!rendered.contains("KAIRASTRA_GITHUB_PROJECT_OWNER"));
+        assert!(!rendered.contains("KAIRASTRA_GITHUB_PROJECT_NUMBER"));
+        assert!(!rendered.contains("KAIRASTRA_GITHUB_PROJECT_URL"));
     }
 }

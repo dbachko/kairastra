@@ -40,6 +40,20 @@ Fix:
 - use a classic PAT for user-owned projects
 - authorize the token for SSO if needed
 
+### Issue is visible in the Project but never dispatches
+
+Cause:
+
+- the Kairastra deployment is scoped to a different repository
+- the project contains issues from multiple repositories
+- `project_owner` / `project_url` does not match the actual Project v2 owner
+
+Fix:
+
+- verify `tracker.owner` and `tracker.repo` point at the repository this deployment should manage
+- verify `tracker.project_owner` or `tracker.project_url` points at the Project v2 owner when it differs from the repository owner
+- run a separate Kairastra deployment for each repository represented in the project
+
 ### `workspace_hook_failed: after_create|before_run|after_run|before_remove`
 
 Cause:

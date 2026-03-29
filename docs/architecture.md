@@ -15,10 +15,19 @@ Rust-based and targets GitHub Issues plus Projects v2.
 - `rust/src/setup.rs`: generates workflow/env/systemd scaffolding for operators.
 - `rust/src/doctor.rs`: validates local commands, auth state, GitHub connectivity, and workspace paths.
 
+## Deployment boundary
+
+One Kairastra deployment is scoped to one repository checkout and one repository push target.
+
+- `tracker.repo` names the repository Kairastra is expected to work in.
+- Workspaces are cloned or overlaid from one configured seed repository.
+- PR lookup, status checks, and workpad writes are all performed against the repository encoded in the issue identifier.
+- If you need automation across multiple repositories, run multiple Kairastra deployments instead of one shared runtime.
+
 ## Execution model
 
 1. `run` loads `WORKFLOW.md` and validates it into `Settings`.
-2. The orchestrator polls GitHub for dispatchable issues.
+2. The orchestrator polls GitHub for dispatchable issues and filters them to the configured repository scope.
 3. Eligible issues get isolated workspaces under `workspace.root/<sanitized-issue-id>`.
 4. The runner starts the selected provider session in that workspace.
 5. Runtime status is written back to the issue workpad comment after each turn.

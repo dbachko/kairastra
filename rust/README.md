@@ -12,11 +12,20 @@ Use this README as the practical setup and operations guide. The normative behav
 
 - Loads `WORKFLOW.md` front matter plus prompt template and keeps the last known good config on reload errors.
 - Talks to GitHub through GraphQL and REST using a typed `tracker.kind: github` config.
-- Supports `projects_v2` as the primary tracker mode and `issues_only` as a fallback.
+- Supports repo-first `issues_only` queues and optional repo-scoped `projects_v2` queues.
 - Creates deterministic per-issue workspaces and runs lifecycle hooks around them.
 - Starts the configured provider runtime for each issue.
 - Tracks retries, continuation turns, backoff, and reconciliation in a single orchestrator loop.
 - Exposes operator commands for setup, doctor checks, and provider auth management.
+
+## Deployment model
+
+One Kairastra deployment manages one repository.
+
+- The runtime bootstraps every issue workspace from one configured repository checkout or clone URL.
+- PR discovery, check summaries, and workpad writes all happen against that repository.
+- `projects_v2` can be used as the queue for that repository, but Kairastra still ignores project items from other repositories.
+- If you want automation across multiple repositories, run multiple Kairastra services or containers.
 
 ## Requirements
 
@@ -27,7 +36,7 @@ At minimum:
   - `codex` for Codex
   - `claude` for Claude Code
   - `gemini` for Gemini CLI
-- GitHub token with access to the target repo and project
+- GitHub token with access to the target repo, and the target project when using `projects_v2`
 - A `WORKFLOW.md` file or a generated equivalent
 
 For native VPS mode:
@@ -73,6 +82,8 @@ Additional operator docs:
 ## Quick start
 
 ## GitHub token requirements
+
+For `tracker.mode: issues_only`, Kairastra needs repo access only.
 
 For `tracker.mode: projects_v2`, Kairastra needs a GitHub token that can read and usually mutate the
 target Project v2.
@@ -192,21 +203,21 @@ make docker-up
 make docker-login
 ```
 
-### Remote Docker bootstrap over SSH
+### Remote Docker bootstrap (run on host after SSH)
 
 If Docker is already installed on the remote machine, use the bootstrap script instead of manually
 copying the repo around. This is the supported path for a remote Mac mini or other Docker host.
 
-Example from your local machine (public repo):
+Latest `main` example (run on the host):
 
 ```bash
-ssh -t user@mac-mini 'curl -fsSL -o install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/main/scripts/install-remote-docker.sh && sed -n "1,120p" install-remote-docker.sh && bash install-remote-docker.sh'
+curl -fsSL -o /tmp/install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/main/scripts/install-remote-docker.sh && bash /tmp/install-remote-docker.sh --ref main
 ```
 
-Pinned release example:
+Pinned release example (run on the host):
 
 ```bash
-ssh -t user@mac-mini 'curl -fsSL -o install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/v0.1.0/scripts/install-remote-docker.sh && sed -n "1,120p" install-remote-docker.sh && bash install-remote-docker.sh'
+curl -fsSL -o /tmp/install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/v0.1.0-alpha.1/scripts/install-remote-docker.sh && bash /tmp/install-remote-docker.sh --ref v0.1.0-alpha.1
 ```
 
 Notes:
@@ -216,7 +227,15 @@ Notes:
 - If the repo is still private, raw URLs return `404`; bootstrap by cloning over Git SSH instead:
 
 ```bash
-ssh -t user@mac-mini 'set -euo pipefail; boot="$HOME/kairastra-bootstrap"; if [ -d "$boot/.git" ]; then git -C "$boot" fetch --tags --prune origin; else git clone git@github.com:dbachko/kairastra.git "$boot"; fi; git -C "$boot" checkout --force main; bash "$boot/scripts/install-remote-docker.sh" --repo git@github.com:dbachko/kairastra.git --ref main'
+set -euo pipefail
+boot="$HOME/kairastra-bootstrap"
+if [ -d "$boot/.git" ]; then
+  git -C "$boot" fetch --tags --prune origin
+else
+  git clone git@github.com:dbachko/kairastra.git "$boot"
+fi
+git -C "$boot" checkout --force main
+bash "$boot/scripts/install-remote-docker.sh" --repo git@github.com:dbachko/kairastra.git --ref main
 ```
 
 What it does:
@@ -302,8 +321,9 @@ Optional flags:
 
 What setup asks for:
 
-- GitHub Project URL, with owner and Project v2 number auto-derived when possible
 - GitHub repo, either as a repo name or a full GitHub repo URL
+- queue source: `issues_only` or `projects_v2`
+- when using `projects_v2`: GitHub Project URL, optional project owner override, and Project v2 number
 - workspace root
 - seed repo path
 - optional canonical clone URL
@@ -542,6 +562,7 @@ It expects:
 
 - `KAIRASTRA_GITHUB_OWNER`
 - `KAIRASTRA_GITHUB_REPO`
+- `KAIRASTRA_GITHUB_PROJECT_OWNER` when the project owner differs from the repo owner
 - `KAIRASTRA_GITHUB_PROJECT_NUMBER`
 
 It ensures:
@@ -571,8 +592,15 @@ Common failure modes:
 - missing provider auth: `auth status` shows no local auth file and no API key
 - wrong binary path in native mode: `systemd` starts but fails immediately
 
+Running multiple repositories:
+
+- Create one workflow/env pair per repository.
+- Run one Docker Compose project or one native service per repository.
+- If several repositories share one GitHub Project, point each deployment at the same project but keep each deployment scoped to its own `owner/repo`.
+
 ## Current limitations
 
+- One runtime does not manage multiple repositories.
 - The current implementation targets local workers only.
 - GitHub dynamic tools are limited to `github_graphql` and a small `github_rest` allow-list.
 - The operator UX is terminal-first; there is no web onboarding flow here.

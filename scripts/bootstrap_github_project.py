@@ -109,6 +109,16 @@ class BootstrapError(RuntimeError):
     pass
 
 
+def _project_owner_from_url(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    path = urllib.parse.urlparse(raw).path.strip("/")
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) >= 3 and segments[0] in {"users", "orgs"} and segments[2] == "projects":
+        return segments[1]
+    return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Bootstrap a GitHub Project and repo for Kairastra orchestration."
@@ -122,6 +132,16 @@ def parse_args() -> argparse.Namespace:
         "--repo",
         default=os.getenv("KAIRASTRA_GITHUB_REPO"),
         help="GitHub repository name for issue labels.",
+    )
+    parser.add_argument(
+        "--project-url",
+        default=os.getenv("KAIRASTRA_GITHUB_PROJECT_URL"),
+        help="GitHub Project URL used to derive the project owner when it differs from the repo owner.",
+    )
+    parser.add_argument(
+        "--project-owner",
+        default=os.getenv("KAIRASTRA_GITHUB_PROJECT_OWNER"),
+        help="GitHub user or org that owns the Project. Defaults to the parsed project URL owner or --owner.",
     )
     parser.add_argument(
         "--project-number",
@@ -145,11 +165,14 @@ def parse_args() -> argparse.Namespace:
         help="Print planned changes without mutating GitHub.",
     )
     args = parser.parse_args()
+    if not args.project_owner:
+        args.project_owner = _project_owner_from_url(args.project_url) or args.owner
 
     missing = [
         name
         for name, value in (
             ("--owner / KAIRASTRA_GITHUB_OWNER", args.owner),
+            ("--project-owner / KAIRASTRA_GITHUB_PROJECT_OWNER", args.project_owner),
             ("--repo / KAIRASTRA_GITHUB_REPO", args.repo),
             ("--project-number / KAIRASTRA_GITHUB_PROJECT_NUMBER", args.project_number),
         )
@@ -393,18 +416,18 @@ def ensure_labels(owner: str, repo: str, dry_run: bool) -> list[Action]:
 def main() -> int:
     args = parse_args()
 
-    project = load_project(args.project_number, args.owner)
-    fields = load_fields(args.project_number, args.owner)
+    project = load_project(args.project_number, args.project_owner)
+    fields = load_fields(args.project_number, args.project_owner)
 
     actions = [
         ensure_status_field(
-            owner=args.owner,
+            owner=args.project_owner,
             project_number=args.project_number,
             fields=fields,
             dry_run=args.dry_run,
         ),
         ensure_priority_field(
-            owner=args.owner,
+            owner=args.project_owner,
             project_number=args.project_number,
             field_name=args.priority_field_name,
             fields=fields,
@@ -418,7 +441,7 @@ def main() -> int:
     changed = [action.summary for action in actions if action.changed]
     unchanged = [action.summary for action in actions if not action.changed]
 
-    print(f"Project: {project['title']} ({args.owner}#{args.project_number})")
+    print(f"Project: {project['title']} ({args.project_owner}#{args.project_number})")
     print(f"Repository: {args.owner}/{args.repo}")
     print(f"Mode: {'dry-run' if args.dry_run else 'apply'}")
     print()
