@@ -200,7 +200,8 @@ copying the repo around. This is the supported path for a remote Mac mini or oth
 Example from your local machine:
 
 ```bash
-ssh -t user@mac-mini 'curl -fsSL https://raw.githubusercontent.com/dbachko/kairastra/main/scripts/install-remote-docker.sh | bash'
+# Replace YOUR_TAG_OR_COMMIT with a specific release tag or commit SHA.
+ssh -t user@mac-mini 'curl -fsSL -o install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/YOUR_TAG_OR_COMMIT/scripts/install-remote-docker.sh && less install-remote-docker.sh && bash install-remote-docker.sh'
 ```
 
 What it does:
@@ -217,10 +218,10 @@ What it does:
 Useful flags:
 
 ```bash
-bash install-remote-docker.sh --install-dir ~/kairastra
-bash install-remote-docker.sh --reconfigure
-bash install-remote-docker.sh --skip-auth
-bash install-remote-docker.sh --repo https://github.com/dbachko/kairastra.git --ref main
+~/kairastra/repo/scripts/install-remote-docker.sh --install-dir ~/kairastra
+~/kairastra/repo/scripts/install-remote-docker.sh --reconfigure
+~/kairastra/repo/scripts/install-remote-docker.sh --skip-auth
+~/kairastra/repo/scripts/install-remote-docker.sh --repo https://github.com/dbachko/kairastra.git --ref main
 ```
 
 After the first install, the same script is available on the remote host at:

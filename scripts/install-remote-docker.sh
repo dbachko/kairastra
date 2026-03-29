@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+umask 077
+
 DEFAULT_REPO_URL="https://github.com/dbachko/kairastra.git"
 DEFAULT_GIT_REF="main"
 DEFAULT_INSTALL_DIR="${HOME}/kairastra"
@@ -40,6 +42,20 @@ die() {
 require_command() {
   local name="$1"
   command -v "$name" >/dev/null 2>&1 || die "required command not found: $name"
+}
+
+validate_repo_url() {
+  local value="$1"
+  [[ -n "$value" ]] || die "repository URL must not be empty"
+  [[ "$value" != -* ]] || die "repository URL must not start with '-'"
+  [[ "$value" != *[[:space:]]* ]] || die "repository URL must not contain whitespace"
+}
+
+validate_git_ref() {
+  local value="$1"
+  [[ -n "$value" ]] || die "git ref must not be empty"
+  [[ "$value" != -* ]] || die "git ref must not start with '-'"
+  [[ "$value" != *[[:space:]]* ]] || die "git ref must not contain whitespace"
 }
 
 have_tty() {
@@ -113,6 +129,7 @@ CODEX_CLI_VERSION=0.114.0
 CLAUDE_CODE_VERSION=2.1.81
 GEMINI_CLI_VERSION=0.35.0
 EOF
+  chmod 600 "$path"
 }
 
 sync_repo_checkout() {
@@ -124,7 +141,7 @@ sync_repo_checkout() {
     git -C "$repo_dir" fetch --tags --prune origin
   else
     log "Cloning $repo_url into $repo_dir"
-    git clone "$repo_url" "$repo_dir"
+    git clone -- "$repo_url" "$repo_dir"
   fi
 
   if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$git_ref"; then
@@ -172,6 +189,8 @@ done
 require_command git
 require_command docker
 docker compose version >/dev/null 2>&1 || die "docker compose is required"
+validate_repo_url "$repo_url"
+validate_git_ref "$git_ref"
 
 install_dir="$(resolve_absolute_path "$install_dir")"
 repo_dir="${install_dir}/repo"
@@ -189,6 +208,7 @@ if [[ ! -f "$workflow_path" ]]; then
 # Generated placeholder for remote Kairastra install.
 # The setup wizard will replace this file.
 EOF
+  chmod 600 "$workflow_path"
 fi
 
 if [[ ! -f "$env_path" ]]; then
