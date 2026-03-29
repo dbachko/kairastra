@@ -197,11 +197,26 @@ make docker-login
 If Docker is already installed on the remote machine, use the bootstrap script instead of manually
 copying the repo around. This is the supported path for a remote Mac mini or other Docker host.
 
-Example from your local machine:
+Example from your local machine (public repo):
 
 ```bash
-# Replace YOUR_TAG_OR_COMMIT with a specific release tag or commit SHA.
-ssh -t user@mac-mini 'curl -fsSL -o install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/YOUR_TAG_OR_COMMIT/scripts/install-remote-docker.sh && less install-remote-docker.sh && bash install-remote-docker.sh'
+ssh -t user@mac-mini 'curl -fsSL -o install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/main/scripts/install-remote-docker.sh && sed -n "1,120p" install-remote-docker.sh && bash install-remote-docker.sh'
+```
+
+Pinned release example:
+
+```bash
+ssh -t user@mac-mini 'curl -fsSL -o install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/v0.1.0/scripts/install-remote-docker.sh && sed -n "1,120p" install-remote-docker.sh && bash install-remote-docker.sh'
+```
+
+Notes:
+
+- For `raw.githubusercontent.com`, use `main`, a tag, or a commit SHA as the ref segment.
+- Do not use `refs/heads/main` in raw URLs.
+- If the repo is still private, raw URLs return `404`; bootstrap by cloning over Git SSH instead:
+
+```bash
+ssh -t user@mac-mini 'set -euo pipefail; boot="$HOME/kairastra-bootstrap"; if [ -d "$boot/.git" ]; then git -C "$boot" fetch --tags --prune origin; else git clone git@github.com:dbachko/kairastra.git "$boot"; fi; git -C "$boot" checkout --force main; bash "$boot/scripts/install-remote-docker.sh" --repo git@github.com:dbachko/kairastra.git --ref main'
 ```
 
 What it does:
