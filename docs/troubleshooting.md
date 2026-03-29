@@ -24,6 +24,7 @@ Cause:
 Fix:
 
 - set `GITHUB_TOKEN`
+- or set `GH_TOKEN`
 - verify the env file is loaded
 - verify the token has the required `project`/`repo` scopes
 
