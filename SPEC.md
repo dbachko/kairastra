@@ -373,6 +373,22 @@ Fields:
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings)
   - Default: `Closed`, `Cancelled`, `Canceled`, `Duplicate`, `Done`
+- `claimable_states` (list of strings)
+  - Default: `Todo`
+  - Describes which active states are treated as ready-to-claim queue states.
+  - Used by blocker gating and may differ from `active_states`.
+- `in_progress_state` (string or null)
+  - Default: `In Progress`
+  - Target workflow state for runtime-owned claim transitions when implemented.
+  - `null` disables the runtime-owned claim transition.
+- `human_review_state` (string or null)
+  - Default: `Human Review`
+  - Target workflow state for runtime-owned review handoff transitions when implemented.
+  - `null` disables the runtime-owned review handoff transition.
+- `done_state` (string or null)
+  - Default: `Done`
+  - Target workflow state for runtime-owned terminal cleanup transitions when implemented.
+  - `null` disables the runtime-owned terminal cleanup transition.
 - `status_source` (object, optional)
   - Describes where workflow state comes from.
   - Supported types for the GitHub implementation: `project_field`, `issue_field`, `github_state`,
@@ -639,6 +655,10 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `tracker.priority_source`: object, optional
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
+- `tracker.claimable_states`: list of strings, default `["Todo"]`
+- `tracker.in_progress_state`: string or null, default `"In Progress"`
+- `tracker.human_review_state`: string or null, default `"Human Review"`
+- `tracker.done_state`: string or null, default `"Done"`
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path, default `<system-temp>/kairastra_workspaces`
 - `worker.ssh_hosts` (extension): list of SSH host strings, optional; when omitted, work runs
@@ -804,8 +824,8 @@ An issue is dispatch-eligible only if all are true:
 - It is not already in `claimed`.
 - Global concurrency slots are available.
 - Per-state concurrency slots are available.
-- Blocker rule for `Todo` state passes:
-  - If the issue state is `Todo`, do not dispatch when any blocker is non-terminal.
+- Blocker rule for claimable states passes:
+  - If the issue state is in `claimable_states`, do not dispatch when any blocker is non-terminal.
 
 Sorting order (stable intent):
 
@@ -1357,7 +1377,8 @@ Additional normalization details:
 - `created_at` and `updated_at` -> parse ISO-8601 timestamps
 - For project-backed GitHub queues:
   - if the underlying GitHub issue is closed and the project status is a terminal workflow state
-    such as `Done`, surface the terminal project state
+    such as the configured `done_state` or another configured terminal state, surface the terminal
+    project state
   - otherwise, a closed GitHub issue should normalize to `Closed`
 
 ### 11.4 Error Handling Contract
@@ -1393,13 +1414,17 @@ runtime-owned workflow transitions are allowed.
 - Implementations may own narrow workflow-state transitions when that improves correctness or
   prevents stuck queues.
 - The current GitHub implementation owns these minimal transitions:
-  - claim transition: `Todo -> In Progress`
-  - review handoff transition: `In Progress -> Human Review` only when an open PR exists for the
-    issue branch, the workpad shows non-bootstrap progress, and GitHub Actions / required PR
-    checks are green
-  - terminal cleanup transition: closed issue -> project `Done`
+  - claim transition: `claimable_state -> in_progress_state`
+    - triggered only when the current issue state is in `claimable_states`
+    - skipped when `in_progress_state` is `null`
+  - review handoff transition: active work state -> `human_review_state`
+    - triggered only when an open PR exists for the issue branch, the workpad shows non-bootstrap
+      progress, and GitHub Actions / required PR checks are green
+    - skipped when `human_review_state` is `null`
+  - terminal cleanup transition: closed issue -> project `done_state`
+    - skipped when `done_state` is `null`
 - Workflow-specific success may still mean "reached the next handoff state" (for example
-  `Human Review`) rather than tracker terminal state `Done`.
+  `human_review_state`) rather than tracker terminal state `done_state`.
 - If optional GitHub client-side tool extensions are implemented, they remain part of the agent
   toolchain rather than a replacement for orchestrator policy.
 
@@ -2180,17 +2205,18 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
 - Dispatch sort order is priority then oldest creation time
-- `Todo` issue with non-terminal blockers is not eligible
-- `Todo` issue with terminal blockers is eligible
+- Claimable-state issue with non-terminal blockers is not eligible
+- Claimable-state issue with terminal blockers is eligible
 - If assignee filtering is configured, only matching assignees are dispatchable
-- Runtime-owned claim transition moves `Todo` to `In Progress` when implemented
+- Runtime-owned claim transition moves a claimable issue to `in_progress_state` when implemented
 - Active-state issue refresh updates running entry state
 - Non-active state stops running agent without workspace cleanup
 - Terminal state stops running agent and cleans workspace
-- Runtime-owned review handoff moves `In Progress` to `Human Review` only when an open PR exists,
-  the workpad shows non-bootstrap progress, and GitHub Actions / required PR checks are green
-- Runtime-owned terminal cleanup moves a closed issue to project `Done` before workspace removal
-  when that behavior is implemented
+- Runtime-owned review handoff moves an issue to `human_review_state` only when an open PR exists,
+  the workpad shows non-bootstrap progress, GitHub Actions / required PR checks are green, and
+  `human_review_state` is configured
+- Runtime-owned terminal cleanup moves a closed issue to project `done_state` before workspace
+  removal when that behavior is implemented and `done_state` is configured
 - Reconciliation with no running issues is a no-op
 - Exhausting `agent.max_turns` schedules a short continuation retry
 - Normal worker completion without continuation clears the claim after one final state refresh

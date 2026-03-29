@@ -190,7 +190,7 @@ pub async fn run_issue(
                                         && workpad_has_progress(&issue)
                                     {
                                         issue = tracker
-                                            .transition_issue_project_status(&issue, "Human Review")
+                                            .transition_issue_to_human_review(&issue)
                                             .await?;
                                     }
                                 }

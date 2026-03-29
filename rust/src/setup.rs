@@ -1,12 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use anyhow::{Context, Result};
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
+use anyhow::{anyhow, Context, Result};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Select};
 
-use crate::config::GitHubMode;
+use crate::config::{FieldSource, FieldSourceType, GitHubMode, TrackerSettings};
 use crate::deploy::DeployMode;
 use crate::doctor::{self, DoctorFormat, DoctorOptions};
+use crate::github::{GitHubTracker, ProjectStatusOverview};
 use crate::providers::{self, ProviderSetupConfig};
 
 #[derive(Debug, Clone)]
@@ -22,6 +24,8 @@ pub struct SetupOptions {
 #[derive(Debug, Clone)]
 struct SetupValues {
     tracker_mode: GitHubMode,
+    project_status: ProjectStatusConfig,
+    normalize_project_statuses: bool,
     provider: String,
     provider_configs: Vec<ProviderSetupConfig>,
     github_owner: String,
@@ -44,6 +48,16 @@ struct SetupValues {
     binary_path: String,
 }
 
+#[derive(Debug, Clone)]
+struct ProjectStatusConfig {
+    active_states: Vec<String>,
+    terminal_states: Vec<String>,
+    claimable_states: Vec<String>,
+    in_progress_state: Option<String>,
+    human_review_state: Option<String>,
+    done_state: Option<String>,
+}
+
 pub async fn run(options: SetupOptions) -> Result<()> {
     let layout = detect_layout(&std::env::current_dir()?);
     let mode = choose_mode(options.mode, options.non_interactive)?;
@@ -55,7 +69,12 @@ pub async fn run(options: SetupOptions) -> Result<()> {
         None
     };
 
-    let values = collect_values(mode, options.binary_path.as_ref(), options.non_interactive)?;
+    let values =
+        collect_values(mode, options.binary_path.as_ref(), options.non_interactive).await?;
+
+    if values.normalize_project_statuses {
+        normalize_project_statuses(&layout, &values)?;
+    }
 
     write_text_file(
         &workflow_path,
@@ -225,7 +244,7 @@ fn docker_login_command(layout: &SetupLayout, provider: &str) -> String {
     )
 }
 
-fn collect_values(
+async fn collect_values(
     mode: DeployMode,
     explicit_binary_path: Option<&PathBuf>,
     non_interactive: bool,
@@ -237,6 +256,7 @@ fn collect_values(
     let env_project_owner = std::env::var("KAIRASTRA_GITHUB_PROJECT_OWNER").unwrap_or_default();
     let env_project_number = std::env::var("KAIRASTRA_GITHUB_PROJECT_NUMBER").unwrap_or_default();
     let env_project_url = std::env::var("KAIRASTRA_GITHUB_PROJECT_URL").unwrap_or_default();
+    let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
 
     let repo_input = ask_string(
         &theme,
@@ -316,6 +336,28 @@ fn collect_values(
     } else {
         String::new()
     };
+    let project_status_overview = if tracker_mode == GitHubMode::ProjectsV2 {
+        inspect_project_status_overview(
+            &github_token,
+            &github_owner,
+            &github_repo,
+            &github_project_owner,
+            &github_project_number,
+            &github_project_url,
+        )
+        .await
+        .ok()
+    } else {
+        None
+    };
+    let (project_status, normalize_project_statuses) = collect_project_status_config(
+        &theme,
+        non_interactive,
+        project_status_overview.as_ref(),
+        &github_owner,
+        &github_project_owner,
+        &github_project_number,
+    )?;
     let workspace_root = ask_string(
         &theme,
         "Workspace root",
@@ -371,7 +413,6 @@ fn collect_values(
         .find(|config| providers::setup_provider_id(config) == provider)
         .cloned()
         .expect("selected provider config should be present");
-    let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
     let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
     let gemini_api_key = std::env::var("GEMINI_API_KEY")
         .or_else(|_| std::env::var("GOOGLE_API_KEY"))
@@ -382,6 +423,8 @@ fn collect_values(
 
     Ok(SetupValues {
         tracker_mode,
+        project_status,
+        normalize_project_statuses,
         provider,
         provider_configs,
         github_owner,
@@ -605,6 +648,540 @@ fn ask_string(
     }
 }
 
+fn ask_string_list(
+    theme: &ColorfulTheme,
+    prompt: &str,
+    default: &[String],
+    non_interactive: bool,
+) -> Result<Vec<String>> {
+    let rendered_default = default.join(", ");
+    let value = ask_string(theme, prompt, rendered_default, non_interactive, true)?;
+    Ok(parse_string_list(&value))
+}
+
+fn ask_optional_string(
+    theme: &ColorfulTheme,
+    prompt: &str,
+    default: Option<&str>,
+    non_interactive: bool,
+) -> Result<Option<String>> {
+    let value = ask_string(
+        theme,
+        prompt,
+        default.unwrap_or_default().to_string(),
+        non_interactive,
+        true,
+    )?;
+    if value.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn parse_string_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn parse_list_env(name: &str) -> Option<Vec<String>> {
+    std::env::var(name)
+        .ok()
+        .map(|value| parse_string_list(&value))
+        .filter(|values| !values.is_empty())
+}
+
+fn parse_optional_env(name: &str) -> Option<Option<String>> {
+    let value = std::env::var(name).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("null")
+    {
+        return Some(None);
+    }
+    Some(Some(trimmed.to_string()))
+}
+
+fn canonical_project_status_options() -> Vec<String> {
+    vec![
+        "Backlog".to_string(),
+        "Todo".to_string(),
+        "In Progress".to_string(),
+        "Human Review".to_string(),
+        "Merging".to_string(),
+        "Rework".to_string(),
+        "Done".to_string(),
+        "Cancelled".to_string(),
+        "Duplicate".to_string(),
+    ]
+}
+
+fn canonical_project_status_config() -> ProjectStatusConfig {
+    ProjectStatusConfig {
+        active_states: vec![
+            "Todo".to_string(),
+            "In Progress".to_string(),
+            "Merging".to_string(),
+            "Rework".to_string(),
+        ],
+        terminal_states: vec![
+            "Closed".to_string(),
+            "Cancelled".to_string(),
+            "Canceled".to_string(),
+            "Duplicate".to_string(),
+            "Done".to_string(),
+        ],
+        claimable_states: vec!["Todo".to_string()],
+        in_progress_state: Some("In Progress".to_string()),
+        human_review_state: Some("Human Review".to_string()),
+        done_state: Some("Done".to_string()),
+    }
+}
+
+fn status_normalization_confirmation_token(project_owner: &str, project_number: &str) -> String {
+    format!("normalize {project_owner}#{project_number}")
+}
+
+fn project_status_overview_block_reason(overview: &ProjectStatusOverview) -> Option<String> {
+    if overview.total_items == 0 {
+        return None;
+    }
+
+    let canonical = canonical_project_status_options()
+        .into_iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let incompatible = overview
+        .item_counts
+        .keys()
+        .filter(|status| {
+            !canonical
+                .iter()
+                .any(|candidate| candidate == &status.to_ascii_lowercase())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if incompatible.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "normalization is blocked because this Project already has items in statuses that would be changed or removed: {}",
+            incompatible.join(", ")
+        ))
+    }
+}
+
+fn build_project_status_tracker_settings(
+    github_token: &str,
+    github_owner: &str,
+    github_repo: &str,
+    github_project_owner: &str,
+    github_project_number: &str,
+    github_project_url: &str,
+) -> Option<TrackerSettings> {
+    if github_token.trim().is_empty() || github_project_number.trim().is_empty() {
+        return None;
+    }
+    let project_number = github_project_number.trim().parse::<u32>().ok()?;
+    Some(TrackerSettings {
+        kind: "github".to_string(),
+        mode: GitHubMode::ProjectsV2,
+        api_key: github_token.to_string(),
+        owner: github_owner.to_string(),
+        repo: Some(github_repo.to_string()),
+        project_owner: Some(github_project_owner.to_string())
+            .filter(|value| !value.trim().is_empty()),
+        project_v2_number: Some(project_number),
+        project_url: Some(github_project_url.to_string()).filter(|value| !value.trim().is_empty()),
+        active_states: Vec::new(),
+        terminal_states: Vec::new(),
+        claimable_states: Vec::new(),
+        in_progress_state: None,
+        human_review_state: None,
+        done_state: None,
+        status_source: Some(FieldSource {
+            source_type: FieldSourceType::ProjectField,
+            name: Some("Status".to_string()),
+        }),
+        priority_source: None,
+        graphql_endpoint: "https://api.github.com/graphql".to_string(),
+        rest_endpoint: "https://api.github.com".to_string(),
+    })
+}
+
+async fn inspect_project_status_overview(
+    github_token: &str,
+    github_owner: &str,
+    github_repo: &str,
+    github_project_owner: &str,
+    github_project_number: &str,
+    github_project_url: &str,
+) -> Result<ProjectStatusOverview> {
+    let settings = build_project_status_tracker_settings(
+        github_token,
+        github_owner,
+        github_repo,
+        github_project_owner,
+        github_project_number,
+        github_project_url,
+    )
+    .ok_or_else(|| {
+        anyhow!("project status inspection requires GITHUB_TOKEN and a valid project number")
+    })?;
+    let tracker = GitHubTracker::new(settings)?;
+    tracker.inspect_project_status_overview().await
+}
+
+fn prompt_multi_select_states(
+    theme: &ColorfulTheme,
+    prompt: &str,
+    options: &[String],
+    defaults: &[String],
+    counts: Option<&std::collections::HashMap<String, usize>>,
+    allow_empty: bool,
+) -> Result<Vec<String>> {
+    let labels = options
+        .iter()
+        .map(|option| {
+            let count = counts
+                .and_then(|counts| counts.get(option))
+                .copied()
+                .unwrap_or(0);
+            if count > 0 {
+                format!("{option} ({count} items)")
+            } else {
+                option.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let default_checks = options
+        .iter()
+        .map(|option| {
+            defaults
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(option))
+        })
+        .collect::<Vec<_>>();
+    let selections = MultiSelect::with_theme(theme)
+        .with_prompt(prompt)
+        .items(&labels)
+        .defaults(&default_checks)
+        .interact()?;
+    let chosen = selections
+        .into_iter()
+        .filter_map(|index| options.get(index).cloned())
+        .collect::<Vec<_>>();
+    if !allow_empty && chosen.is_empty() {
+        return Err(anyhow!("{prompt} requires at least one selection"));
+    }
+    Ok(chosen)
+}
+
+fn prompt_optional_state(
+    theme: &ColorfulTheme,
+    prompt: &str,
+    options: &[String],
+    default: Option<&str>,
+    counts: Option<&std::collections::HashMap<String, usize>>,
+) -> Result<Option<String>> {
+    let mut labels = vec!["Do not change project status".to_string()];
+    labels.extend(options.iter().map(|option| {
+        let count = counts
+            .and_then(|counts| counts.get(option))
+            .copied()
+            .unwrap_or(0);
+        if count > 0 {
+            format!("{option} ({count} items)")
+        } else {
+            option.clone()
+        }
+    }));
+    let default_index = default
+        .and_then(|target| {
+            options
+                .iter()
+                .position(|option| option.eq_ignore_ascii_case(target))
+                .map(|index| index + 1)
+        })
+        .unwrap_or(0);
+    let selection = Select::with_theme(theme)
+        .with_prompt(prompt)
+        .items(&labels)
+        .default(default_index)
+        .interact()?;
+    if selection == 0 {
+        Ok(None)
+    } else {
+        Ok(options.get(selection - 1).cloned())
+    }
+}
+
+fn collect_existing_project_status_config(
+    theme: &ColorfulTheme,
+    overview: &ProjectStatusOverview,
+) -> Result<ProjectStatusConfig> {
+    let defaults = canonical_project_status_config();
+    let active_states = prompt_multi_select_states(
+        theme,
+        "Dispatchable active states",
+        &overview.options,
+        &defaults.active_states,
+        Some(&overview.item_counts),
+        false,
+    )?;
+    let mut terminal_options = vec!["Closed".to_string()];
+    terminal_options.extend(overview.options.clone());
+    let terminal_states = prompt_multi_select_states(
+        theme,
+        "Terminal states",
+        &terminal_options,
+        &defaults.terminal_states,
+        Some(&overview.item_counts),
+        false,
+    )?;
+    let claimable_states = prompt_multi_select_states(
+        theme,
+        "States treated as ready to claim (optional)",
+        &active_states,
+        &defaults.claimable_states,
+        Some(&overview.item_counts),
+        true,
+    )?;
+    let in_progress_state = prompt_optional_state(
+        theme,
+        "Status to set when a claim starts",
+        &overview.options,
+        defaults.in_progress_state.as_deref(),
+        Some(&overview.item_counts),
+    )?;
+    let human_review_state = prompt_optional_state(
+        theme,
+        "Status to set for review or blocked handoff",
+        &overview.options,
+        defaults.human_review_state.as_deref(),
+        Some(&overview.item_counts),
+    )?;
+    let done_state = prompt_optional_state(
+        theme,
+        "Status to set when a closed issue is reconciled",
+        &overview.options,
+        defaults.done_state.as_deref(),
+        Some(&overview.item_counts),
+    )?;
+
+    Ok(ProjectStatusConfig {
+        active_states,
+        terminal_states,
+        claimable_states,
+        in_progress_state,
+        human_review_state,
+        done_state,
+    })
+}
+
+fn collect_manual_project_status_config(
+    theme: &ColorfulTheme,
+    non_interactive: bool,
+) -> Result<ProjectStatusConfig> {
+    let defaults = canonical_project_status_config();
+    let active_states = ask_string_list(
+        theme,
+        "Dispatchable active states (comma-separated)",
+        &defaults.active_states,
+        non_interactive,
+    )?;
+    let terminal_states = ask_string_list(
+        theme,
+        "Terminal states (comma-separated)",
+        &defaults.terminal_states,
+        non_interactive,
+    )?;
+    let claimable_states = ask_string_list(
+        theme,
+        "Claimable states (comma-separated, optional)",
+        &defaults.claimable_states,
+        non_interactive,
+    )?;
+    let in_progress_state = ask_optional_string(
+        theme,
+        "Status to set when a claim starts (optional)",
+        defaults.in_progress_state.as_deref(),
+        non_interactive,
+    )?;
+    let human_review_state = ask_optional_string(
+        theme,
+        "Status to set for review or blocked handoff (optional)",
+        defaults.human_review_state.as_deref(),
+        non_interactive,
+    )?;
+    let done_state = ask_optional_string(
+        theme,
+        "Status to set when a closed issue is reconciled (optional)",
+        defaults.done_state.as_deref(),
+        non_interactive,
+    )?;
+    Ok(ProjectStatusConfig {
+        active_states,
+        terminal_states,
+        claimable_states,
+        in_progress_state,
+        human_review_state,
+        done_state,
+    })
+}
+
+fn collect_non_interactive_project_status_config() -> ProjectStatusConfig {
+    let defaults = canonical_project_status_config();
+    ProjectStatusConfig {
+        active_states: parse_list_env("KAIRASTRA_ACTIVE_STATES")
+            .unwrap_or_else(|| defaults.active_states.clone()),
+        terminal_states: parse_list_env("KAIRASTRA_TERMINAL_STATES")
+            .unwrap_or_else(|| defaults.terminal_states.clone()),
+        claimable_states: parse_list_env("KAIRASTRA_CLAIMABLE_STATES")
+            .unwrap_or_else(|| defaults.claimable_states.clone()),
+        in_progress_state: parse_optional_env("KAIRASTRA_IN_PROGRESS_STATE")
+            .unwrap_or_else(|| defaults.in_progress_state.clone()),
+        human_review_state: parse_optional_env("KAIRASTRA_HUMAN_REVIEW_STATE")
+            .unwrap_or_else(|| defaults.human_review_state.clone()),
+        done_state: parse_optional_env("KAIRASTRA_DONE_STATE")
+            .unwrap_or_else(|| defaults.done_state.clone()),
+    }
+}
+
+fn confirm_project_normalization(
+    theme: &ColorfulTheme,
+    project_owner: &str,
+    project_number: &str,
+) -> Result<()> {
+    let token = status_normalization_confirmation_token(project_owner, project_number);
+    println!();
+    println!("Normalize GitHub Project Status field?");
+    println!(
+        "This will update the Status field on GitHub Project {}#{} to Kairastra's default options.",
+        project_owner, project_number
+    );
+    println!(
+        "Status options that are not in the target set will be removed from the field definition."
+    );
+    println!("Kairastra cannot undo this change.");
+    let confirmation = ask_string(
+        theme,
+        &format!("To continue, type: {token}"),
+        String::new(),
+        false,
+        true,
+    )?;
+    if confirmation != token {
+        return Err(anyhow!(
+            "project status normalization confirmation did not match"
+        ));
+    }
+    Ok(())
+}
+
+fn collect_project_status_config(
+    theme: &ColorfulTheme,
+    non_interactive: bool,
+    overview: Option<&ProjectStatusOverview>,
+    github_owner: &str,
+    github_project_owner: &str,
+    github_project_number: &str,
+) -> Result<(ProjectStatusConfig, bool)> {
+    if non_interactive {
+        return Ok((collect_non_interactive_project_status_config(), false));
+    }
+
+    if let Some(overview) = overview {
+        let block_reason = project_status_overview_block_reason(overview);
+        let normalize_label = if let Some(reason) = block_reason.as_ref() {
+            format!("Normalize Project to Kairastra statuses (unavailable: {reason})")
+        } else {
+            "Normalize Project to Kairastra statuses".to_string()
+        };
+        let choice = Select::with_theme(theme)
+            .with_prompt("Project status handling")
+            .items(&[
+                "Keep existing Project statuses (recommended)".to_string(),
+                normalize_label,
+            ])
+            .default(0)
+            .interact()?;
+        if choice == 1 {
+            if let Some(reason) = block_reason {
+                return Err(anyhow!(
+                    "{reason}. Kairastra will not rewrite a live Project without an explicit migration feature."
+                ));
+            }
+            let project_owner = if github_project_owner.trim().is_empty() {
+                github_owner
+            } else {
+                github_project_owner
+            };
+            confirm_project_normalization(theme, project_owner, github_project_number)?;
+            return Ok((canonical_project_status_config(), true));
+        }
+        return Ok((
+            collect_existing_project_status_config(theme, overview)?,
+            false,
+        ));
+    }
+
+    Ok((collect_manual_project_status_config(theme, false)?, false))
+}
+
+fn normalize_project_statuses(layout: &SetupLayout, values: &SetupValues) -> Result<()> {
+    let script = layout.repo_root.join("scripts/bootstrap_github_project.py");
+    if !script.is_file() {
+        return Err(anyhow!(
+            "status normalization helper not found at {}",
+            script.display()
+        ));
+    }
+
+    let project_owner = if values.github_project_owner.trim().is_empty() {
+        values.github_owner.as_str()
+    } else {
+        values.github_project_owner.as_str()
+    };
+    let confirmation_token =
+        status_normalization_confirmation_token(project_owner, &values.github_project_number);
+
+    let output = Command::new("python3")
+        .arg(&script)
+        .arg("--owner")
+        .arg(&values.github_owner)
+        .arg("--repo")
+        .arg(&values.github_repo)
+        .arg("--project-owner")
+        .arg(project_owner)
+        .arg("--project-number")
+        .arg(&values.github_project_number)
+        .arg("--status-mode")
+        .arg("normalize")
+        .arg("--skip-labels")
+        .arg("--skip-priority-field")
+        .arg("--confirm-normalize-token")
+        .arg(&confirmation_token)
+        .output()
+        .with_context(|| format!("failed to run {}", script.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(anyhow!(
+            "project status normalization failed: {}",
+            if stderr.is_empty() { stdout } else { stderr }
+        ));
+    }
+
+    Ok(())
+}
+
 fn write_text_file(path: &Path, content: &str, non_interactive: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -627,6 +1204,28 @@ fn write_text_file(path: &Path, content: &str, non_interactive: bool) -> Result<
     }
 
     Ok(())
+}
+
+fn render_yaml_list(values: &[String], indent: usize) -> String {
+    if values.is_empty() {
+        return format!("{}[]\n", " ".repeat(indent));
+    }
+    let prefix = " ".repeat(indent);
+    values
+        .iter()
+        .map(|value| format!("{prefix}- {}\n", render_yaml_scalar(value)))
+        .collect::<String>()
+}
+
+fn render_optional_yaml_value(value: Option<&str>) -> String {
+    match value {
+        Some(value) => render_yaml_scalar(value),
+        None => "null".to_string(),
+    }
+}
+
+fn render_yaml_scalar(value: &str) -> String {
+    serde_json::to_string(value).expect("YAML scalar serialization should succeed")
 }
 
 fn render_workflow(values: &SetupValues) -> String {
@@ -654,7 +1253,8 @@ fn render_workflow(values: &SetupValues) -> String {
     let support_dirs = support_dirs.join(" ");
     let tracker_block = match values.tracker_mode {
         GitHubMode::ProjectsV2 => {
-            r#"tracker:
+            format!(
+                r#"tracker:
   kind: github
   mode: projects_v2
   api_key: $GITHUB_TOKEN
@@ -670,19 +1270,23 @@ fn render_workflow(values: &SetupValues) -> String {
     type: project_field
     name: Priority
   active_states:
-    - Todo
-    - In Progress
-    - Merging
-    - Rework
-  terminal_states:
-    - Closed
-    - Cancelled
-    - Canceled
-    - Duplicate
-    - Done"#
+{active_states}  terminal_states:
+{terminal_states}  claimable_states:
+{claimable_states}  in_progress_state: {in_progress_state}
+  human_review_state: {human_review_state}
+  done_state: {done_state}"#,
+                active_states = render_yaml_list(&values.project_status.active_states, 4),
+                terminal_states = render_yaml_list(&values.project_status.terminal_states, 4),
+                claimable_states = render_yaml_list(&values.project_status.claimable_states, 4),
+                in_progress_state =
+                    render_optional_yaml_value(values.project_status.in_progress_state.as_deref()),
+                human_review_state =
+                    render_optional_yaml_value(values.project_status.human_review_state.as_deref()),
+                done_state =
+                    render_optional_yaml_value(values.project_status.done_state.as_deref()),
+            )
         }
-        GitHubMode::IssuesOnly => {
-            r#"tracker:
+        GitHubMode::IssuesOnly => r#"tracker:
   kind: github
   mode: issues_only
   api_key: $GITHUB_TOKEN
@@ -694,7 +1298,7 @@ fn render_workflow(values: &SetupValues) -> String {
     - Open
   terminal_states:
     - Closed"#
-        }
+            .to_string(),
     };
 
     format!(
@@ -1071,6 +1675,8 @@ mod tests {
     fn sample_values() -> SetupValues {
         SetupValues {
             tracker_mode: GitHubMode::ProjectsV2,
+            project_status: super::canonical_project_status_config(),
+            normalize_project_statuses: false,
             provider: "codex".to_string(),
             provider_configs: vec![
                 ProviderSetupConfig::Codex(CodexSetupConfig {
@@ -1147,6 +1753,9 @@ mod tests {
         assert!(
             rendered.contains("current_remote=\"$(git config --get remote.origin.url || true)\"")
         );
+        assert!(rendered.contains(r#"  in_progress_state: "In Progress""#));
+        assert!(rendered.contains(r#"  human_review_state: "Human Review""#));
+        assert!(rendered.contains(r#"  done_state: "Done""#));
     }
 
     #[test]
@@ -1281,5 +1890,23 @@ mod tests {
         assert!(!rendered.contains("KAIRASTRA_GITHUB_PROJECT_OWNER"));
         assert!(!rendered.contains("KAIRASTRA_GITHUB_PROJECT_NUMBER"));
         assert!(!rendered.contains("KAIRASTRA_GITHUB_PROJECT_URL"));
+    }
+
+    #[test]
+    fn workflow_quotes_custom_status_names() {
+        let mut values = sample_values();
+        values.project_status.active_states = vec!["Ready: Waiting".to_string()];
+        values.project_status.terminal_states = vec!["Done / Shipped".to_string()];
+        values.project_status.claimable_states = vec!["Ready: Waiting".to_string()];
+        values.project_status.in_progress_state = Some("Doing: Active".to_string());
+        values.project_status.human_review_state = Some("Needs Review".to_string());
+        values.project_status.done_state = None;
+
+        let rendered = render_workflow(&values);
+        assert!(rendered.contains(r#"- "Ready: Waiting""#));
+        assert!(rendered.contains(r#"- "Done / Shipped""#));
+        assert!(rendered.contains(r#"  in_progress_state: "Doing: Active""#));
+        assert!(rendered.contains(r#"  human_review_state: "Needs Review""#));
+        assert!(rendered.contains("  done_state: null"));
     }
 }

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 use tracing::{debug, warn};
 
-use crate::config::{FieldSourceType, GitHubMode, TrackerSettings};
+use crate::config::{normalize_issue_state, FieldSourceType, GitHubMode, TrackerSettings};
 use crate::model::{BlockerRef, Issue};
 use crate::providers::is_workpad_comment;
 
@@ -26,6 +26,14 @@ pub trait Tracker: Send + Sync {
 pub struct GitHubTracker {
     settings: TrackerSettings,
     client: Client,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectStatusOverview {
+    pub field_name: String,
+    pub options: Vec<String>,
+    pub item_counts: HashMap<String, usize>,
+    pub total_items: usize,
 }
 
 impl GitHubTracker {
@@ -85,6 +93,22 @@ impl GitHubTracker {
             }
             None => true,
         }
+    }
+
+    fn configured_status_field_name(&self) -> String {
+        self.settings
+            .status_source
+            .as_ref()
+            .and_then(|source| source.name.clone())
+            .unwrap_or_else(|| "Status".to_string())
+    }
+
+    fn claimable_state(&self, state: &str) -> bool {
+        let normalized = normalize_issue_state(state);
+        self.settings
+            .claimable_states
+            .iter()
+            .any(|candidate| normalize_issue_state(candidate) == normalized)
     }
 
     pub async fn graphql_raw(&self, query: &str, variables: JsonValue) -> Result<JsonValue> {
@@ -180,12 +204,7 @@ impl GitHubTracker {
             .settings
             .project_v2_number
             .ok_or_else(|| anyhow!("missing_github_project_v2_number"))?;
-        let status_field = self
-            .settings
-            .status_source
-            .as_ref()
-            .and_then(|source| source.name.clone())
-            .unwrap_or_else(|| "Status".to_string());
+        let status_field = self.configured_status_field_name();
         let priority_field = self
             .settings
             .priority_source
@@ -350,12 +369,7 @@ query KairastraProjectItems(
             .settings
             .project_v2_number
             .ok_or_else(|| anyhow!("missing_github_project_v2_number"))?;
-        let status_field = self
-            .settings
-            .status_source
-            .as_ref()
-            .and_then(|source| source.name.clone())
-            .unwrap_or_else(|| "Status".to_string());
+        let status_field = self.configured_status_field_name();
 
         let query = r#"
 query KairastraProjectStatusField($owner: String!, $projectNumber: Int!) {
@@ -435,6 +449,30 @@ query KairastraProjectStatusField($owner: String!, $projectNumber: Int!) {
         })
     }
 
+    pub async fn inspect_project_status_overview(&self) -> Result<ProjectStatusOverview> {
+        let metadata = self.load_project_status_field_metadata().await?;
+        let mut item_counts = HashMap::new();
+        let mut total_items = 0usize;
+
+        for item in self.list_project_items().await? {
+            if let Some(status) = item.status.as_ref().and_then(field_value_string) {
+                *item_counts.entry(status).or_insert(0) += 1;
+                total_items += 1;
+            }
+        }
+
+        Ok(ProjectStatusOverview {
+            field_name: self.configured_status_field_name(),
+            options: metadata
+                .options
+                .into_iter()
+                .map(|option| option.name)
+                .collect(),
+            item_counts,
+            total_items,
+        })
+    }
+
     pub async fn transition_issue_project_status(
         &self,
         issue: &Issue,
@@ -499,18 +537,30 @@ mutation KairastraUpdateProjectItemStatus(
     }
 
     pub async fn transition_issue_to_in_progress_on_claim(&self, issue: &Issue) -> Result<Issue> {
-        if !issue.state.trim().eq_ignore_ascii_case("todo") {
+        if !self.claimable_state(&issue.state) {
             return Ok(issue.clone());
         }
-        self.transition_issue_project_status(issue, "In Progress")
-            .await
+        let Some(target) = self.settings.in_progress_state.as_deref() else {
+            return Ok(issue.clone());
+        };
+        self.transition_issue_project_status(issue, target).await
+    }
+
+    pub async fn transition_issue_to_human_review(&self, issue: &Issue) -> Result<Issue> {
+        let Some(target) = self.settings.human_review_state.as_deref() else {
+            return Ok(issue.clone());
+        };
+        self.transition_issue_project_status(issue, target).await
     }
 
     pub async fn transition_closed_issue_to_done(&self, issue: &Issue) -> Result<Issue> {
         if !issue.state.trim().eq_ignore_ascii_case("closed") {
             return Ok(issue.clone());
         }
-        self.transition_issue_project_status(issue, "Done").await
+        let Some(target) = self.settings.done_state.as_deref() else {
+            return Ok(issue.clone());
+        };
+        self.transition_issue_project_status(issue, target).await
     }
 
     pub async fn has_open_pull_request_for_branch(
@@ -851,7 +901,7 @@ mutation KairastraUpdateProjectItemStatus(
             project_status.unwrap_or(issue_state)
         };
 
-        let blocked_by = if state.trim().eq_ignore_ascii_case("todo") {
+        let blocked_by = if self.claimable_state(&state) {
             self.fetch_blocked_by(&owner, &repo, content.number).await?
         } else {
             Vec::new()
@@ -915,7 +965,7 @@ mutation KairastraUpdateProjectItemStatus(
         };
 
         let state = resolve_issue_state(&self.settings, &issue, &field_values);
-        let blocked_by = if state.trim().eq_ignore_ascii_case("todo") {
+        let blocked_by = if self.claimable_state(&state) {
             self.fetch_blocked_by(&owner, &repo, issue.number).await?
         } else {
             Vec::new()
@@ -2274,6 +2324,138 @@ mod tests {
             .unwrap();
         assert_eq!(updated.state, "In Progress");
         assert_eq!(updated.project_item_id.as_deref(), Some("item-1"));
+    }
+
+    #[tokio::test]
+    async fn claim_transition_uses_custom_project_status_target() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("KairastraProjectStatusField"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "organization": {
+                        "projectV2": {
+                            "id": "project-1",
+                            "fields": {
+                                "nodes": [{
+                                    "__typename": "ProjectV2SingleSelectField",
+                                    "id": "field-status",
+                                    "name": "Status",
+                                    "options": [
+                                        { "id": "opt-ready", "name": "Ready" },
+                                        { "id": "opt-doing", "name": "Doing" }
+                                    ]
+                                }]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("KairastraUpdateProjectItemStatus"))
+            .and(body_string_contains("opt-doing"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": {
+                        "projectV2Item": { "id": "item-1" }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("KairastraProjectItems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "organization": {
+                        "projectV2": {
+                            "items": {
+                                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                                "nodes": [{
+                                    "id": "item-1",
+                                    "status": { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Doing" },
+                                    "priority": null,
+                                    "content": {
+                                        "__typename": "Issue",
+                                        "id": "issue-node-1",
+                                        "number": 42,
+                                        "title": "Port tracker",
+                                        "body": "body",
+                                        "url": "https://github.com/openai/kairastra/issues/42",
+                                        "state": "OPEN",
+                                        "createdAt": "2026-03-13T00:00:00Z",
+                                        "updatedAt": "2026-03-13T01:00:00Z",
+                                        "assignees": { "nodes": [] },
+                                        "labels": { "nodes": [] },
+                                        "repository": {
+                                            "name": "kairastra",
+                                            "owner": { "login": "openai" }
+                                        }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  project_v2_number: 7
+  mode: projects_v2
+  claimable_states: ["Ready"]
+  in_progress_state: Doing
+  status_source:
+    type: project_field
+    name: Status
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issue = crate::model::Issue {
+            id: "issue-node-1".to_string(),
+            project_item_id: Some("item-1".to_string()),
+            identifier: "openai/kairastra#42".to_string(),
+            title: "Port tracker".to_string(),
+            description: Some("body".to_string()),
+            priority: None,
+            state: "Ready".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/kairastra/issues/42".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let updated = tracker
+            .transition_issue_to_in_progress_on_claim(&issue)
+            .await
+            .unwrap();
+        assert_eq!(updated.state, "Doing");
     }
 
     #[tokio::test]

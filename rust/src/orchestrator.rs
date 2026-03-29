@@ -449,7 +449,7 @@ impl Orchestrator {
             IssueProviderSelection::Selected(provider) => provider,
             IssueProviderSelection::Blocked(warning) => {
                 if let Some((provider, failure, blocked)) =
-                    classify_provider_selection_block(&issue, &warning)
+                    classify_provider_selection_block(&snapshot.settings, &issue, &warning)
                 {
                     if let Err(error) = self
                         .persist_dispatch_blocker(&snapshot, &issue, &provider, &failure, &blocked)
@@ -549,7 +549,7 @@ impl Orchestrator {
 
         if let IssueProviderSelection::Blocked(warning) = issue_provider(snapshot, &issue) {
             if let Some((provider, failure, blocked)) =
-                classify_provider_selection_block(&issue, &warning)
+                classify_provider_selection_block(&snapshot.settings, &issue, &warning)
             {
                 if let Err(error) = self
                     .persist_dispatch_blocker(snapshot, &issue, &provider, &failure, &blocked)
@@ -566,7 +566,7 @@ impl Orchestrator {
             return Ok(None);
         }
 
-        if issue.state.trim().eq_ignore_ascii_case("todo")
+        if snapshot.settings.claimable_state(&issue.state)
             && issue.blocked_by.iter().any(|blocker| {
                 blocker
                     .state
@@ -578,7 +578,7 @@ impl Orchestrator {
             return Ok(None);
         }
 
-        if issue.state.trim().eq_ignore_ascii_case("todo") {
+        if snapshot.settings.claimable_state(&issue.state) {
             issue = self
                 .tracker
                 .transition_issue_to_in_progress_on_claim(&issue)
@@ -713,7 +713,9 @@ impl Orchestrator {
                     Err(error) => {
                         error!(issue_identifier = %identifier, error, "worker failed");
                         state.claimed.remove(&issue_id);
-                        if let Some(blocked) = classify_blocked_worker_failure(provider, &error) {
+                        if let Some(blocked) =
+                            classify_blocked_worker_failure(&snapshot.settings, provider, &error)
+                        {
                             if let Err(annotation_error) = self
                                 .persist_blocked_worker_failure(
                                     snapshot,
@@ -828,10 +830,7 @@ impl Orchestrator {
         if snapshot.settings.active_state(&issue.state)
             && !snapshot.settings.terminal_state(&issue.state)
         {
-            *issue = self
-                .tracker
-                .transition_issue_project_status(issue, "Human Review")
-                .await?;
+            *issue = self.tracker.transition_issue_to_human_review(issue).await?;
         }
 
         warn!(
@@ -1423,15 +1422,21 @@ fn schedule_retry(
     );
 }
 
-fn classify_blocked_worker_failure(provider: &str, error: &str) -> Option<BlockedWorkerFailure> {
+fn classify_blocked_worker_failure(
+    settings: &Settings,
+    provider: &str,
+    error: &str,
+) -> Option<BlockedWorkerFailure> {
     let normalized = error.to_ascii_lowercase();
+    let move_back_action = move_issue_back_instruction(settings);
 
     let operator_action = if normalized.contains("approval_required")
         || normalized.contains("requested permissions")
     {
         format!(
-            "Grant the missing {} permissions or adjust the provider permission mode, then move the issue back to `Todo` or `In Progress`.",
-            provider_display_name(provider)
+            "Grant the missing {} permissions or adjust the provider permission mode, then {}.",
+            provider_display_name(provider),
+            move_back_action
         )
     } else if normalized.contains("not logged in")
         || normalized.contains("authentication_failed")
@@ -1439,14 +1444,18 @@ fn classify_blocked_worker_failure(provider: &str, error: &str) -> Option<Blocke
         || normalized.contains("credentials_present: false")
     {
         format!(
-            "Configure {} auth in the runtime environment, then move the issue back to `Todo` or `In Progress`.",
-            provider_display_name(provider)
+            "Configure {} auth in the runtime environment, then {}.",
+            provider_display_name(provider),
+            move_back_action
         )
     } else if normalized.contains("root/sudo privileges")
         || normalized.contains("dangerously-skip-permissions")
         || normalized.contains("bypasspermissions")
     {
-        "Run Claude in a non-root environment or change `providers.claude.permission_mode` / `approval_policy` so Docker does not request bypass permissions, then move the issue back to `Todo` or `In Progress`.".to_string()
+        format!(
+            "Run Claude in a non-root environment or change `providers.claude.permission_mode` / `approval_policy` so Docker does not request bypass permissions, then {}.",
+            move_back_action
+        )
     } else if normalized.contains("failed to launch claude code")
         || normalized.contains("failed to launch codex app-server")
         || normalized.contains("failed to launch gemini cli")
@@ -1454,13 +1463,17 @@ fn classify_blocked_worker_failure(provider: &str, error: &str) -> Option<Blocke
         || normalized.contains("command not found")
     {
         format!(
-            "Install the {} runtime in the worker environment and verify it is available on `PATH`, then move the issue back to `Todo` or `In Progress`.",
-            provider_display_name(provider)
+            "Install the {} runtime in the worker environment and verify it is available on `PATH`, then {}.",
+            provider_display_name(provider),
+            move_back_action
         )
     } else if normalized.contains("invalid_workflow_config")
         || normalized.contains("unsupported_agent_provider")
     {
-        "Fix the Kairastra workflow/provider configuration, then move the issue back to `Todo` or `In Progress`.".to_string()
+        format!(
+            "Fix the Kairastra workflow/provider configuration, then {}.",
+            move_back_action
+        )
     } else {
         return None;
     };
@@ -1469,15 +1482,21 @@ fn classify_blocked_worker_failure(provider: &str, error: &str) -> Option<Blocke
 }
 
 fn classify_provider_selection_block(
+    settings: &Settings,
     issue: &Issue,
     warning: &str,
 ) -> Option<(String, String, BlockedWorkerFailure)> {
+    let move_back_action = move_issue_back_instruction(settings);
+
     if warning == "invalid_issue_agent_label" {
         return Some((
             "unknown".to_string(),
             "Issue has an invalid `agent:` label.".to_string(),
             BlockedWorkerFailure {
-                operator_action: "Replace the invalid `agent:` label with exactly one supported provider label, then move the issue back to `Todo` or `In Progress`.".to_string(),
+                operator_action: format!(
+                    "Replace the invalid `agent:` label with exactly one supported provider label, then {}.",
+                    move_back_action
+                ),
             },
         ));
     }
@@ -1487,7 +1506,10 @@ fn classify_provider_selection_block(
             "unknown".to_string(),
             "Issue has multiple `agent:` labels.".to_string(),
             BlockedWorkerFailure {
-                operator_action: "Leave exactly one `agent:` label on the issue, then move it back to `Todo` or `In Progress`.".to_string(),
+                operator_action: format!(
+                    "Leave exactly one `agent:` label on the issue, then {}.",
+                    move_back_action
+                ),
             },
         ));
     }
@@ -1502,7 +1524,8 @@ fn classify_provider_selection_block(
             ),
             BlockedWorkerFailure {
                 operator_action: format!(
-                    "Configure {display_name} in the active workflow/runtime or remove the `agent:{provider}` label, then move the issue back to `Todo` or `In Progress`."
+                    "Configure {display_name} in the active workflow/runtime or remove the `agent:{provider}` label, then {}.",
+                    move_back_action
                 ),
             },
         ));
@@ -1520,11 +1543,58 @@ fn classify_provider_selection_block(
         requested,
         format!("Issue cannot be dispatched because provider selection failed: {warning}"),
         BlockedWorkerFailure {
-            operator_action:
-                "Fix the issue's provider selection or workflow configuration, then move the issue back to `Todo` or `In Progress`."
-                    .to_string(),
+            operator_action: format!(
+                "Fix the issue's provider selection or workflow configuration, then {}.",
+                move_back_action
+            ),
         },
     ))
+}
+
+fn move_issue_back_instruction(settings: &Settings) -> String {
+    let mut states = Vec::new();
+    let mut seen = HashSet::new();
+
+    for state in &settings.tracker.claimable_states {
+        let normalized = normalize_issue_state(state);
+        if seen.insert(normalized) {
+            states.push(state.as_str());
+        }
+    }
+
+    if let Some(state) = settings.tracker.in_progress_state.as_deref() {
+        let normalized = normalize_issue_state(state);
+        if seen.insert(normalized) {
+            states.push(state);
+        }
+    }
+
+    if states.is_empty() {
+        return "move the issue into a configured active state".to_string();
+    }
+
+    format!(
+        "move the issue back to {}",
+        format_inline_state_list(&states)
+    )
+}
+
+fn format_inline_state_list(states: &[&str]) -> String {
+    match states {
+        [] => "a configured active state".to_string(),
+        [state] => format!("`{state}`"),
+        [first, second] => format!("`{first}` or `{second}`"),
+        _ => {
+            let mut rendered = states[..states.len() - 1]
+                .iter()
+                .map(|state| format!("`{state}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            rendered.push_str(", or ");
+            rendered.push_str(&format!("`{}`", states[states.len() - 1]));
+            rendered
+        }
+    }
 }
 
 fn provider_display_name(provider: &str) -> &'static str {
@@ -1699,7 +1769,7 @@ fn issue_eligible(
         }
     }
 
-    if issue.state.trim().eq_ignore_ascii_case("todo")
+    if snapshot.settings.claimable_state(&issue.state)
         && issue.blocked_by.iter().any(|blocker| {
             blocker
                 .state
@@ -1891,6 +1961,37 @@ providers:
         }
     }
 
+    fn snapshot_with_custom_status_mapping() -> WorkflowSnapshot {
+        let workflow = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+  api_key: fake
+  active_states: ["Ready", "Doing", "Needs Review"]
+  terminal_states: ["Complete", "Closed"]
+  claimable_states: ["Ready"]
+  in_progress_state: Doing
+  human_review_state: "Needs Review"
+  done_state: Complete
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+        let settings = Settings::from_workflow(&workflow).unwrap();
+        WorkflowSnapshot {
+            definition: workflow,
+            settings,
+        }
+    }
+
     fn issue(id: &str, state: &str, priority: Option<i64>) -> Issue {
         Issue {
             id: id.to_string(),
@@ -1921,6 +2022,44 @@ providers:
             id: Some("b1".to_string()),
             identifier: Some("B-1".to_string()),
             state: Some("In Progress".to_string()),
+        });
+
+        let state = RuntimeState::default();
+
+        assert!(!issue_eligible(&snapshot, &issue, &state, &HashMap::new()));
+    }
+
+    #[test]
+    fn blocks_custom_claimable_issues_with_active_blockers() {
+        let workflow = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+  api_key: fake
+  active_states: ["Ready", "Doing"]
+  terminal_states: ["Done", "Closed"]
+  claimable_states: ["Ready"]
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+        let snapshot = WorkflowSnapshot {
+            settings: Settings::from_workflow(&workflow).unwrap(),
+            definition: workflow,
+        };
+        let mut issue = issue("1", "Ready", Some(1));
+        issue.blocked_by.push(BlockerRef {
+            id: Some("b1".to_string()),
+            identifier: Some("B-1".to_string()),
+            state: Some("Doing".to_string()),
         });
 
         let state = RuntimeState::default();
@@ -2056,7 +2195,9 @@ providers:
 
     #[test]
     fn classifies_claude_auth_failures_as_blocked() {
+        let snapshot = snapshot();
         let blocked = classify_blocked_worker_failure(
+            &snapshot.settings,
             "claude",
             "Not logged in · Please run /login; process_exited=exit status: 1",
         )
@@ -2067,7 +2208,9 @@ providers:
 
     #[test]
     fn classifies_root_bypass_permission_failures_as_blocked() {
+        let snapshot = snapshot();
         let blocked = classify_blocked_worker_failure(
+            &snapshot.settings,
             "claude",
             "--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons",
         )
@@ -2078,15 +2221,20 @@ providers:
 
     #[test]
     fn leaves_retryable_failures_unclassified() {
-        assert!(classify_blocked_worker_failure("claude", "turn_timeout").is_none());
+        let snapshot = snapshot();
+        assert!(
+            classify_blocked_worker_failure(&snapshot.settings, "claude", "turn_timeout").is_none()
+        );
     }
 
     #[test]
     fn classifies_unconfigured_provider_labels_as_dispatch_blockers() {
+        let snapshot = snapshot();
         let mut issue = issue("55", "Todo", Some(1));
         issue.labels = vec!["agent:claude".to_string()];
 
         let (provider, failure, blocked) = classify_provider_selection_block(
+            &snapshot.settings,
             &issue,
             "issue_requested_provider_not_configured: claude",
         )
@@ -2099,16 +2247,30 @@ providers:
 
     #[test]
     fn classifies_multiple_provider_labels_as_dispatch_blockers() {
+        let snapshot = snapshot();
         let mut issue = issue("55", "Todo", Some(1));
         issue.labels = vec!["agent:claude".to_string(), "agent:codex".to_string()];
 
-        let (provider, failure, blocked) =
-            classify_provider_selection_block(&issue, "multiple_issue_agent_labels")
-                .expect("multiple provider labels should be annotated");
+        let (provider, failure, blocked) = classify_provider_selection_block(
+            &snapshot.settings,
+            &issue,
+            "multiple_issue_agent_labels",
+        )
+        .expect("multiple provider labels should be annotated");
 
         assert_eq!(provider, "unknown");
         assert!(failure.contains("multiple `agent:` labels"));
         assert!(blocked.operator_action.contains("exactly one"));
+    }
+
+    #[test]
+    fn blocker_actions_reference_custom_requeue_states() {
+        let snapshot = snapshot_with_custom_status_mapping();
+        let blocked =
+            classify_blocked_worker_failure(&snapshot.settings, "codex", "authentication_failed")
+                .expect("auth failures should block");
+
+        assert!(blocked.operator_action.contains("`Ready` or `Doing`"));
     }
 
     #[test]

@@ -75,7 +75,7 @@ For a public repository, `raw.githubusercontent.com` URLs should use:
 
 Use `sed`/`cat` for non-interactive review instead of `less` in scripted host commands.
 
-Latest `main` example (run on the host):
+Latest supported build from `main` (run on the host):
 
 ```bash
 curl -fsSL -o /tmp/install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/main/scripts/install-remote-docker.sh && bash /tmp/install-remote-docker.sh --ref main
@@ -86,3 +86,12 @@ Pinned ref example (run on the host):
 ```bash
 curl -fsSL -o /tmp/install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/v0.1.0-alpha.1/scripts/install-remote-docker.sh && bash /tmp/install-remote-docker.sh --ref v0.1.0-alpha.1
 ```
+
+Upgrade an existing remote install to the latest `main` and re-run setup:
+
+```bash
+~/kairastra/repo/scripts/install-remote-docker.sh --ref main --reconfigure
+```
+
+If setup still shows the old prompt text `GitHub Project URL (optional, can auto-fill owner and number)`,
+the host is still running an older ref or image. Re-run one of the `main` commands above.

@@ -155,14 +155,29 @@ def parse_args() -> argparse.Namespace:
         help="Project field name to ensure for numeric prioritization.",
     )
     parser.add_argument(
+        "--status-mode",
+        choices=["preserve", "normalize"],
+        default="preserve",
+        help="Whether to leave the Project Status field unchanged or normalize it to Kairastra defaults.",
+    )
+    parser.add_argument(
         "--skip-labels",
         action="store_true",
         help="Do not create or update the default Kairastra label pack.",
     )
     parser.add_argument(
+        "--skip-priority-field",
+        action="store_true",
+        help="Do not create the numeric Priority field.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print planned changes without mutating GitHub.",
+    )
+    parser.add_argument(
+        "--confirm-normalize-token",
+        help="Internal use: bypass the interactive destructive confirmation when the exact expected token is provided.",
     )
     args = parser.parse_args()
     if not args.project_owner:
@@ -308,6 +323,120 @@ def ensure_status_field(
     return Action(summary, True)
 
 
+def load_project_status_counts(project_number: int, owner: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    after: str | None = None
+
+    while True:
+        payload = gh_graphql(
+            """
+            query ProjectStatusItems($owner: String!, $projectNumber: Int!, $after: String) {
+              organization(login: $owner) {
+                projectV2(number: $projectNumber) {
+                  items(first: 100, after: $after) {
+                    pageInfo {
+                      hasNextPage
+                      endCursor
+                    }
+                    nodes {
+                      status: fieldValueByName(name: "Status") {
+                        __typename
+                        ... on ProjectV2ItemFieldSingleSelectValue { name }
+                        ... on ProjectV2ItemFieldTextValue { text }
+                        ... on ProjectV2ItemFieldNumberValue { number }
+                      }
+                    }
+                  }
+                }
+              }
+              user(login: $owner) {
+                projectV2(number: $projectNumber) {
+                  items(first: 100, after: $after) {
+                    pageInfo {
+                      hasNextPage
+                      endCursor
+                    }
+                    nodes {
+                      status: fieldValueByName(name: "Status") {
+                        __typename
+                        ... on ProjectV2ItemFieldSingleSelectValue { name }
+                        ... on ProjectV2ItemFieldTextValue { text }
+                        ... on ProjectV2ItemFieldNumberValue { number }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """,
+            {
+                "owner": owner,
+                "projectNumber": project_number,
+                "after": after,
+            },
+        )
+        project = (
+            payload.get("data", {}).get("organization", {}).get("projectV2")
+            or payload.get("data", {}).get("user", {}).get("projectV2")
+        )
+        if not project:
+            break
+        items = project.get("items", {})
+        for node in items.get("nodes", []):
+            status = node.get("status") or {}
+            value = status.get("name") or status.get("text") or status.get("number")
+            if value is None:
+                continue
+            rendered = str(value)
+            counts[rendered] = counts.get(rendered, 0) + 1
+        page_info = items.get("pageInfo", {})
+        if not page_info.get("hasNextPage"):
+            break
+        after = page_info.get("endCursor")
+    return counts
+
+
+def normalization_block_reason(status_counts: dict[str, int]) -> str | None:
+    if not status_counts:
+        return None
+    desired = {option["name"].lower() for option in STATUS_OPTIONS}
+    incompatible = sorted(
+        status for status, count in status_counts.items() if count > 0 and status.lower() not in desired
+    )
+    if not incompatible:
+        return None
+    return (
+        "normalization is blocked because this Project already has items in statuses that would be changed or removed: "
+        + ", ".join(incompatible)
+    )
+
+
+def confirm_status_normalization(
+    *,
+    owner: str,
+    project_number: int,
+    provided_token: str | None,
+) -> None:
+    expected = f"normalize {owner}#{project_number}"
+    if provided_token is not None:
+        if provided_token != expected:
+            raise BootstrapError("invalid --confirm-normalize-token")
+        return
+    if not sys.stdin.isatty():
+        raise BootstrapError("status normalization requires an interactive terminal")
+
+    print()
+    print("Normalize GitHub Project Status field?")
+    print(
+        f"This will update the Status field on GitHub Project {owner}#{project_number} to Kairastra's default options."
+    )
+    print("Status options that are not in the target set will be removed from the field definition.")
+    print("Kairastra cannot undo this change.")
+    typed = input(f"To continue, type: {expected}\n> ").strip()
+    if typed != expected:
+        raise BootstrapError("status normalization confirmation did not match")
+
+
 def ensure_priority_field(
     *,
     owner: str,
@@ -418,22 +547,44 @@ def main() -> int:
 
     project = load_project(args.project_number, args.project_owner)
     fields = load_fields(args.project_number, args.project_owner)
+    status_counts = load_project_status_counts(args.project_number, args.project_owner)
+    block_reason = normalization_block_reason(status_counts)
 
-    actions = [
-        ensure_status_field(
+    if args.status_mode == "normalize" and block_reason and not args.dry_run:
+        raise BootstrapError(
+            block_reason
+            + ". Kairastra will not rewrite a live Project without an explicit migration feature."
+        )
+    if args.status_mode == "normalize" and not args.dry_run:
+        confirm_status_normalization(
             owner=args.project_owner,
             project_number=args.project_number,
-            fields=fields,
-            dry_run=args.dry_run,
-        ),
-        ensure_priority_field(
-            owner=args.project_owner,
-            project_number=args.project_number,
-            field_name=args.priority_field_name,
-            fields=fields,
-            dry_run=args.dry_run,
-        ),
-    ]
+            provided_token=args.confirm_normalize_token,
+        )
+
+    actions = []
+    if args.status_mode == "normalize":
+        actions.append(
+            ensure_status_field(
+                owner=args.project_owner,
+                project_number=args.project_number,
+                fields=fields,
+                dry_run=args.dry_run,
+            )
+        )
+    else:
+        actions.append(Action("Status field left unchanged (preserve mode).", False))
+
+    if not args.skip_priority_field:
+        actions.append(
+            ensure_priority_field(
+                owner=args.project_owner,
+                project_number=args.project_number,
+                field_name=args.priority_field_name,
+                fields=fields,
+                dry_run=args.dry_run,
+            )
+        )
 
     if not args.skip_labels:
         actions.extend(ensure_labels(args.owner, args.repo, args.dry_run))
@@ -444,6 +595,7 @@ def main() -> int:
     print(f"Project: {project['title']} ({args.project_owner}#{args.project_number})")
     print(f"Repository: {args.owner}/{args.repo}")
     print(f"Mode: {'dry-run' if args.dry_run else 'apply'}")
+    print(f"Status field mode: {args.status_mode}")
     print()
 
     if changed:
@@ -465,6 +617,8 @@ def main() -> int:
         "Recommended Project status options: "
         + ", ".join(option["name"] for option in STATUS_OPTIONS)
     )
+    if block_reason:
+        print(block_reason + ".")
     print(
         "Dispatchable workflow states stay narrower: Todo, In Progress, Merging, Rework."
     )
