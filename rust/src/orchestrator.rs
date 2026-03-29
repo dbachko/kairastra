@@ -39,6 +39,7 @@ pub struct Orchestrator {
 struct RuntimeState {
     running: HashMap<String, RunningEntry>,
     claimed: HashSet<String>,
+    blocked_claims: HashMap<String, String>,
     retry_attempts: HashMap<String, RetryEntry>,
     agent_totals: AgentTotals,
     agent_rate_limits: Option<JsonValue>,
@@ -214,6 +215,7 @@ impl Orchestrator {
         worker_tx: &tokio::sync::mpsc::UnboundedSender<WorkerMessage>,
     ) -> Result<()> {
         self.reconcile_running(snapshot, state).await?;
+        self.revalidate_blocked_claims(snapshot, state).await?;
         self.dispatch_due_retries(snapshot, state, worker_tx)
             .await?;
 
@@ -246,7 +248,10 @@ impl Orchestrator {
                 break;
             }
 
-            let Some(issue) = self.revalidate_dispatch_issue(snapshot, issue).await? else {
+            let Some(issue) = self
+                .revalidate_dispatch_issue(snapshot, state, issue)
+                .await?
+            else {
                 continue;
             };
 
@@ -255,6 +260,47 @@ impl Orchestrator {
                 .await?
             {
                 dispatched += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn revalidate_blocked_claims(
+        &self,
+        snapshot: &WorkflowSnapshot,
+        state: &mut RuntimeState,
+    ) -> Result<()> {
+        if state.blocked_claims.is_empty() {
+            return Ok(());
+        }
+
+        let blocked_ids = state.blocked_claims.keys().cloned().collect::<Vec<_>>();
+        let refreshed = self.tracker.fetch_issue_states_by_ids(&blocked_ids).await?;
+        let issues_by_id = refreshed
+            .into_iter()
+            .map(|issue| (issue.id.clone(), issue))
+            .collect::<HashMap<_, _>>();
+
+        for issue_id in blocked_ids {
+            let Some(previous_state) = state.blocked_claims.get(&issue_id).cloned() else {
+                continue;
+            };
+
+            let Some(issue) = issues_by_id.get(&issue_id) else {
+                clear_blocked_claim(state, &issue_id);
+                continue;
+            };
+
+            if snapshot.settings.terminal_state(&issue.state) {
+                clear_blocked_claim(state, &issue_id);
+                self.cleanup_terminal_issue(snapshot, issue.clone(), "blocked claim release")
+                    .await;
+                continue;
+            }
+
+            if should_release_blocked_claim(&snapshot.settings, &previous_state, issue) {
+                clear_blocked_claim(state, &issue_id);
             }
         }
 
@@ -451,11 +497,18 @@ impl Orchestrator {
                 if let Some((provider, failure, blocked)) =
                     classify_provider_selection_block(&snapshot.settings, &issue, &warning)
                 {
-                    if let Err(error) = self
+                    match self
                         .persist_dispatch_blocker(&snapshot, &issue, &provider, &failure, &blocked)
                         .await
                     {
-                        log_runtime_error("dispatch blocker annotation", &error);
+                        Ok(issue) => {
+                            if should_hold_blocked_claim(&snapshot.settings, &issue) {
+                                hold_blocked_claim(state, &issue);
+                            }
+                        }
+                        Err(error) => {
+                            log_runtime_error("dispatch blocker annotation", &error);
+                        }
                     }
                 }
                 warn!(
@@ -531,6 +584,7 @@ impl Orchestrator {
     async fn revalidate_dispatch_issue(
         &self,
         snapshot: &WorkflowSnapshot,
+        state: &mut RuntimeState,
         issue: Issue,
     ) -> Result<Option<Issue>> {
         let refreshed = self
@@ -551,11 +605,18 @@ impl Orchestrator {
             if let Some((provider, failure, blocked)) =
                 classify_provider_selection_block(&snapshot.settings, &issue, &warning)
             {
-                if let Err(error) = self
+                match self
                     .persist_dispatch_blocker(snapshot, &issue, &provider, &failure, &blocked)
                     .await
                 {
-                    log_runtime_error("dispatch blocker annotation", &error);
+                    Ok(issue) => {
+                        if should_hold_blocked_claim(&snapshot.settings, &issue) {
+                            hold_blocked_claim(state, &issue);
+                        }
+                    }
+                    Err(error) => {
+                        log_runtime_error("dispatch blocker annotation", &error);
+                    }
                 }
             }
             warn!(
@@ -712,11 +773,10 @@ impl Orchestrator {
                     }
                     Err(error) => {
                         error!(issue_identifier = %identifier, error, "worker failed");
-                        state.claimed.remove(&issue_id);
                         if let Some(blocked) =
                             classify_blocked_worker_failure(&snapshot.settings, provider, &error)
                         {
-                            if let Err(annotation_error) = self
+                            match self
                                 .persist_blocked_worker_failure(
                                     snapshot,
                                     &issue_id,
@@ -732,12 +792,23 @@ impl Orchestrator {
                                 )
                                 .await
                             {
-                                log_runtime_error(
-                                    "blocked worker failure annotation",
-                                    &annotation_error,
-                                );
+                                Ok(issue) => {
+                                    if should_hold_blocked_claim(&snapshot.settings, &issue) {
+                                        hold_blocked_claim(state, &issue);
+                                    } else {
+                                        clear_blocked_claim(state, &issue_id);
+                                    }
+                                }
+                                Err(annotation_error) => {
+                                    clear_blocked_claim(state, &issue_id);
+                                    log_runtime_error(
+                                        "blocked worker failure annotation",
+                                        &annotation_error,
+                                    );
+                                }
                             }
                         } else {
+                            clear_blocked_claim(state, &issue_id);
                             schedule_retry(
                                 &snapshot.settings,
                                 state,
@@ -760,13 +831,15 @@ impl Orchestrator {
         snapshot: &WorkflowSnapshot,
         issue_id: &str,
         context: BlockedIssueContext<'_>,
-    ) -> Result<()> {
+    ) -> Result<Issue> {
         let mut refreshed = self
             .tracker
             .fetch_issue_states_by_ids(&[issue_id.to_string()])
             .await?;
         let Some(mut issue) = refreshed.pop() else {
-            return Ok(());
+            return Err(anyhow::anyhow!(
+                "blocked issue disappeared before annotation"
+            ));
         };
 
         self.persist_issue_blocker(snapshot, &mut issue, context)
@@ -780,7 +853,7 @@ impl Orchestrator {
         provider: &str,
         error: &str,
         blocked: &BlockedWorkerFailure,
-    ) -> Result<()> {
+    ) -> Result<Issue> {
         let mut issue = issue.clone();
         let identifier = issue.identifier.clone();
         let workspace_path = workspace::workspace_path(&snapshot.settings, &issue.identifier).ok();
@@ -806,7 +879,7 @@ impl Orchestrator {
         snapshot: &WorkflowSnapshot,
         issue: &mut Issue,
         context: BlockedIssueContext<'_>,
-    ) -> Result<()> {
+    ) -> Result<Issue> {
         if issue.workpad_comment_id.is_some() {
             *issue = self.tracker.refresh_workpad_comment(issue).await?;
         }
@@ -840,7 +913,7 @@ impl Orchestrator {
             state = %issue.state,
             "issue blocked; recorded blocker details on the issue"
         );
-        Ok(())
+        Ok(issue.clone())
     }
 }
 
@@ -1801,6 +1874,26 @@ fn issue_eligible(
     used < allowed
 }
 
+fn should_hold_blocked_claim(settings: &Settings, issue: &Issue) -> bool {
+    settings.active_state(&issue.state) && !settings.terminal_state(&issue.state)
+}
+
+fn hold_blocked_claim(state: &mut RuntimeState, issue: &Issue) {
+    state.claimed.insert(issue.id.clone());
+    state
+        .blocked_claims
+        .insert(issue.id.clone(), normalize_issue_state(&issue.state));
+}
+
+fn clear_blocked_claim(state: &mut RuntimeState, issue_id: &str) {
+    state.blocked_claims.remove(issue_id);
+    state.claimed.remove(issue_id);
+}
+
+fn should_release_blocked_claim(settings: &Settings, previous_state: &str, issue: &Issue) -> bool {
+    !settings.active_state(&issue.state) || normalize_issue_state(&issue.state) != previous_state
+}
+
 fn issue_sort_key(left: &Issue, right: &Issue) -> Ordering {
     left.priority
         .unwrap_or(i64::MAX)
@@ -1865,10 +1958,10 @@ mod tests {
 
     use super::{
         classify_blocked_worker_failure, classify_provider_selection_block, extract_rate_limits,
-        extract_token_usage, issue_eligible, issue_provider, issue_sort_key, merge_blocker_section,
-        render_blocked_failure_workpad, select_dispatchable, tool_log_fields, usage_delta,
-        IssueProviderSelection, RuntimeState, TokenUsage, BLOCKER_SECTION_END,
-        BLOCKER_SECTION_START,
+        extract_token_usage, hold_blocked_claim, issue_eligible, issue_provider, issue_sort_key,
+        merge_blocker_section, render_blocked_failure_workpad, select_dispatchable,
+        should_release_blocked_claim, tool_log_fields, usage_delta, IssueProviderSelection,
+        RuntimeState, TokenUsage, BLOCKER_SECTION_END, BLOCKER_SECTION_START,
     };
     use crate::workflow::WorkflowSnapshot;
 
@@ -2271,6 +2364,35 @@ providers:
                 .expect("auth failures should block");
 
         assert!(blocked.operator_action.contains("`Ready` or `Doing`"));
+    }
+
+    #[test]
+    fn blocked_claims_release_after_state_change() {
+        let snapshot = snapshot_with_custom_status_mapping();
+        let original = issue("1", "Doing", Some(1));
+        let changed = issue("1", "Ready", Some(1));
+
+        assert!(should_release_blocked_claim(
+            &snapshot.settings,
+            "doing",
+            &changed
+        ));
+        assert!(!should_release_blocked_claim(
+            &snapshot.settings,
+            "doing",
+            &original
+        ));
+    }
+
+    #[test]
+    fn blocked_claims_make_issue_ineligible_until_released() {
+        let snapshot = snapshot();
+        let mut state = RuntimeState::default();
+        let issue = issue("1", "Todo", Some(1));
+
+        hold_blocked_claim(&mut state, &issue);
+
+        assert!(!issue_eligible(&snapshot, &issue, &state, &HashMap::new()));
     }
 
     #[test]

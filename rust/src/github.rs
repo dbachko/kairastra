@@ -455,9 +455,9 @@ query KairastraProjectStatusField($owner: String!, $projectNumber: Int!) {
         let mut total_items = 0usize;
 
         for item in self.list_project_items().await? {
+            total_items += 1;
             if let Some(status) = item.status.as_ref().and_then(field_value_string) {
                 *item_counts.entry(status).or_insert(0) += 1;
-                total_items += 1;
             }
         }
 
@@ -2456,6 +2456,124 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.state, "Doing");
+    }
+
+    #[tokio::test]
+    async fn project_status_overview_counts_unset_items_in_total() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("KairastraProjectStatusField"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "organization": {
+                        "projectV2": {
+                            "id": "project-1",
+                            "fields": {
+                                "nodes": [{
+                                    "__typename": "ProjectV2SingleSelectField",
+                                    "id": "field-status",
+                                    "name": "Status",
+                                    "options": [
+                                        { "id": "opt-todo", "name": "Todo" },
+                                        { "id": "opt-done", "name": "Done" }
+                                    ]
+                                }]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("KairastraProjectItems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "organization": {
+                        "projectV2": {
+                            "items": {
+                                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                                "nodes": [
+                                    {
+                                        "id": "item-1",
+                                        "status": { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Todo" },
+                                        "priority": null,
+                                        "content": {
+                                            "__typename": "Issue",
+                                            "id": "issue-node-1",
+                                            "number": 1,
+                                            "title": "Queued issue",
+                                            "body": "body",
+                                            "url": "https://github.com/openai/kairastra/issues/1",
+                                            "state": "OPEN",
+                                            "createdAt": "2026-03-13T00:00:00Z",
+                                            "updatedAt": "2026-03-13T01:00:00Z",
+                                            "assignees": { "nodes": [] },
+                                            "labels": { "nodes": [] },
+                                            "repository": {
+                                                "name": "kairastra",
+                                                "owner": { "login": "openai" }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "id": "item-2",
+                                        "status": null,
+                                        "priority": null,
+                                        "content": {
+                                            "__typename": "Issue",
+                                            "id": "issue-node-2",
+                                            "number": 2,
+                                            "title": "Unset issue",
+                                            "body": "body",
+                                            "url": "https://github.com/openai/kairastra/issues/2",
+                                            "state": "OPEN",
+                                            "createdAt": "2026-03-13T00:00:00Z",
+                                            "updatedAt": "2026-03-13T01:00:00Z",
+                                            "assignees": { "nodes": [] },
+                                            "labels": { "nodes": [] },
+                                            "repository": {
+                                                "name": "kairastra",
+                                                "owner": { "login": "openai" }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  project_v2_number: 7
+  mode: projects_v2
+  status_source:
+    type: project_field
+    name: Status
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let overview = tracker.inspect_project_status_overview().await.unwrap();
+        assert_eq!(overview.total_items, 2);
+        assert_eq!(overview.item_counts.get("Todo"), Some(&1));
     }
 
     #[tokio::test]

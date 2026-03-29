@@ -154,7 +154,7 @@ struct RawTracker {
     project_url: Option<String>,
     active_states: Vec<String>,
     terminal_states: Vec<String>,
-    claimable_states: Vec<String>,
+    claimable_states: Option<Vec<String>>,
     in_progress_state: NullableString,
     human_review_state: NullableString,
     done_state: NullableString,
@@ -362,11 +362,10 @@ impl Settings {
                 } else {
                     raw.tracker.terminal_states
                 },
-                claimable_states: if raw.tracker.claimable_states.is_empty() {
-                    vec!["Todo".to_string()]
-                } else {
-                    raw.tracker.claimable_states
-                },
+                claimable_states: raw
+                    .tracker
+                    .claimable_states
+                    .unwrap_or_else(|| vec!["Todo".to_string()]),
                 in_progress_state: resolve_nullable_string_or_default(
                     raw.tracker.in_progress_state,
                     "In Progress",
@@ -899,5 +898,30 @@ providers:
         assert_eq!(settings.tracker.in_progress_state.as_deref(), Some("Doing"));
         assert_eq!(settings.tracker.human_review_state, None);
         assert_eq!(settings.tracker.done_state.as_deref(), Some("Complete"));
+    }
+
+    #[test]
+    fn tracker_status_mapping_preserves_explicit_empty_claimable_states() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+  claimable_states: []
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert!(settings.tracker.claimable_states.is_empty());
     }
 }

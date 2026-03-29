@@ -155,6 +155,11 @@ def parse_args() -> argparse.Namespace:
         help="Project field name to ensure for numeric prioritization.",
     )
     parser.add_argument(
+        "--status-field-name",
+        default=os.getenv("KAIRASTRA_STATUS_FIELD_NAME", "Status"),
+        help="Project field name to ensure for workflow status transitions.",
+    )
+    parser.add_argument(
         "--status-mode",
         choices=["preserve", "normalize"],
         default="preserve",
@@ -259,14 +264,15 @@ def ensure_status_field(
     *,
     owner: str,
     project_number: int,
+    field_name: str,
     fields: list[dict[str, Any]],
     dry_run: bool,
 ) -> Action:
     desired_names = [option["name"] for option in STATUS_OPTIONS]
-    status_field = next((field for field in fields if field.get("name") == "Status"), None)
+    status_field = next((field for field in fields if field.get("name") == field_name), None)
 
     if status_field is None:
-        summary = f"create project Status field with options: {', '.join(desired_names)}"
+        summary = f"create project {field_name} field with options: {', '.join(desired_names)}"
         if not dry_run:
             run(
                 [
@@ -277,7 +283,7 @@ def ensure_status_field(
                     "--owner",
                     owner,
                     "--name",
-                    "Status",
+                    field_name,
                     "--data-type",
                     "SINGLE_SELECT",
                     "--single-select-options",
@@ -288,12 +294,12 @@ def ensure_status_field(
 
     current_names = [option.get("name") for option in status_field.get("options", [])]
     if current_names == desired_names:
-        return Action("Status field already matches the Kairastra workflow states.", False)
+        return Action(
+            f"{field_name} field already matches the Kairastra workflow states.",
+            False,
+        )
 
-    summary = (
-        "update Status field options from "
-        f"{current_names!r} to {desired_names!r}"
-    )
+    summary = f"update {field_name} field options from {current_names!r} to {desired_names!r}"
     if not dry_run:
         gh_graphql(
             """
@@ -316,21 +322,23 @@ def ensure_status_field(
             """,
             {
                 "fieldId": status_field["id"],
-                "name": "Status",
+                "name": field_name,
                 "options": STATUS_OPTIONS,
             },
         )
     return Action(summary, True)
 
 
-def load_project_status_counts(project_number: int, owner: str) -> dict[str, int]:
+def load_project_status_counts(
+    project_number: int, owner: str, status_field_name: str
+) -> dict[str, int]:
     counts: dict[str, int] = {}
     after: str | None = None
 
     while True:
         payload = gh_graphql(
             """
-            query ProjectStatusItems($owner: String!, $projectNumber: Int!, $after: String) {
+            query ProjectStatusItems($owner: String!, $projectNumber: Int!, $after: String, $statusFieldName: String!) {
               organization(login: $owner) {
                 projectV2(number: $projectNumber) {
                   items(first: 100, after: $after) {
@@ -339,7 +347,7 @@ def load_project_status_counts(project_number: int, owner: str) -> dict[str, int
                       endCursor
                     }
                     nodes {
-                      status: fieldValueByName(name: "Status") {
+                      status: fieldValueByName(name: $statusFieldName) {
                         __typename
                         ... on ProjectV2ItemFieldSingleSelectValue { name }
                         ... on ProjectV2ItemFieldTextValue { text }
@@ -357,7 +365,7 @@ def load_project_status_counts(project_number: int, owner: str) -> dict[str, int
                       endCursor
                     }
                     nodes {
-                      status: fieldValueByName(name: "Status") {
+                      status: fieldValueByName(name: $statusFieldName) {
                         __typename
                         ... on ProjectV2ItemFieldSingleSelectValue { name }
                         ... on ProjectV2ItemFieldTextValue { text }
@@ -373,6 +381,7 @@ def load_project_status_counts(project_number: int, owner: str) -> dict[str, int
                 "owner": owner,
                 "projectNumber": project_number,
                 "after": after,
+                "statusFieldName": status_field_name,
             },
         )
         project = (
@@ -547,7 +556,11 @@ def main() -> int:
 
     project = load_project(args.project_number, args.project_owner)
     fields = load_fields(args.project_number, args.project_owner)
-    status_counts = load_project_status_counts(args.project_number, args.project_owner)
+    status_counts = load_project_status_counts(
+        args.project_number,
+        args.project_owner,
+        args.status_field_name,
+    )
     block_reason = normalization_block_reason(status_counts)
 
     if args.status_mode == "normalize" and block_reason and not args.dry_run:
@@ -568,12 +581,18 @@ def main() -> int:
             ensure_status_field(
                 owner=args.project_owner,
                 project_number=args.project_number,
+                field_name=args.status_field_name,
                 fields=fields,
                 dry_run=args.dry_run,
             )
         )
     else:
-        actions.append(Action("Status field left unchanged (preserve mode).", False))
+        actions.append(
+            Action(
+                f"{args.status_field_name} field left unchanged (preserve mode).",
+                False,
+            )
+        )
 
     if not args.skip_priority_field:
         actions.append(

@@ -732,7 +732,6 @@ fn canonical_project_status_config() -> ProjectStatusConfig {
         terminal_states: vec![
             "Closed".to_string(),
             "Cancelled".to_string(),
-            "Canceled".to_string(),
             "Duplicate".to_string(),
             "Done".to_string(),
         ],
@@ -1908,5 +1907,19 @@ mod tests {
         assert!(rendered.contains(r#"  in_progress_state: "Doing: Active""#));
         assert!(rendered.contains(r#"  human_review_state: "Needs Review""#));
         assert!(rendered.contains("  done_state: null"));
+    }
+
+    #[test]
+    fn canonical_project_statuses_have_matching_terminal_options() {
+        let options = super::canonical_project_status_options();
+        for state in super::canonical_project_status_config().terminal_states {
+            if state.eq_ignore_ascii_case("closed") {
+                continue;
+            }
+            assert!(
+                options.iter().any(|option| option == &state),
+                "missing canonical status option for {state}"
+            );
+        }
     }
 }
