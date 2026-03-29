@@ -230,6 +230,7 @@ Notes:
 
 - For `raw.githubusercontent.com`, use `main`, a tag, or a commit SHA as the ref segment.
 - Do not use `refs/heads/main` in raw URLs.
+- The remote bootstrap seeds `GITHUB_TOKEN` from host `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token` when available. If none are present, the containerized setup flow now prompts and persists the token into the generated Docker env file.
 - To get the newest setup flow, use the `main` install command above or re-run the managed script with
   `--ref main --reconfigure`. The pinned release example intentionally keeps you on that older release.
 - If setup still shows the old prompt text `GitHub Project URL (optional, can auto-fill owner and number)`,
@@ -359,6 +360,7 @@ Optional flags:
 What setup asks for:
 
 - GitHub repo, either as a repo name or a full GitHub repo URL
+- GitHub token when `GITHUB_TOKEN` or `GH_TOKEN` is not already set
 - queue source: `issues_only` or `projects_v2`
 - when using `projects_v2`: GitHub Project URL, optional project owner override, and Project v2 number
 - when using `projects_v2` with a working GitHub token: inspect the Project `Status` field and choose between

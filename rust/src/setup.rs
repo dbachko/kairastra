@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
 
 use crate::config::{FieldSource, FieldSourceType, GitHubMode, TrackerSettings};
 use crate::deploy::DeployMode;
@@ -265,8 +265,6 @@ async fn collect_values(
     let env_project_number = std::env::var("KAIRASTRA_GITHUB_PROJECT_NUMBER").unwrap_or_default();
     let env_project_url = std::env::var("KAIRASTRA_GITHUB_PROJECT_URL").unwrap_or_default();
     let env_git_clone_url = std::env::var("KAIRASTRA_GIT_CLONE_URL").unwrap_or_default();
-    let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
-
     let repo_input = ask_string(
         &theme,
         "GitHub repo to manage (name or GitHub URL)",
@@ -280,6 +278,7 @@ async fn collect_values(
         non_interactive,
         !env_project_number.trim().is_empty() || !env_project_url.trim().is_empty(),
     )?;
+    let github_token = resolve_github_token(&theme, non_interactive, tracker_mode)?;
     let github_project_url = if tracker_mode == GitHubMode::ProjectsV2 {
         ask_string(
             &theme,
@@ -741,6 +740,51 @@ fn parse_optional_env(name: &str) -> Option<Option<String>> {
         return Some(None);
     }
     Some(Some(trimmed.to_string()))
+}
+
+fn resolve_env_secret(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn resolve_github_token(
+    theme: &ColorfulTheme,
+    non_interactive: bool,
+    tracker_mode: GitHubMode,
+) -> Result<String> {
+    if let Some(token) = resolve_env_secret(&["GITHUB_TOKEN", "GH_TOKEN"]) {
+        return Ok(token);
+    }
+
+    let tracker_guidance = match tracker_mode {
+        GitHubMode::ProjectsV2 => {
+            "A GitHub token is required. For user-owned Projects v2, use a classic PAT with `project` and repo access."
+        }
+        GitHubMode::IssuesOnly => {
+            "A GitHub token is required so Kairastra can read issues and clone/push against the target repo."
+        }
+    };
+
+    if non_interactive {
+        return Err(anyhow!(
+            "{tracker_guidance} Set GITHUB_TOKEN or GH_TOKEN before running setup."
+        ));
+    }
+
+    let token = Password::with_theme(theme)
+        .with_prompt("GitHub token")
+        .allow_empty_password(true)
+        .interact()?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(anyhow!("{tracker_guidance}"));
+    }
+
+    Ok(token)
 }
 
 fn canonical_project_status_options() -> Vec<String> {
@@ -1720,7 +1764,10 @@ mod tests {
     use crate::providers::ProviderSetupConfig;
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn sample_values() -> SetupValues {
         SetupValues {
@@ -1982,6 +2029,41 @@ mod tests {
         assert!(rendered.contains(r#"  in_progress_state: "Doing: Active""#));
         assert!(rendered.contains(r#"  human_review_state: "Needs Review""#));
         assert!(rendered.contains("  done_state: null"));
+    }
+
+    #[test]
+    fn resolve_github_token_accepts_gh_token_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("GITHUB_TOKEN");
+        std::env::set_var("GH_TOKEN", "gh-token-123");
+
+        let token = super::resolve_github_token(
+            &dialoguer::theme::ColorfulTheme::default(),
+            true,
+            GitHubMode::IssuesOnly,
+        )
+        .unwrap();
+
+        assert_eq!(token, "gh-token-123");
+
+        std::env::remove_var("GH_TOKEN");
+    }
+
+    #[test]
+    fn resolve_github_token_requires_non_interactive_secret() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("GITHUB_TOKEN");
+        std::env::remove_var("GH_TOKEN");
+
+        let error = super::resolve_github_token(
+            &dialoguer::theme::ColorfulTheme::default(),
+            true,
+            GitHubMode::ProjectsV2,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Set GITHUB_TOKEN or GH_TOKEN before running setup"));
     }
 
     #[test]
