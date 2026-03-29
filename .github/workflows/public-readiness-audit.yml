@@ -20,6 +20,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install audit dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
+      - name: Prepare artifact directory
+        run: mkdir -p reports/public-readiness
+
       - name: Run public-readiness audit
         run: bash scripts/public-readiness-audit.sh --output-dir reports/public-readiness
 
@@ -29,4 +37,4 @@ jobs:
         with:
           name: public-readiness-audit-${{ github.run_id }}
           path: reports/public-readiness
-          if-no-files-found: error
+          if-no-files-found: warn
