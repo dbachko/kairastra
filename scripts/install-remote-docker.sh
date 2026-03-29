@@ -112,6 +112,59 @@ resolve_absolute_path() {
   )
 }
 
+repair_managed_env_paths() {
+  local path="$1"
+  local workflow_file="$2"
+  local seed_repo="$3"
+
+  [[ -f "$path" ]] || return 0
+
+  local tmp
+  local saw_workflow=false
+  local saw_seed=false
+  local changed=false
+  tmp="$(mktemp)"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      WORKFLOW_FILE=*)
+        saw_workflow=true
+        local workflow_value="${line#WORKFLOW_FILE=}"
+        if [[ -z "$workflow_value" || "$workflow_value" == /config-state/* || "$workflow_value" == /config/* ]]; then
+          line="WORKFLOW_FILE=${workflow_file}"
+          changed=true
+        fi
+        ;;
+      SEED_REPO_PATH=*)
+        saw_seed=true
+        local seed_value="${line#SEED_REPO_PATH=}"
+        if [[ -z "$seed_value" || "$seed_value" == /seed-repo* ]]; then
+          line="SEED_REPO_PATH=${seed_repo}"
+          changed=true
+        fi
+        ;;
+    esac
+    printf '%s\n' "$line" >> "$tmp"
+  done < "$path"
+
+  if [[ "$saw_workflow" == false ]]; then
+    printf 'WORKFLOW_FILE=%s\n' "$workflow_file" >> "$tmp"
+    changed=true
+  fi
+
+  if [[ "$saw_seed" == false ]]; then
+    printf 'SEED_REPO_PATH=%s\n' "$seed_repo" >> "$tmp"
+    changed=true
+  fi
+
+  if [[ "$changed" == true ]]; then
+    mv "$tmp" "$path"
+    chmod 600 "$path"
+  else
+    rm -f "$tmp"
+  fi
+}
+
 write_bootstrap_env() {
   local path="$1"
   local workflow_file="$2"
@@ -241,6 +294,8 @@ fi
 if [[ ! -f "$env_path" ]]; then
   write_bootstrap_env "$env_path" "$workflow_path" "$repo_dir" "$github_token"
 fi
+
+repair_managed_env_paths "$env_path" "$workflow_path" "$repo_dir"
 
 compose_args=(
   -p "$compose_project"
