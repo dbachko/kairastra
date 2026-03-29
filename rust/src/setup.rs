@@ -1639,7 +1639,7 @@ fn render_project_env_lines(values: &SetupValues) -> String {
 }
 
 fn render_env_file(mode: DeployMode, values: &SetupValues, workflow_path: &Path) -> String {
-    let workflow_abs = absolute_display_path(workflow_path);
+    let workflow_abs = render_workflow_env_path(mode, workflow_path);
     let project_env_lines = render_project_env_lines(values);
     let provider_env = values
         .provider_configs
@@ -1714,6 +1714,20 @@ KAIRASTRA_AGENT_ASSIGNEE={assignee_login}
             provider_env = provider_env,
         ),
     }
+}
+
+fn render_workflow_env_path(mode: DeployMode, workflow_path: &Path) -> String {
+    if mode == DeployMode::Docker
+        && workflow_path
+            .to_string_lossy()
+            .starts_with("/config-state/")
+    {
+        if let Some(existing) = resolve_env_secret(&["WORKFLOW_FILE"]) {
+            return existing;
+        }
+    }
+
+    absolute_display_path(workflow_path)
 }
 
 fn render_systemd_unit(values: &SetupValues, workflow_path: &Path, env_file: &Path) -> String {
@@ -1894,6 +1908,26 @@ mod tests {
         assert!(rendered.contains("GEMINI_AUTH_MODE=subscription"));
         assert!(rendered.contains("KAIRASTRA_GEMINI_MODEL=gemini-2.5-pro"));
         assert!(rendered.contains("KAIRASTRA_GEMINI_APPROVAL_MODE=yolo"));
+    }
+
+    #[test]
+    fn docker_env_preserves_host_workflow_file_when_setup_runs_in_config_state() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(
+            "WORKFLOW_FILE",
+            "/Users/dbachko/kairastra/config/WORKFLOW.md",
+        );
+
+        let rendered = render_env_file(
+            DeployMode::Docker,
+            &sample_values(),
+            Path::new("/config-state/WORKFLOW.md"),
+        );
+
+        assert!(rendered.contains("WORKFLOW_FILE=/Users/dbachko/kairastra/config/WORKFLOW.md"));
+        assert!(!rendered.contains("WORKFLOW_FILE=/config-state/WORKFLOW.md"));
+
+        std::env::remove_var("WORKFLOW_FILE");
     }
 
     #[test]
