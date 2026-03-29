@@ -208,7 +208,7 @@ make docker-login
 If Docker is already installed on the remote machine, use the bootstrap script instead of manually
 copying the repo around. This is the supported path for a remote Mac mini or other Docker host.
 
-Latest `main` example (run on the host):
+Latest supported build from `main` (run on the host):
 
 ```bash
 curl -fsSL -o /tmp/install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/main/scripts/install-remote-docker.sh && bash /tmp/install-remote-docker.sh --ref main
@@ -220,10 +220,21 @@ Pinned release example (run on the host):
 curl -fsSL -o /tmp/install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/v0.1.0-alpha.1/scripts/install-remote-docker.sh && bash /tmp/install-remote-docker.sh --ref v0.1.0-alpha.1
 ```
 
+Upgrade an existing remote install to the latest `main` and re-run setup:
+
+```bash
+~/kairastra/repo/scripts/install-remote-docker.sh --ref main --reconfigure
+```
+
 Notes:
 
 - For `raw.githubusercontent.com`, use `main`, a tag, or a commit SHA as the ref segment.
 - Do not use `refs/heads/main` in raw URLs.
+- To get the newest setup flow, use the `main` install command above or re-run the managed script with
+  `--ref main --reconfigure`. The pinned release example intentionally keeps you on that older release.
+- If setup still shows the old prompt text `GitHub Project URL (optional, can auto-fill owner and number)`,
+  you are running an older ref or image. Re-run the latest `main` command above, or on an existing host run
+  `~/kairastra/repo/scripts/install-remote-docker.sh --ref main --reconfigure`.
 - If the repo is still private, raw URLs return `404`; bootstrap by cloning over Git SSH instead:
 
 ```bash
@@ -266,6 +277,32 @@ After the first install, the same script is available on the remote host at:
 
 Re-running that script updates the managed checkout to the requested ref, rebuilds the image, runs
 Docker doctor checks, and refreshes the stack without replacing persisted Docker volumes.
+
+Project status handling:
+
+- For `projects_v2`, Kairastra now reads and writes Project statuses from workflow config.
+- Read-side queue behavior uses `status_source`, `active_states`, `terminal_states`, and
+  `claimable_states`.
+- Write-side transitions use `in_progress_state`, `human_review_state`, and `done_state`.
+- Set any of those write-side target states to `null` to disable that automatic Project mutation.
+- `doctor` validates that the configured states and transition targets exist in the Project's
+  configured status field.
+- Interactive `setup` inspects the Project status field and defaults to
+  `Keep existing Project statuses (recommended)`, which generates a matching workflow without
+  mutating GitHub.
+- `Normalize Project to Kairastra statuses` remains available, but it is interactive-only,
+  requires typed confirmation, and is blocked for live Projects that already contain items in
+  statuses that would be changed or removed.
+- Non-interactive setup never normalizes Project statuses. Use these env overrides when you want
+  custom mappings in generated workflows:
+  - `KAIRASTRA_ACTIVE_STATES`
+  - `KAIRASTRA_TERMINAL_STATES`
+  - `KAIRASTRA_CLAIMABLE_STATES`
+  - `KAIRASTRA_IN_PROGRESS_STATE`
+  - `KAIRASTRA_HUMAN_REVIEW_STATE`
+  - `KAIRASTRA_DONE_STATE`
+- The explicit normalization helper is still `scripts/bootstrap_github_project.py`, which now has
+  separate preserve vs normalize modes and applies the same safety checks as setup.
 
 `make docker-up` now runs a Docker-scoped `doctor` preflight before starting the long-lived
 service, so missing workflow env vars or invalid tracker settings fail once at startup instead of
@@ -324,6 +361,10 @@ What setup asks for:
 - GitHub repo, either as a repo name or a full GitHub repo URL
 - queue source: `issues_only` or `projects_v2`
 - when using `projects_v2`: GitHub Project URL, optional project owner override, and Project v2 number
+- when using `projects_v2` with a working GitHub token: inspect the Project `Status` field and choose between
+  `Keep existing Project statuses (recommended)` or `Normalize Project to Kairastra statuses`
+- when keeping existing statuses: active states, terminal states, claimable states, and optional transition targets
+- when normalizing statuses: typed destructive confirmation before Kairastra rewrites the Project field
 - workspace root
 - seed repo path
 - optional canonical clone URL
@@ -375,6 +416,7 @@ Doctor currently checks:
 - selected provider auth state
 - workflow load/validation
 - GitHub tracker connectivity using the configured token
+- for `projects_v2`, configured Project status field mappings and transition targets
 - workspace root existence or whether its parent exists
 
 Expected behavior:

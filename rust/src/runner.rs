@@ -176,7 +176,15 @@ pub async fn run_issue(
                         issue = tracker.refresh_workpad_comment(&issue).await?;
                     }
 
-                    if issue.state.trim().eq_ignore_ascii_case("in progress") {
+                    if snapshot
+                        .settings
+                        .tracker
+                        .in_progress_state
+                        .as_deref()
+                        .map(|state| issue.state.trim().eq_ignore_ascii_case(state))
+                        .unwrap_or(false)
+                        && snapshot.settings.tracker.human_review_state.is_some()
+                    {
                         if let Some((owner, repo)) = issue_repo(&issue) {
                             if let Some(branch) = current_branch(&workspace.path).await? {
                                 if let Some(pr) = tracker
@@ -190,7 +198,7 @@ pub async fn run_issue(
                                         && workpad_has_progress(&issue)
                                     {
                                         issue = tracker
-                                            .transition_issue_project_status(&issue, "Human Review")
+                                            .transition_issue_to_human_review(&issue)
                                             .await?;
                                     }
                                 }

@@ -37,6 +37,10 @@ pub struct TrackerSettings {
     pub project_url: Option<String>,
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
+    pub claimable_states: Vec<String>,
+    pub in_progress_state: Option<String>,
+    pub human_review_state: Option<String>,
+    pub done_state: Option<String>,
     pub status_source: Option<FieldSource>,
     pub priority_source: Option<FieldSource>,
     pub graphql_endpoint: String,
@@ -150,6 +154,10 @@ struct RawTracker {
     project_url: Option<String>,
     active_states: Vec<String>,
     terminal_states: Vec<String>,
+    claimable_states: Option<Vec<String>>,
+    in_progress_state: NullableString,
+    human_review_state: NullableString,
+    done_state: NullableString,
     status_source: Option<FieldSource>,
     priority_source: Option<FieldSource>,
     endpoint: Option<String>,
@@ -201,6 +209,27 @@ pub(crate) enum IntOrString {
 pub(crate) enum BoolOrString {
     Bool(bool),
     String(String),
+}
+
+#[derive(Debug, Clone, Default)]
+enum NullableString {
+    #[default]
+    Missing,
+    String(String),
+    Null,
+}
+
+impl<'de> Deserialize<'de> for NullableString {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Option::<String>::deserialize(deserializer)?;
+        Ok(match value {
+            Some(value) => Self::String(value),
+            None => Self::Null,
+        })
+    }
 }
 
 impl Settings {
@@ -333,6 +362,19 @@ impl Settings {
                 } else {
                     raw.tracker.terminal_states
                 },
+                claimable_states: raw
+                    .tracker
+                    .claimable_states
+                    .unwrap_or_else(|| vec!["Todo".to_string()]),
+                in_progress_state: resolve_nullable_string_or_default(
+                    raw.tracker.in_progress_state,
+                    "In Progress",
+                ),
+                human_review_state: resolve_nullable_string_or_default(
+                    raw.tracker.human_review_state,
+                    "Human Review",
+                ),
+                done_state: resolve_nullable_string_or_default(raw.tracker.done_state, "Done"),
                 status_source: raw.tracker.status_source,
                 priority_source: raw.tracker.priority_source,
                 graphql_endpoint: raw
@@ -408,6 +450,14 @@ impl Settings {
         let normalized = normalize_issue_state(state);
         self.tracker
             .terminal_states
+            .iter()
+            .any(|candidate| normalize_issue_state(candidate) == normalized)
+    }
+
+    pub fn claimable_state(&self, state: &str) -> bool {
+        let normalized = normalize_issue_state(state);
+        self.tracker
+            .claimable_states
             .iter()
             .any(|candidate| normalize_issue_state(candidate) == normalized)
     }
@@ -566,6 +616,16 @@ pub(crate) fn resolve_optional_bool(
             }
         }
         None => Ok(None),
+    }
+}
+
+fn resolve_nullable_string_or_default(raw: NullableString, default: &str) -> Option<String> {
+    match raw {
+        NullableString::String(value) => {
+            resolve_optional_string(Some(value)).or_else(|| Some(default.to_string()))
+        }
+        NullableString::Null => None,
+        NullableString::Missing => Some(default.to_string()),
     }
 }
 
@@ -774,5 +834,94 @@ providers:
             settings.tracker_dashboard_url().as_deref(),
             Some("https://github.com/users/dbachko/projects/19")
         );
+    }
+
+    #[test]
+    fn tracker_status_defaults_preserve_existing_behavior() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(settings.tracker.claimable_states, vec!["Todo".to_string()]);
+        assert_eq!(
+            settings.tracker.in_progress_state.as_deref(),
+            Some("In Progress")
+        );
+        assert_eq!(
+            settings.tracker.human_review_state.as_deref(),
+            Some("Human Review")
+        );
+        assert_eq!(settings.tracker.done_state.as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn tracker_status_mapping_accepts_custom_targets_and_nulls() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+  claimable_states: ["Ready"]
+  in_progress_state: Doing
+  human_review_state: ~
+  done_state: Complete
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(settings.tracker.claimable_states, vec!["Ready".to_string()]);
+        assert_eq!(settings.tracker.in_progress_state.as_deref(), Some("Doing"));
+        assert_eq!(settings.tracker.human_review_state, None);
+        assert_eq!(settings.tracker.done_state.as_deref(), Some("Complete"));
+    }
+
+    #[test]
+    fn tracker_status_mapping_preserves_explicit_empty_claimable_states() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+  claimable_states: []
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert!(settings.tracker.claimable_states.is_empty());
     }
 }

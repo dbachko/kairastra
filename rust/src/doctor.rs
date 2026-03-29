@@ -5,7 +5,7 @@ use clap::ValueEnum;
 use serde::Serialize;
 
 use crate::auth::find_command;
-use crate::config::Settings;
+use crate::config::{normalize_issue_state, FieldSourceType, Settings};
 use crate::deploy::DeployMode;
 use crate::envfile::{apply_env, load_env_file};
 use crate::github::GitHubTracker;
@@ -77,6 +77,11 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
         status: DoctorStatus::Warn,
         detail: "workflow not loaded".to_string(),
     };
+    let mut project_status_check = DoctorCheck {
+        name: "project_status_mapping",
+        status: DoctorStatus::Warn,
+        detail: "workflow not loaded".to_string(),
+    };
 
     let mut workspace_check = DoctorCheck {
         name: "workspace_root",
@@ -110,6 +115,7 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
                     );
                     provider_auth_check = check_auth_status(&settings);
                     tracker_check = check_github_tracker(&settings).await;
+                    project_status_check = check_project_status_mapping(&settings).await;
                     workspace_check = check_workspace_root(&settings.workspace.root);
                 }
                 Err(error) => {
@@ -138,6 +144,7 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
     checks.push(provider_command_check);
     checks.push(provider_auth_check);
     checks.push(tracker_check);
+    checks.push(project_status_check);
     checks.push(workspace_check);
 
     let report = DoctorReport {
@@ -281,6 +288,140 @@ async fn check_github_tracker(settings: &Settings) -> DoctorCheck {
             status: DoctorStatus::Fail,
             detail: error.to_string(),
         },
+    }
+}
+
+async fn check_project_status_mapping(settings: &Settings) -> DoctorCheck {
+    if settings.tracker.mode != crate::config::GitHubMode::ProjectsV2 {
+        return DoctorCheck {
+            name: "project_status_mapping",
+            status: DoctorStatus::Pass,
+            detail: "not applicable for issues_only".to_string(),
+        };
+    }
+
+    if !matches!(
+        settings
+            .tracker
+            .status_source
+            .as_ref()
+            .map(|source| source.source_type),
+        Some(FieldSourceType::ProjectField)
+    ) {
+        return DoctorCheck {
+            name: "project_status_mapping",
+            status: DoctorStatus::Pass,
+            detail: "not applicable for non-project status sources".to_string(),
+        };
+    }
+
+    let tracker = match GitHubTracker::new(settings.tracker.clone()) {
+        Ok(tracker) => tracker,
+        Err(error) => {
+            return DoctorCheck {
+                name: "project_status_mapping",
+                status: DoctorStatus::Fail,
+                detail: error.to_string(),
+            }
+        }
+    };
+
+    let overview = match tracker.inspect_project_status_overview().await {
+        Ok(overview) => overview,
+        Err(error) => {
+            return DoctorCheck {
+                name: "project_status_mapping",
+                status: DoctorStatus::Fail,
+                detail: error.to_string(),
+            }
+        }
+    };
+
+    let allowed_issue_states = ["closed"];
+    let option_names = overview
+        .options
+        .iter()
+        .map(|value| normalize_issue_state(value))
+        .collect::<Vec<_>>();
+    let mut missing = Vec::new();
+
+    for state in &settings.tracker.active_states {
+        let normalized = normalize_issue_state(state);
+        if !option_names
+            .iter()
+            .any(|candidate| candidate == &normalized)
+        {
+            missing.push(format!("active_states:{state}"));
+        }
+    }
+
+    for state in &settings.tracker.terminal_states {
+        let normalized = normalize_issue_state(state);
+        if allowed_issue_states.contains(&normalized.as_str()) {
+            continue;
+        }
+        if !option_names
+            .iter()
+            .any(|candidate| candidate == &normalized)
+        {
+            missing.push(format!("terminal_states:{state}"));
+        }
+    }
+
+    for state in &settings.tracker.claimable_states {
+        let normalized = normalize_issue_state(state);
+        if !option_names
+            .iter()
+            .any(|candidate| candidate == &normalized)
+        {
+            missing.push(format!("claimable_states:{state}"));
+        }
+    }
+
+    for (label, value) in [
+        (
+            "in_progress_state",
+            settings.tracker.in_progress_state.as_ref(),
+        ),
+        (
+            "human_review_state",
+            settings.tracker.human_review_state.as_ref(),
+        ),
+        ("done_state", settings.tracker.done_state.as_ref()),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        let normalized = normalize_issue_state(value);
+        if !option_names
+            .iter()
+            .any(|candidate| candidate == &normalized)
+        {
+            missing.push(format!("{label}:{value}"));
+        }
+    }
+
+    if !missing.is_empty() {
+        return DoctorCheck {
+            name: "project_status_mapping",
+            status: DoctorStatus::Fail,
+            detail: format!(
+                "configured states missing from project field {}: {}",
+                overview.field_name,
+                missing.join(", ")
+            ),
+        };
+    }
+
+    DoctorCheck {
+        name: "project_status_mapping",
+        status: DoctorStatus::Pass,
+        detail: format!(
+            "field={} options={} items={}",
+            overview.field_name,
+            overview.options.join(", "),
+            overview.total_items
+        ),
     }
 }
 
