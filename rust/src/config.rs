@@ -32,6 +32,7 @@ pub struct TrackerSettings {
     pub api_key: String,
     pub owner: String,
     pub repo: Option<String>,
+    pub project_owner: Option<String>,
     pub project_v2_number: Option<u32>,
     pub project_url: Option<String>,
     pub active_states: Vec<String>,
@@ -144,6 +145,7 @@ struct RawTracker {
     api_key: Option<String>,
     owner: Option<String>,
     repo: Option<String>,
+    project_owner: Option<String>,
     project_v2_number: Option<IntOrString>,
     project_url: Option<String>,
     active_states: Vec<String>,
@@ -221,6 +223,7 @@ impl Settings {
             .ok_or_else(|| anyhow!("missing_github_api_token"))?;
         let owner = resolve_required_string(raw.tracker.owner, "tracker.owner")?;
         let repo = resolve_optional_string(raw.tracker.repo);
+        let project_owner = resolve_optional_string(raw.tracker.project_owner);
         let project_v2_number = match raw.tracker.mode {
             GitHubMode::ProjectsV2 => Some(
                 resolve_u32(raw.tracker.project_v2_number, "tracker.project_v2_number")?
@@ -311,6 +314,7 @@ impl Settings {
                 api_key,
                 owner,
                 repo,
+                project_owner,
                 project_v2_number,
                 project_url,
                 active_states: if raw.tracker.active_states.is_empty() {

@@ -9,7 +9,7 @@ use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::config::{FieldSourceType, GitHubMode, TrackerSettings};
 use crate::model::{BlockerRef, Issue};
@@ -52,6 +52,39 @@ impl GitHubTracker {
 
     pub fn settings(&self) -> &TrackerSettings {
         &self.settings
+    }
+
+    fn project_owner(&self) -> &str {
+        self.settings
+            .project_owner
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| project_owner_from_url(self.settings.project_url.as_deref()))
+            .unwrap_or(&self.settings.owner)
+    }
+
+    fn issue_matches_repo_scope(&self, owner: &str, repo: &str) -> bool {
+        match self.settings.repo.as_deref() {
+            Some(configured_repo) if self.settings.mode == GitHubMode::ProjectsV2 => {
+                if self.settings.project_owner.is_none()
+                    && project_owner_from_url(self.settings.project_url.as_deref())
+                        .map(|project_owner| {
+                            project_owner.eq_ignore_ascii_case(&self.settings.owner)
+                        })
+                        .unwrap_or(true)
+                {
+                    configured_repo.eq_ignore_ascii_case(repo)
+                } else {
+                    self.settings.owner.eq_ignore_ascii_case(owner)
+                        && configured_repo.eq_ignore_ascii_case(repo)
+                }
+            }
+            Some(configured_repo) => {
+                self.settings.owner.eq_ignore_ascii_case(owner)
+                    && configured_repo.eq_ignore_ascii_case(repo)
+            }
+            None => true,
+        }
     }
 
     pub async fn graphql_raw(&self, query: &str, variables: JsonValue) -> Result<JsonValue> {
@@ -286,7 +319,7 @@ query KairastraProjectItems(
                 .graphql(
                     query,
                     json!({
-                        "owner": self.settings.owner,
+                        "owner": self.project_owner(),
                         "projectNumber": project_number,
                         "after": after,
                         "statusField": status_field,
@@ -368,7 +401,7 @@ query KairastraProjectStatusField($owner: String!, $projectNumber: Int!) {
             .graphql(
                 query,
                 json!({
-                    "owner": self.settings.owner,
+                    "owner": self.project_owner(),
                     "projectNumber": project_number,
                 }),
             )
@@ -794,6 +827,15 @@ mutation KairastraUpdateProjectItemStatus(
 
         let owner = content.repository.owner.login.clone();
         let repo = content.repository.name.clone();
+        if !self.issue_matches_repo_scope(&owner, &repo) {
+            warn!(
+                issue_identifier = %format!("{owner}/{repo}#{}", content.number),
+                configured_owner = %self.settings.owner,
+                configured_repo = ?self.settings.repo,
+                "skipping project item outside configured repository scope"
+            );
+            return Ok(None);
+        }
         let issue_state = title_case_state(content.state.as_deref().unwrap_or("OPEN"));
         let project_status = status.as_ref().and_then(field_value_string);
         let state = if issue_state.eq_ignore_ascii_case("closed") {
@@ -1105,6 +1147,34 @@ fn field_value_priority(value: &ProjectFieldValue) -> Option<i64> {
                 .as_ref()
                 .and_then(|text| text.trim().parse::<i64>().ok())
         })
+}
+
+fn project_owner_from_url(url: Option<&str>) -> Option<&str> {
+    let raw = url?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let without_scheme = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))
+        .unwrap_or(raw);
+    let without_host = without_scheme
+        .strip_prefix("github.com/")
+        .or_else(|| without_scheme.strip_prefix("www.github.com/"))?;
+    let path = without_host
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(without_host);
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    match segments.as_slice() {
+        ["users", owner, "projects", ..] => Some(*owner),
+        ["orgs", owner, "projects", ..] => Some(*owner),
+        _ => None,
+    }
 }
 
 fn json_stringish(value: &JsonValue) -> Option<String> {
@@ -1724,6 +1794,189 @@ mod tests {
 
         let issues = tracker.fetch_candidate_issues().await.unwrap();
         assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn projects_v2_uses_explicit_project_owner_with_repo_scoped_issue_filtering() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains(r#""owner":"dbachko""#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "organization": null,
+                    "user": {
+                        "projectV2": {
+                            "items": {
+                                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                                "nodes": [{
+                                    "id": "item-1",
+                                    "status": { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Todo" },
+                                    "priority": null,
+                                    "content": {
+                                        "__typename": "Issue",
+                                        "id": "issue-node-1",
+                                        "number": 42,
+                                        "title": "Port tracker",
+                                        "body": "body",
+                                        "url": "https://github.com/openai/kairastra/issues/42",
+                                        "state": "OPEN",
+                                        "createdAt": "2026-03-13T00:00:00Z",
+                                        "updatedAt": "2026-03-13T01:00:00Z",
+                                        "assignees": { "nodes": [] },
+                                        "labels": { "nodes": [] },
+                                        "repository": {
+                                            "name": "kairastra",
+                                            "owner": { "login": "openai" }
+                                        }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/openai/kairastra/issues/42/dependencies/blocked_by",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  repo: kairastra
+  project_owner: dbachko
+  project_url: https://github.com/users/dbachko/projects/7
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  project_v2_number: 7
+  mode: projects_v2
+  status_source:
+    type: project_field
+    name: Status
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issues = tracker.fetch_candidate_issues().await.unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].identifier, "openai/kairastra#42");
+    }
+
+    #[tokio::test]
+    async fn projects_v2_skips_items_outside_configured_repo_scope() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "organization": null,
+                    "user": {
+                        "projectV2": {
+                            "items": {
+                                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                                "nodes": [
+                                    {
+                                        "id": "item-1",
+                                        "status": { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Todo" },
+                                        "priority": null,
+                                        "content": {
+                                            "__typename": "Issue",
+                                            "id": "issue-node-1",
+                                            "number": 42,
+                                            "title": "Keep me",
+                                            "body": "body",
+                                            "url": "https://github.com/openai/kairastra/issues/42",
+                                            "state": "OPEN",
+                                            "createdAt": "2026-03-13T00:00:00Z",
+                                            "updatedAt": "2026-03-13T01:00:00Z",
+                                            "assignees": { "nodes": [] },
+                                            "labels": { "nodes": [] },
+                                            "repository": {
+                                                "name": "kairastra",
+                                                "owner": { "login": "openai" }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "id": "item-2",
+                                        "status": { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Todo" },
+                                        "priority": null,
+                                        "content": {
+                                            "__typename": "Issue",
+                                            "id": "issue-node-2",
+                                            "number": 99,
+                                            "title": "Skip me",
+                                            "body": "body",
+                                            "url": "https://github.com/openai/other-repo/issues/99",
+                                            "state": "OPEN",
+                                            "createdAt": "2026-03-13T00:00:00Z",
+                                            "updatedAt": "2026-03-13T01:00:00Z",
+                                            "assignees": { "nodes": [] },
+                                            "labels": { "nodes": [] },
+                                            "repository": {
+                                                "name": "other-repo",
+                                                "owner": { "login": "openai" }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/openai/kairastra/issues/42/dependencies/blocked_by",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  repo: kairastra
+  project_owner: dbachko
+  project_url: https://github.com/users/dbachko/projects/7
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  project_v2_number: 7
+  mode: projects_v2
+  status_source:
+    type: project_field
+    name: Status
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issues = tracker.fetch_candidate_issues().await.unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].identifier, "openai/kairastra#42");
     }
 
     #[tokio::test]

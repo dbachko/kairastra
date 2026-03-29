@@ -20,7 +20,7 @@ This is not a generic issue-bot starter.
 
 This repository contains the Rust implementation of Kairastra for GitHub:
 
-- GitHub Issues plus Projects v2 as the work queue
+- one deployment per repository, with GitHub Issues or Projects v2 as the queue
 - per-issue isolated workspaces
 - multi-provider agent support (`codex`, `claude`, and `gemini`)
 - issue workpad comments, PR discovery, and review handoff logic
@@ -48,7 +48,8 @@ If you want to run the implementation in this repository, start with:
 The current implementation is opinionated around GitHub:
 
 - `tracker.kind: github`
-- GitHub Projects v2 as the primary queueing model, with `issues_only` as a fallback
+- one runtime manages one repository checkout and one repository push target
+- `issues_only` is the simplest queue model; `projects_v2` is optional when you want a repo-scoped project queue
 - GitHub-backed workpad comments and PR/check integration
 - `WORKFLOW.md` as the in-repo control surface for prompt and runtime behavior
 

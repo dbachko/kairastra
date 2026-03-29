@@ -20,17 +20,25 @@ Required for the current Rust runtime:
 - `kind: github`
 - `mode: projects_v2` or `issues_only`
 - `api_key`: usually `$GITHUB_TOKEN`
-- `owner`
-- `repo` for `issues_only`
+- `owner`: repository owner
+- `repo`: repository name
 - `project_v2_number` for `projects_v2`
 
 Useful optional fields:
 
+- `project_owner`: GitHub user or org that owns the Project v2 when it differs from the repository owner
 - `project_url`
 - `status_source`
 - `priority_source`
 - `active_states`
 - `terminal_states`
+
+Practical model:
+
+- One workflow should target one repository.
+- `issues_only` is the repo-first mode. Kairastra polls `owner/repo` issues directly.
+- `projects_v2` is still repo-scoped. Kairastra reads items from the configured project, then only dispatches issues that belong to the configured repository.
+- If one GitHub Project contains issues from multiple repositories, run one Kairastra deployment per repository instead of sharing one runtime.
 
 ### `polling`
 

@@ -70,19 +70,19 @@ gh api repos/dbachko/kairastra/secret-scanning/alerts --paginate
 For a public repository, `raw.githubusercontent.com` URLs should use:
 
 - branch name (for example `main`),
-- a release tag (for example `v0.1.0`), or
+- a release tag (for example `v0.1.0-alpha.1`), or
 - a commit SHA.
 
-Use `sed`/`cat` for non-interactive review instead of `less` in single-shot SSH commands.
+Use `sed`/`cat` for non-interactive review instead of `less` in scripted host commands.
 
-Latest `main` example:
+Latest `main` example (run on the host):
 
 ```bash
-ssh -t user@host 'curl -fsSL -o install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/main/scripts/install-remote-docker.sh && sed -n "1,120p" install-remote-docker.sh && bash install-remote-docker.sh'
+curl -fsSL -o /tmp/install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/main/scripts/install-remote-docker.sh && bash /tmp/install-remote-docker.sh --ref main
 ```
 
-Pinned ref example:
+Pinned ref example (run on the host):
 
 ```bash
-ssh -t user@host 'curl -fsSL -o install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/v0.1.0/scripts/install-remote-docker.sh && sed -n "1,120p" install-remote-docker.sh && bash install-remote-docker.sh'
+curl -fsSL -o /tmp/install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/v0.1.0-alpha.1/scripts/install-remote-docker.sh && bash /tmp/install-remote-docker.sh --ref v0.1.0-alpha.1
 ```

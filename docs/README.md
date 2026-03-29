@@ -3,6 +3,9 @@
 Operator docs, implementation references, planning notes, and specs for the Kairastra runtime live
 here.
 
+Current deployment model: one Kairastra deployment manages one repository. If you want to automate
+multiple repositories, run multiple Kairastra services or containers.
+
 - [architecture.md](architecture.md): how Kairastra is structured and where orchestration logic lives
 - [workflow-reference.md](workflow-reference.md): `WORKFLOW.md` structure, key fields, and defaults
 - [troubleshooting.md](troubleshooting.md): common setup and runtime failures
