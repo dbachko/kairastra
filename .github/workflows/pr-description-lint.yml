@@ -35,8 +35,9 @@ jobs:
           done
 
           # Allow additional sections (for example, automation summaries), but
-          # block obvious unfinished placeholders.
-          if grep -Ein '\bTODO\b|\bTBD\b' /tmp/pr_body.md; then
+          # block obvious unfinished placeholders such as list items starting with
+          # TODO/TBD. This avoids false positives for prose like "detect TODO/TBD".
+          if grep -Ein '^[[:space:]]*([-*]|[0-9]+\.)?[[:space:]]*(TODO|TBD)\b([[:space:]:.!?,)]|$)' /tmp/pr_body.md; then
             echo "PR description still contains TODO/TBD placeholders" >&2
             exit 1
           fi
