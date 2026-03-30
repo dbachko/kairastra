@@ -7,7 +7,8 @@ Current deployment model: one Kairastra deployment manages one repository. If yo
 multiple repositories, run multiple Kairastra services or containers.
 
 - [architecture.md](architecture.md): how Kairastra is structured and where orchestration logic lives
-- [workflow-reference.md](workflow-reference.md): `WORKFLOW.md` structure, key fields, and defaults
+- [workflow-reference.md](workflow-reference.md): `WORKFLOW.md` structure, key fields, defaults,
+  and the Docker split between deployment config and repo-owned workspace workflows
 - [troubleshooting.md](troubleshooting.md): common setup and runtime failures
 - [public-repo-readiness.md](public-repo-readiness.md): pre-publication secret-risk checklist and audit flow
 - `plans/`: proposed or historical design notes, including some documents written before the

@@ -57,14 +57,32 @@ impl DoctorReport {
 }
 
 pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
-    if let Some(path) = options.env_file.as_ref() {
+    let env_values = if let Some(path) = options.env_file.as_ref() {
         let env_values = load_env_file(path)?;
         apply_env(&env_values);
-    }
+        Some(env_values)
+    } else {
+        None
+    };
 
     let workflow_path = resolve_workflow_path(options.workflow.as_ref());
     let mut checks = Vec::new();
     let mode = options.mode.unwrap_or_else(infer_mode);
+
+    if mode == DeployMode::Docker {
+        if let Some(values) = env_values.as_ref() {
+            let removed_keys = ["WORKFLOW_FILE", "SEED_REPO_PATH"]
+                .into_iter()
+                .filter(|key| values.contains_key(*key))
+                .collect::<Vec<_>>();
+            if !removed_keys.is_empty() {
+                return Err(anyhow!(
+                    "removed_docker_env_keys: {} are no longer supported in Docker mode; re-run setup or import config into Docker volumes",
+                    removed_keys.join(", ")
+                ));
+            }
+        }
+    }
 
     checks.push(check_command("gh"));
     checks.push(match mode {
@@ -475,8 +493,11 @@ fn print_text_report(report: &DoctorReport) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::infer_mode;
     use crate::deploy::DeployMode;
+    use tempfile::tempdir;
 
     #[test]
     fn infer_mode_prefers_explicit_env() {
@@ -485,5 +506,28 @@ mod tests {
         std::env::set_var("KAIRASTRA_DEPLOY_MODE", "native");
         assert_eq!(infer_mode(), DeployMode::Native);
         std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
+    }
+
+    #[tokio::test]
+    async fn docker_doctor_rejects_removed_host_bind_keys() {
+        let dir = tempdir().unwrap();
+        let env_path = dir.path().join("docker.env");
+        fs::write(
+            &env_path,
+            "KAIRASTRA_DEPLOY_MODE=docker\nWORKFLOW_FILE=../WORKFLOW.md\n",
+        )
+        .unwrap();
+
+        let error = super::run(super::DoctorOptions {
+            workflow: None,
+            env_file: Some(env_path),
+            mode: Some(DeployMode::Docker),
+            format: super::DoctorFormat::Text,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("removed_docker_env_keys"));
     }
 }

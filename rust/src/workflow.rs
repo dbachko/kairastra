@@ -4,10 +4,13 @@ use std::sync::RwLock;
 use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
 use tracing::warn;
 
 use crate::config::Settings;
 use crate::model::WorkflowDefinition;
+
+pub const REPO_WORKFLOW_FILENAME: &str = "WORKFLOW.md";
 
 #[derive(Debug, Clone)]
 pub struct WorkflowSnapshot {
@@ -82,7 +85,7 @@ impl WorkflowStore {
 }
 
 pub fn default_workflow_path() -> Result<PathBuf> {
-    Ok(std::env::current_dir()?.join("WORKFLOW.md"))
+    Ok(std::env::current_dir()?.join(REPO_WORKFLOW_FILENAME))
 }
 
 pub fn load_definition(path: &Path) -> Result<WorkflowDefinition> {
@@ -106,6 +109,50 @@ pub fn load_definition(path: &Path) -> Result<WorkflowDefinition> {
     Ok(WorkflowDefinition {
         config,
         prompt_template,
+    })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoWorkflowHooks {
+    pub after_create: Option<String>,
+    pub before_run: Option<String>,
+    pub after_run: Option<String>,
+    pub before_remove: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RepoWorkflow {
+    pub definition: WorkflowDefinition,
+    pub hooks: RepoWorkflowHooks,
+}
+
+pub fn default_repo_workflow() -> RepoWorkflow {
+    RepoWorkflow {
+        definition: WorkflowDefinition {
+            config: serde_yaml::Value::Mapping(Default::default()),
+            prompt_template: String::new(),
+        },
+        hooks: RepoWorkflowHooks::default(),
+    }
+}
+
+pub fn load_repo_workflow(path: &Path) -> Result<RepoWorkflow> {
+    if !path.is_file() {
+        return Ok(default_repo_workflow());
+    }
+
+    let definition = load_definition(path)?;
+    let raw = serde_yaml::from_value::<RawRepoWorkflow>(definition.config.clone())
+        .map_err(|error| anyhow!("invalid_repo_workflow_config: {error}"))?;
+
+    Ok(RepoWorkflow {
+        definition,
+        hooks: RepoWorkflowHooks {
+            after_create: raw.hooks.after_create,
+            before_run: raw.hooks.before_run,
+            after_run: raw.hooks.after_run,
+            before_remove: raw.hooks.before_remove,
+        },
     })
 }
 
@@ -141,13 +188,31 @@ fn workflow_modified_time(path: &Path) -> Result<SystemTime> {
         .context("workflow metadata missing modified time")
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RawRepoWorkflow {
+    hooks: RawRepoWorkflowHooks,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RawRepoWorkflowHooks {
+    after_create: Option<String>,
+    before_run: Option<String>,
+    after_run: Option<String>,
+    before_remove: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use tempfile::tempdir;
 
-    use super::{load_definition, WorkflowStore};
+    use super::{
+        default_repo_workflow, load_definition, load_repo_workflow, RepoWorkflowHooks,
+        WorkflowStore,
+    };
 
     #[test]
     fn supports_prompt_only_workflows() {
@@ -219,5 +284,64 @@ hello
 
         let second = store.current().unwrap();
         assert_eq!(second.definition.prompt_template, "hello");
+    }
+
+    #[test]
+    fn missing_repo_workflow_uses_default() {
+        let dir = tempdir().unwrap();
+        let workflow = load_repo_workflow(&dir.path().join("WORKFLOW.md")).unwrap();
+
+        assert_eq!(workflow.definition.prompt_template, "");
+        assert_eq!(workflow.hooks, default_repo_workflow().hooks);
+    }
+
+    #[test]
+    fn repo_workflow_accepts_prompt_and_hooks_only() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("WORKFLOW.md");
+        fs::write(
+            &path,
+            r#"---
+hooks:
+  after_create: echo ready
+  before_run: echo run
+  after_run: echo done
+  before_remove: echo bye
+---
+Repo prompt
+"#,
+        )
+        .unwrap();
+
+        let workflow = load_repo_workflow(&path).unwrap();
+        assert_eq!(workflow.definition.prompt_template, "Repo prompt");
+        assert_eq!(
+            workflow.hooks,
+            RepoWorkflowHooks {
+                after_create: Some("echo ready".to_string()),
+                before_run: Some("echo run".to_string()),
+                after_run: Some("echo done".to_string()),
+                before_remove: Some("echo bye".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn repo_workflow_rejects_global_config_fields() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("WORKFLOW.md");
+        fs::write(
+            &path,
+            r#"---
+tracker:
+  kind: github
+---
+Repo prompt
+"#,
+        )
+        .unwrap();
+
+        let error = load_repo_workflow(&path).unwrap_err().to_string();
+        assert!(error.contains("invalid_repo_workflow_config"));
     }
 }

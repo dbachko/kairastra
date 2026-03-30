@@ -188,10 +188,11 @@ cargo run -- auth login --mode api-key
 ### Docker
 
 1. Copy `rust/.env.example` to `rust/.env`.
-2. Fill in `GITHUB_TOKEN` and the workflow-related `KAIRASTRA_*` values.
-3. Point `WORKFLOW_FILE` at the workflow you want mounted.
-4. Start the stack.
-5. If you use subscription/device auth, run the Docker login helper once.
+2. Fill in `GITHUB_TOKEN` and the deployment-related `KAIRASTRA_*` values.
+3. Run `make docker-setup` to write the deployment config into Docker-managed storage.
+4. Run `make docker-sync-seed` to publish the current checkout into the Docker seed volume.
+5. Start the stack.
+6. If you use subscription/device auth, run the Docker login helper once.
 
 Example:
 
@@ -199,6 +200,8 @@ Example:
 cd rust
 cp .env.example .env
 make docker-build
+make docker-setup
+make docker-sync-seed
 make docker-up
 make docker-login
 ```
@@ -254,10 +257,11 @@ What it does:
 
 - creates a managed install root under `~/kairastra` by default
 - clones the repo into `~/kairastra/repo`
-- keeps generated operator config in `~/kairastra/config`
+- keeps the host Docker env file in `~/kairastra/config`
 - builds the Docker image from that managed checkout
-- opens the existing interactive `kairastra setup --mode docker` wizard in your SSH terminal
+- opens the interactive `kairastra setup --mode docker` wizard in your SSH terminal and writes deployment config into the Docker `/config` volume
 - runs `doctor`
+- syncs the managed checkout into the Docker seed volume
 - starts the stack with `docker compose up -d`
 - opens `auth menu` on first install or explicit reconfigure unless you pass `--skip-auth`
 
@@ -309,6 +313,11 @@ Project status handling:
 service, so missing workflow env vars or invalid tracker settings fail once at startup instead of
 triggering a Compose restart loop.
 
+Docker now keeps the deployment config in a named `/config` volume and the seeded checkout in a
+named `/seed-repo` volume. Workspace prompt/hooks come from repo-root `WORKFLOW.md` files inside
+those seeded workspaces when present, or Kairastra's built-in default workspace workflow when
+absent.
+
 `make docker-login` opens a provider picker that shows which providers are already ready and which
 still need action. Codex, Claude, and Gemini can use subscription login in Docker, and API-key auth
 is still available when you want it. You can skip the picker with
@@ -343,8 +352,10 @@ Non-interactive mode:
 
 ```bash
 cargo run -- setup --mode native --non-interactive
-cargo run -- setup --mode docker --non-interactive
 ```
+
+For Docker deployments, prefer `make docker-setup` so the deployment config is written into the
+Docker-managed `/config` volume while the host `.env` file stays authoritative for compose.
 
 Optional flags:
 
@@ -483,8 +494,8 @@ Compose files:
 
 Important details:
 
-- `WORKFLOW_FILE` is mounted read-only at `/config/WORKFLOW.md`.
-- `SEED_REPO_PATH` is mounted read-only at `/seed-repo`.
+- deployment config lives in the `kairastra_config` volume and is read from `/config/WORKFLOW.md`.
+- the seeded checkout lives in the `kairastra_seed` volume and is mounted at `/seed-repo`.
 - workspaces live in the `kairastra_workspaces` volume.
 - runtime home state persists in the `kairastra_home` volume.
 - Codex auth persists in the `kairastra_codex` volume and is linked into the runtime home.
@@ -508,6 +519,11 @@ Important details:
 Available make targets:
 
 - `make docker-build`
+- `make docker-doctor`
+- `make docker-setup`
+- `make docker-sync-seed`
+- `make docker-config-export DEST=...`
+- `make docker-config-import SRC=...`
 - `make docker-up`
 - `make docker-down`
 - `make docker-logs`
@@ -569,14 +585,23 @@ owner and Project v2 number automatically for URLs like
 `https://github.com/users/<owner>/projects/<number>` and
 `https://github.com/orgs/<owner>/projects/<number>`.
 
-The generated workflow also includes an `after_create` hook that:
+For native deployments and repo-owned workflows like the checked-in [WORKFLOW.md](../WORKFLOW.md),
+the workflow hook layer still prepares issue workspaces:
 
 - clones the canonical repo when `KAIRASTRA_GIT_CLONE_URL` is set
 - overlays `KAIRASTRA_SEED_REPO` on top when present
 - sets the git author identity
 
+For Docker deployments:
+
+- setup writes deployment config into `/config/WORKFLOW.md`
+- Kairastra performs the clone/overlay bootstrap internally from `/seed-repo` before repo hooks run
+- workspace prompt/hooks come from repo-root `WORKFLOW.md` inside the seeded repository when
+  present, or from Kairastra's built-in default repo workflow when absent
+
 The checked-in [WORKFLOW.md](../WORKFLOW.md) remains a good reference for the richer review/handoff
-prompt used in this repo.
+prompt used in this repo, and in Docker mode it is also the repo-owned prompt/hook surface when
+that repo is used as the seed source.
 
 Provider runtime controls:
 

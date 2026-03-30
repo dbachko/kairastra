@@ -86,7 +86,7 @@ pub async fn run(options: SetupOptions) -> Result<()> {
 
     write_text_file(
         &workflow_path,
-        &render_workflow(&values),
+        &render_workflow(mode, &values),
         options.non_interactive,
     )?;
     write_text_file(
@@ -376,16 +376,20 @@ async fn collect_values(
         non_interactive,
         false,
     )?;
-    let seed_repo = ask_string(
-        &theme,
-        "Seed repo path (host checkout or overlay repo)",
-        std::env::var("KAIRASTRA_SEED_REPO")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| cwd.display().to_string()),
-        non_interactive,
-        false,
-    )?;
+    let seed_repo = if mode == DeployMode::Native {
+        ask_string(
+            &theme,
+            "Seed repo path (host checkout or overlay repo)",
+            std::env::var("KAIRASTRA_SEED_REPO")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| cwd.display().to_string()),
+            non_interactive,
+            false,
+        )?
+    } else {
+        "/seed-repo".to_string()
+    };
     let default_git_clone_url =
         default_target_clone_url(&env_git_clone_url, &github_owner, &github_repo);
     let git_clone_url = ask_string(
@@ -1319,7 +1323,7 @@ fn render_yaml_scalar(value: &str) -> String {
     serde_json::to_string(value).expect("YAML scalar serialization should succeed")
 }
 
-fn render_workflow(values: &SetupValues) -> String {
+fn render_workflow(mode: DeployMode, values: &SetupValues) -> String {
     let assignee_line = if values.assignee_login.trim().is_empty() {
         String::new()
     } else {
@@ -1331,6 +1335,87 @@ fn render_workflow(values: &SetupValues) -> String {
         .map(providers::render_workflow_provider_section)
         .collect::<Vec<_>>()
         .join("\n");
+    if mode == DeployMode::Docker {
+        let tracker_block = match values.tracker_mode {
+            GitHubMode::ProjectsV2 => {
+                format!(
+                    r#"tracker:
+  kind: github
+  mode: projects_v2
+  api_key: $GITHUB_TOKEN
+  owner: $KAIRASTRA_GITHUB_OWNER
+  repo: $KAIRASTRA_GITHUB_REPO
+  project_owner: $KAIRASTRA_GITHUB_PROJECT_OWNER
+  project_v2_number: $KAIRASTRA_GITHUB_PROJECT_NUMBER
+  project_url: $KAIRASTRA_GITHUB_PROJECT_URL
+  status_source:
+    type: project_field
+    name: Status
+  priority_source:
+    type: project_field
+    name: Priority
+  active_states:
+{active_states}  terminal_states:
+{terminal_states}  claimable_states:
+{claimable_states}  in_progress_state: {in_progress_state}
+  human_review_state: {human_review_state}
+  done_state: {done_state}"#,
+                    active_states = render_yaml_list(&values.project_status.active_states, 4),
+                    terminal_states = render_yaml_list(&values.project_status.terminal_states, 4),
+                    claimable_states = render_yaml_list(&values.project_status.claimable_states, 4),
+                    in_progress_state = render_optional_yaml_value(
+                        values.project_status.in_progress_state.as_deref()
+                    ),
+                    human_review_state = render_optional_yaml_value(
+                        values.project_status.human_review_state.as_deref()
+                    ),
+                    done_state =
+                        render_optional_yaml_value(values.project_status.done_state.as_deref()),
+                )
+            }
+            GitHubMode::IssuesOnly => r#"tracker:
+  kind: github
+  mode: issues_only
+  api_key: $GITHUB_TOKEN
+  owner: $KAIRASTRA_GITHUB_OWNER
+  repo: $KAIRASTRA_GITHUB_REPO
+  status_source:
+    type: github_state
+  active_states:
+    - Open
+  terminal_states:
+    - Closed"#
+                .to_string(),
+        };
+
+        return format!(
+            r#"---
+{tracker_block}
+workspace:
+  root: $KAIRASTRA_WORKSPACE_ROOT
+agent:
+  provider: {provider}
+  max_concurrent_agents: {max_concurrent_agents}
+  max_turns: {max_turns}
+{assignee_line}providers:
+{provider_sections}
+---
+
+Docker deployment config.
+
+Workspace prompts and repo-local hooks come from `<repo>/WORKFLOW.md` inside each workspace when
+present. When a repo does not define that file, Kairastra uses its built-in default workspace
+workflow.
+"#,
+            tracker_block = tracker_block,
+            provider = values.provider,
+            max_concurrent_agents = values.max_concurrent_agents,
+            max_turns = values.max_turns,
+            assignee_line = assignee_line,
+            provider_sections = provider_sections,
+        );
+    }
+
     let mut support_dirs = Vec::new();
     for config in &values.provider_configs {
         for dir in providers::repo_support_dirs(providers::setup_provider_id(config))
@@ -1639,7 +1724,6 @@ fn render_project_env_lines(values: &SetupValues) -> String {
 }
 
 fn render_env_file(mode: DeployMode, values: &SetupValues, workflow_path: &Path) -> String {
-    let workflow_abs = render_workflow_env_path(mode, workflow_path);
     let project_env_lines = render_project_env_lines(values);
     let provider_env = values
         .provider_configs
@@ -1670,7 +1754,7 @@ RUST_LOG={rust_log}
             anthropic_api_key = values.anthropic_api_key,
             gemini_api_key = values.gemini_api_key,
             openai_api_key = values.openai_api_key,
-            workflow_path = workflow_abs,
+            workflow_path = absolute_display_path(workflow_path),
             workspace_root = values.workspace_root,
             github_owner = values.github_owner,
             github_repo = values.github_repo,
@@ -1688,8 +1772,6 @@ GITHUB_TOKEN={github_token}
 ANTHROPIC_API_KEY={anthropic_api_key}
 GEMINI_API_KEY={gemini_api_key}
 OPENAI_API_KEY={openai_api_key}
-WORKFLOW_FILE={workflow_path}
-SEED_REPO_PATH={seed_repo}
 KAIRASTRA_WORKSPACE_ROOT={workspace_root}
 RUST_LOG={rust_log}
 KAIRASTRA_GITHUB_OWNER={github_owner}
@@ -1702,8 +1784,6 @@ KAIRASTRA_AGENT_ASSIGNEE={assignee_login}
             anthropic_api_key = values.anthropic_api_key,
             gemini_api_key = values.gemini_api_key,
             openai_api_key = values.openai_api_key,
-            workflow_path = workflow_abs,
-            seed_repo = values.seed_repo,
             workspace_root = values.workspace_root,
             rust_log = values.rust_log,
             github_owner = values.github_owner,
@@ -1714,20 +1794,6 @@ KAIRASTRA_AGENT_ASSIGNEE={assignee_login}
             provider_env = provider_env,
         ),
     }
-}
-
-fn render_workflow_env_path(mode: DeployMode, workflow_path: &Path) -> String {
-    if mode == DeployMode::Docker
-        && workflow_path
-            .to_string_lossy()
-            .starts_with("/config-state/")
-    {
-        if let Some(existing) = resolve_env_secret(&["WORKFLOW_FILE"]) {
-            return existing;
-        }
-    }
-
-    absolute_display_path(workflow_path)
 }
 
 fn render_systemd_unit(values: &SetupValues, workflow_path: &Path, env_file: &Path) -> String {
@@ -1835,7 +1901,7 @@ mod tests {
 
     #[test]
     fn workflow_template_uses_env_placeholders() {
-        let rendered = render_workflow(&sample_values());
+        let rendered = render_workflow(DeployMode::Native, &sample_values());
         assert!(rendered.contains("owner: $KAIRASTRA_GITHUB_OWNER"));
         assert!(rendered.contains("project_owner: $KAIRASTRA_GITHUB_PROJECT_OWNER"));
         assert!(rendered.contains("provider: codex"));
@@ -1879,7 +1945,7 @@ mod tests {
             reasoning_effort: "high".to_string(),
         });
 
-        let rendered = render_workflow(&values);
+        let rendered = render_workflow(DeployMode::Native, &values);
         assert!(rendered.contains("provider: claude"));
         assert!(rendered.contains("for support_dir in .codex .github; do"));
         assert!(rendered.contains("  codex:"));
@@ -1890,13 +1956,21 @@ mod tests {
     }
 
     #[test]
-    fn docker_env_uses_workflow_file_key() {
+    fn docker_workflow_describes_repo_owned_workspace_behavior() {
+        let rendered = render_workflow(DeployMode::Docker, &sample_values());
+        assert!(rendered.contains("Workspace prompts and repo-local hooks come from"));
+        assert!(!rendered.contains("before_run: |"));
+    }
+
+    #[test]
+    fn docker_env_omits_removed_host_bind_keys() {
         let rendered = render_env_file(
             DeployMode::Docker,
             &sample_values(),
             Path::new("WORKFLOW.md"),
         );
-        assert!(rendered.contains("WORKFLOW_FILE="));
+        assert!(!rendered.contains("WORKFLOW_FILE="));
+        assert!(!rendered.contains("SEED_REPO_PATH="));
         assert!(rendered.contains("KAIRASTRA_GITHUB_PROJECT_OWNER=dbachko"));
         assert!(rendered.contains("CODEX_AUTH_MODE=subscription"));
         assert!(rendered.contains("KAIRASTRA_CODEX_MODEL=gpt-5.4"));
@@ -1908,26 +1982,6 @@ mod tests {
         assert!(rendered.contains("GEMINI_AUTH_MODE=subscription"));
         assert!(rendered.contains("KAIRASTRA_GEMINI_MODEL=gemini-2.5-pro"));
         assert!(rendered.contains("KAIRASTRA_GEMINI_APPROVAL_MODE=yolo"));
-    }
-
-    #[test]
-    fn docker_env_preserves_host_workflow_file_when_setup_runs_in_config_state() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var(
-            "WORKFLOW_FILE",
-            "/Users/dbachko/kairastra/config/WORKFLOW.md",
-        );
-
-        let rendered = render_env_file(
-            DeployMode::Docker,
-            &sample_values(),
-            Path::new("/config-state/WORKFLOW.md"),
-        );
-
-        assert!(rendered.contains("WORKFLOW_FILE=/Users/dbachko/kairastra/config/WORKFLOW.md"));
-        assert!(!rendered.contains("WORKFLOW_FILE=/config-state/WORKFLOW.md"));
-
-        std::env::remove_var("WORKFLOW_FILE");
     }
 
     #[test]
@@ -2025,7 +2079,7 @@ mod tests {
         let mut values = sample_values();
         values.tracker_mode = GitHubMode::IssuesOnly;
 
-        let rendered = render_workflow(&values);
+        let rendered = render_workflow(DeployMode::Native, &values);
         assert!(rendered.contains("mode: issues_only"));
         assert!(rendered.contains("type: github_state"));
         assert!(rendered.contains("- Open"));
@@ -2057,7 +2111,7 @@ mod tests {
         values.project_status.human_review_state = Some("Needs Review".to_string());
         values.project_status.done_state = None;
 
-        let rendered = render_workflow(&values);
+        let rendered = render_workflow(DeployMode::Native, &values);
         assert!(rendered.contains(r#"- "Ready: Waiting""#));
         assert!(rendered.contains(r#"- "Done / Shipped""#));
         assert!(rendered.contains(r#"  in_progress_state: "Doing: Active""#));

@@ -35,7 +35,7 @@ impl Issue {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WorkflowDefinition {
     pub config: serde_yaml::Value,
     pub prompt_template: String,
