@@ -34,6 +34,8 @@ Fix:
 - or set `GH_TOKEN`
 - verify the env file is loaded
 - verify the token has the required `project`/`repo` scopes
+- token creation: https://github.com/settings/tokens/new
+- setup details: `rust/README.md` -> `GitHub token requirements`
 
 ### `github_project_not_found`
 
@@ -47,6 +49,7 @@ Fix:
 - verify the project URL
 - use a classic PAT for user-owned projects
 - authorize the token for SSO if needed
+- verify the token includes `project` or `read:project` as appropriate
 
 ### Issue is visible in the Project but never dispatches
 
