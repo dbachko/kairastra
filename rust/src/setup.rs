@@ -47,6 +47,12 @@ struct SetupValues {
     binary_path: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectOwnerKind {
+    User,
+    Organization,
+}
+
 #[derive(Debug, Clone)]
 struct ProjectStatusConfig {
     active_states: Vec<String>,
@@ -300,7 +306,6 @@ async fn collect_values(
         non_interactive,
         !env_project_number.trim().is_empty() || !env_project_url.trim().is_empty(),
     )?;
-    let github_token = resolve_github_token(&theme, non_interactive, tracker_mode)?;
     let github_project_url = if tracker_mode == GitHubMode::ProjectsV2 {
         ask_string(
             &theme,
@@ -366,6 +371,11 @@ async fn collect_values(
     } else {
         String::new()
     };
+    let github_token = resolve_github_token(
+        &theme,
+        non_interactive,
+        github_token_help_context(tracker_mode, parsed_project.as_ref()),
+    )?;
     let project_status_overview = if tracker_mode == GitHubMode::ProjectsV2 {
         inspect_project_status_overview(
             &github_token,
@@ -564,6 +574,7 @@ fn default_target_clone_url(existing: &str, owner: &str, repo: &str) -> String {
 struct ParsedProjectUrl {
     owner: String,
     project_number: String,
+    owner_kind: ProjectOwnerKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -608,9 +619,16 @@ fn parse_project_url(url: &str) -> Option<ParsedProjectUrl> {
         return None;
     }
 
+    let owner_kind = match segments[0] {
+        "users" => ProjectOwnerKind::User,
+        "orgs" => ProjectOwnerKind::Organization,
+        _ => return None,
+    };
+
     Some(ParsedProjectUrl {
         owner: segments[1].to_string(),
         project_number: project_number.to_string(),
+        owner_kind,
     })
 }
 
@@ -754,26 +772,59 @@ fn print_setup_help_block<T: AsRef<str>>(title: &str, lines: &[T]) {
     println!();
 }
 
-fn github_token_tracker_guidance(tracker_mode: GitHubMode) -> &'static str {
-    match tracker_mode {
-        GitHubMode::ProjectsV2 => {
-            "A GitHub token is required. For user-owned Projects v2, use a classic PAT."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GitHubTokenHelpContext {
+    tracker_mode: GitHubMode,
+    project_owner_kind: Option<ProjectOwnerKind>,
+}
+
+fn github_token_help_context(
+    tracker_mode: GitHubMode,
+    parsed_project: Option<&ParsedProjectUrl>,
+) -> GitHubTokenHelpContext {
+    GitHubTokenHelpContext {
+        tracker_mode,
+        project_owner_kind: parsed_project.map(|project| project.owner_kind),
+    }
+}
+
+fn github_token_tracker_guidance(context: GitHubTokenHelpContext) -> &'static str {
+    match context {
+        GitHubTokenHelpContext {
+            tracker_mode: GitHubMode::ProjectsV2,
+            project_owner_kind: Some(ProjectOwnerKind::User),
+        } => "A GitHub token is required. User-owned Projects v2 require a classic PAT.",
+        GitHubTokenHelpContext {
+            tracker_mode: GitHubMode::ProjectsV2,
+            project_owner_kind: Some(ProjectOwnerKind::Organization),
+        } => "A GitHub token is required. Org-owned Projects v2 can use a classic PAT, and may support a fine-grained PAT when the org exposes the Projects permission.",
+        GitHubTokenHelpContext {
+            tracker_mode: GitHubMode::ProjectsV2,
+            project_owner_kind: None,
+        } => {
+            "A GitHub token is required. User-owned Projects v2 require a classic PAT; org-owned Projects v2 can use a classic PAT and may support a fine-grained PAT when the org exposes the Projects permission."
         }
-        GitHubMode::IssuesOnly => {
+        GitHubTokenHelpContext {
+            tracker_mode: GitHubMode::IssuesOnly,
+            ..
+        } => {
             "A GitHub token is required so Kairastra can read issues and clone/push against the target repo."
         }
     }
 }
 
-fn github_token_help_lines(tracker_mode: GitHubMode) -> Vec<String> {
+fn github_token_help_lines(context: GitHubTokenHelpContext) -> Vec<String> {
     let mut lines = vec![
         format!("- Token settings: {GITHUB_TOKEN_SETTINGS_URL}"),
         format!("- Classic token creation: {GITHUB_TOKEN_CLASSIC_URL}"),
         "- Existing GITHUB_TOKEN or GH_TOKEN env vars will skip this prompt.".to_string(),
     ];
 
-    match tracker_mode {
-        GitHubMode::ProjectsV2 => {
+    match context {
+        GitHubTokenHelpContext {
+            tracker_mode: GitHubMode::ProjectsV2,
+            project_owner_kind: Some(ProjectOwnerKind::User),
+        } => {
             lines.extend([
                 "- For user-owned Projects v2, use a classic PAT, not a fine-grained PAT."
                     .to_string(),
@@ -782,7 +833,38 @@ fn github_token_help_lines(tracker_mode: GitHubMode) -> Vec<String> {
                 "- For read-only diagnostics, `read:project` can replace `project`.".to_string(),
             ]);
         }
-        GitHubMode::IssuesOnly => {
+        GitHubTokenHelpContext {
+            tracker_mode: GitHubMode::ProjectsV2,
+            project_owner_kind: Some(ProjectOwnerKind::Organization),
+        } => {
+            lines.extend([
+                "- For org-owned Projects v2, a fine-grained PAT may work when the org exposes the `Projects` permission; a classic PAT also works."
+                    .to_string(),
+                "- If you use a fine-grained PAT, look for the org-level `Projects` permission. If it is missing, create a classic PAT instead."
+                    .to_string(),
+                "- Recommended classic PAT scopes: `project`, `repo` for private repos, and `workflow` when pushes may edit `.github/workflows/*`."
+                    .to_string(),
+                "- For read-only diagnostics with a classic PAT, `read:project` can replace `project`.".to_string(),
+            ]);
+        }
+        GitHubTokenHelpContext {
+            tracker_mode: GitHubMode::ProjectsV2,
+            project_owner_kind: None,
+        } => {
+            lines.extend([
+                "- User-owned Projects v2 require a classic PAT; org-owned Projects v2 may work with a fine-grained PAT when the org exposes the `Projects` permission."
+                    .to_string(),
+                "- If you do not see a `Projects` permission while creating a fine-grained PAT, create a classic PAT instead."
+                    .to_string(),
+                "- Recommended classic PAT scopes: `project`, `repo` for private repos, and `workflow` when pushes may edit `.github/workflows/*`."
+                    .to_string(),
+                "- For read-only diagnostics with a classic PAT, `read:project` can replace `project`.".to_string(),
+            ]);
+        }
+        GitHubTokenHelpContext {
+            tracker_mode: GitHubMode::IssuesOnly,
+            ..
+        } => {
             lines.extend([
                 "- Recommended scopes: `repo` for private repos and `workflow` only when pushes may edit `.github/workflows/*`."
                     .to_string(),
@@ -799,7 +881,7 @@ fn github_token_help_lines(tracker_mode: GitHubMode) -> Vec<String> {
     lines
 }
 
-fn github_token_error_guidance(tracker_mode: GitHubMode, non_interactive: bool) -> String {
+fn github_token_error_guidance(context: GitHubTokenHelpContext, non_interactive: bool) -> String {
     let action = if non_interactive {
         "Set GITHUB_TOKEN or GH_TOKEN before running setup."
     } else {
@@ -807,7 +889,7 @@ fn github_token_error_guidance(tracker_mode: GitHubMode, non_interactive: bool) 
     };
     format!(
         "{} {} Create or review tokens at {} or {}. See rust/README.md and docs/troubleshooting.md for scope details.",
-        github_token_tracker_guidance(tracker_mode),
+        github_token_tracker_guidance(context),
         action,
         GITHUB_TOKEN_SETTINGS_URL,
         GITHUB_TOKEN_CLASSIC_URL
@@ -817,17 +899,17 @@ fn github_token_error_guidance(tracker_mode: GitHubMode, non_interactive: bool) 
 fn resolve_github_token(
     theme: &ColorfulTheme,
     non_interactive: bool,
-    tracker_mode: GitHubMode,
+    help_context: GitHubTokenHelpContext,
 ) -> Result<String> {
     if let Some(token) = resolve_env_secret(&["GITHUB_TOKEN", "GH_TOKEN"]) {
         return Ok(token);
     }
 
     if non_interactive {
-        return Err(anyhow!(github_token_error_guidance(tracker_mode, true)));
+        return Err(anyhow!(github_token_error_guidance(help_context, true)));
     }
 
-    let help_lines = github_token_help_lines(tracker_mode);
+    let help_lines = github_token_help_lines(help_context);
     print_setup_help_block("GitHub token setup", &help_lines);
 
     let token = Password::with_theme(theme)
@@ -836,7 +918,7 @@ fn resolve_github_token(
         .interact()?;
     let token = token.trim().to_string();
     if token.is_empty() {
-        return Err(anyhow!(github_token_error_guidance(tracker_mode, false)));
+        return Err(anyhow!(github_token_error_guidance(help_context, false)));
     }
 
     Ok(token)
@@ -2040,6 +2122,7 @@ mod tests {
             super::parse_project_url("https://github.com/users/openai/projects/7").unwrap();
         assert_eq!(parsed.owner, "openai");
         assert_eq!(parsed.project_number, "7");
+        assert_eq!(parsed.owner_kind, super::ProjectOwnerKind::User);
     }
 
     #[test]
@@ -2048,6 +2131,7 @@ mod tests {
             super::parse_project_url("https://github.com/orgs/acme/projects/12/views/1").unwrap();
         assert_eq!(parsed.owner, "acme");
         assert_eq!(parsed.project_number, "12");
+        assert_eq!(parsed.owner_kind, super::ProjectOwnerKind::Organization);
     }
 
     #[test]
@@ -2168,7 +2252,7 @@ mod tests {
         let token = super::resolve_github_token(
             &dialoguer::theme::ColorfulTheme::default(),
             true,
-            GitHubMode::IssuesOnly,
+            super::github_token_help_context(GitHubMode::IssuesOnly, None),
         )
         .unwrap();
 
@@ -2186,7 +2270,7 @@ mod tests {
         let error = super::resolve_github_token(
             &dialoguer::theme::ColorfulTheme::default(),
             true,
-            GitHubMode::ProjectsV2,
+            super::github_token_help_context(GitHubMode::ProjectsV2, None),
         )
         .unwrap_err()
         .to_string();
@@ -2197,17 +2281,55 @@ mod tests {
     }
 
     #[test]
-    fn github_token_help_mentions_classic_pat_for_projects_v2() {
-        let lines = super::github_token_help_lines(GitHubMode::ProjectsV2).join("\n");
+    fn github_token_help_mentions_classic_pat_for_user_owned_projects_v2() {
+        let parsed =
+            super::parse_project_url("https://github.com/users/dbachko/projects/7").unwrap();
+        let lines = super::github_token_help_lines(super::github_token_help_context(
+            GitHubMode::ProjectsV2,
+            Some(&parsed),
+        ))
+        .join("\n");
 
         assert!(lines.contains("classic PAT"));
         assert!(lines.contains("`project`"));
         assert!(lines.contains("`read:project`"));
+        assert!(lines.contains("not a fine-grained PAT"));
+    }
+
+    #[test]
+    fn github_token_help_mentions_fine_grained_pat_for_org_owned_projects_v2() {
+        let parsed = super::parse_project_url("https://github.com/orgs/acme/projects/12").unwrap();
+        let lines = super::github_token_help_lines(super::github_token_help_context(
+            GitHubMode::ProjectsV2,
+            Some(&parsed),
+        ))
+        .join("\n");
+
+        assert!(lines.contains("fine-grained PAT may work"));
+        assert!(lines.contains("`Projects` permission"));
+        assert!(lines.contains("classic PAT also works"));
+    }
+
+    #[test]
+    fn github_token_help_mentions_classic_pat_fallback_when_project_ownership_is_unknown() {
+        let lines = super::github_token_help_lines(super::github_token_help_context(
+            GitHubMode::ProjectsV2,
+            None,
+        ))
+        .join("\n");
+
+        assert!(lines.contains("User-owned Projects v2 require a classic PAT"));
+        assert!(lines.contains("fine-grained PAT"));
+        assert!(lines.contains("create a classic PAT instead"));
     }
 
     #[test]
     fn github_token_help_mentions_repo_scope_for_issues_only() {
-        let lines = super::github_token_help_lines(GitHubMode::IssuesOnly).join("\n");
+        let lines = super::github_token_help_lines(super::github_token_help_context(
+            GitHubMode::IssuesOnly,
+            None,
+        ))
+        .join("\n");
 
         assert!(lines.contains("`repo`"));
         assert!(!lines.contains("`read:project`"));
