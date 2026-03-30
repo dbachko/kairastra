@@ -6,7 +6,7 @@ When opening a pull request for this repository, always start from the repo temp
 
 `gh pr create --template pull_request_template.md --editor`
 
-Use the template name, not the `.github/...` path. `gh` resolves PR templates by
+Use the template name, not the `.github/...` path. `gh` (GitHub CLI) resolves PR templates by
 name and rejects the repo-relative path form.
 
 Rules:
