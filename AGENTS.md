@@ -4,7 +4,10 @@
 
 When opening a pull request for this repository, always start from the repo template:
 
-`gh pr create --template .github/pull_request_template.md --editor`
+`gh pr create --template pull_request_template.md --editor`
+
+Use the template name, not the `.github/...` path. `gh` resolves PR templates by
+name and rejects the repo-relative path form.
 
 Rules:
 
