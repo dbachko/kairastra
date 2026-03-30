@@ -39,7 +39,6 @@ struct SetupValues {
     assignee_login: String,
     max_concurrent_agents: String,
     max_turns: String,
-    provider_config: ProviderSetupConfig,
     github_token: String,
     anthropic_api_key: String,
     gemini_api_key: String,
@@ -419,11 +418,6 @@ async fn collect_values(
     let max_turns = "20".to_string();
     let provider = choose_provider(&theme, non_interactive)?;
     let provider_configs = collect_provider_configs(&provider, non_interactive)?;
-    let provider_config = provider_configs
-        .iter()
-        .find(|config| providers::setup_provider_id(config) == provider)
-        .cloned()
-        .expect("selected provider config should be present");
     let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
     let gemini_api_key = std::env::var("GEMINI_API_KEY")
         .or_else(|_| std::env::var("GOOGLE_API_KEY"))
@@ -449,7 +443,6 @@ async fn collect_values(
         assignee_login,
         max_concurrent_agents,
         max_turns,
-        provider_config,
         github_token,
         anthropic_api_key,
         gemini_api_key,
@@ -1942,12 +1935,6 @@ mod tests {
             assignee_login: "codex-bot".to_string(),
             max_concurrent_agents: "4".to_string(),
             max_turns: "20".to_string(),
-            provider_config: ProviderSetupConfig::Codex(CodexSetupConfig {
-                auth_mode: crate::auth::AuthMode::Subscription,
-                model: "gpt-5.4".to_string(),
-                reasoning_effort: "high".to_string(),
-                fast: true,
-            }),
             github_token: String::new(),
             anthropic_api_key: String::new(),
             gemini_api_key: String::new(),
@@ -1997,11 +1984,6 @@ mod tests {
     fn claude_default_workflow_still_includes_all_provider_blocks() {
         let mut values = sample_values();
         values.provider = "claude".to_string();
-        values.provider_config = ProviderSetupConfig::Claude(ClaudeSetupConfig {
-            auth_mode: crate::auth::AuthMode::Subscription,
-            model: "sonnet".to_string(),
-            reasoning_effort: "high".to_string(),
-        });
 
         let rendered = render_workflow(DeployMode::Native, &values);
         assert!(rendered.contains("provider: claude"));
