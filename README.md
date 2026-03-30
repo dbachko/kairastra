@@ -51,7 +51,9 @@ The current implementation is opinionated around GitHub:
 - one runtime manages one repository checkout and one repository push target
 - `issues_only` is the simplest queue model; `projects_v2` is optional when you want a repo-scoped project queue
 - GitHub-backed workpad comments and PR/check integration
-- `WORKFLOW.md` as the in-repo control surface for prompt and runtime behavior
+- `WORKFLOW.md` as the workflow control surface: native deployments read one deployment workflow
+  directly, while Docker deployments keep deployment config in `/config/WORKFLOW.md` and can load
+  repo-root `WORKFLOW.md` prompt/hooks inside seeded workspaces
 
 The runtime also supports multiple coding-agent providers through `agent.provider` and
 `providers.<name>` workflow config blocks.

@@ -4,14 +4,21 @@ Use these checks when Kairastra setup, auth, or runtime behavior is not matching
 
 ## First checks
 
-Run:
+If you are using Docker, run:
+
+```bash
+cd rust
+make docker-doctor
+```
+
+If you are not using Docker, run:
 
 ```bash
 cd rust
 cargo run -- doctor --workflow ../WORKFLOW.md --env-file .env
 ```
 
-If you are not using Docker, point `--env-file` at the native env file or omit it.
+For native deployments, point `--env-file` at the native env file or omit it.
 
 ## Common failures
 
@@ -66,6 +73,31 @@ Fix:
 - reproduce the command manually in a workspace
 - check that required tools like `git`, `rsync`, or provider CLIs exist
 - inspect hook stdout/stderr in the error output or runtime logs
+
+### `removed_docker_env_keys`
+
+Cause:
+
+- the Docker env file still contains removed host-bind keys such as `WORKFLOW_FILE` or
+  `SEED_REPO_PATH`
+
+Fix:
+
+- rerun `make docker-setup`
+- or rerun the remote bootstrap script with `--reconfigure`
+- or remove the stale keys and import/write the deployment config into Docker-managed volumes again
+
+### Repo `WORKFLOW.md` changes do not show up in Docker workspaces
+
+Cause:
+
+- the seed volume still contains an older checkout
+
+Fix:
+
+- run `cd rust && make docker-sync-seed`
+- restart the stack with `make docker-up` if needed
+- on a remote install, rerun `~/kairastra/repo/scripts/install-remote-docker.sh --reconfigure`
 
 ### `command=codex not found in PATH` or `command=claude not found in PATH`
 

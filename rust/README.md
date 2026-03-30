@@ -519,6 +519,7 @@ Important details:
 Available make targets:
 
 - `make docker-build`
+- `make docker-doctor`
 - `make docker-setup`
 - `make docker-sync-seed`
 - `make docker-config-export DEST=...`
@@ -584,14 +585,23 @@ owner and Project v2 number automatically for URLs like
 `https://github.com/users/<owner>/projects/<number>` and
 `https://github.com/orgs/<owner>/projects/<number>`.
 
-The generated workflow also includes an `after_create` hook that:
+For native deployments and repo-owned workflows like the checked-in [WORKFLOW.md](../WORKFLOW.md),
+the workflow hook layer still prepares issue workspaces:
 
 - clones the canonical repo when `KAIRASTRA_GIT_CLONE_URL` is set
 - overlays `KAIRASTRA_SEED_REPO` on top when present
 - sets the git author identity
 
+For Docker deployments:
+
+- setup writes deployment config into `/config/WORKFLOW.md`
+- Kairastra performs the clone/overlay bootstrap internally from `/seed-repo` before repo hooks run
+- workspace prompt/hooks come from repo-root `WORKFLOW.md` inside the seeded repository when
+  present, or from Kairastra's built-in default repo workflow when absent
+
 The checked-in [WORKFLOW.md](../WORKFLOW.md) remains a good reference for the richer review/handoff
-prompt used in this repo.
+prompt used in this repo, and in Docker mode it is also the repo-owned prompt/hook surface when
+that repo is used as the seed source.
 
 Provider runtime controls:
 

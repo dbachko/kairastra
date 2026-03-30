@@ -1,6 +1,9 @@
 # Workflow Reference
 
-Kairastra reads runtime behavior from `WORKFLOW.md`.
+Kairastra reads runtime behavior from `WORKFLOW.md`. In native mode, one deployment workflow owns
+both settings and prompt behavior. In Docker mode, the deployment config still comes from a
+workflow file, but workspace prompt/hooks can come from repo-root `WORKFLOW.md` files inside the
+seeded repository.
 
 ## Structure
 
@@ -10,6 +13,32 @@ Kairastra reads runtime behavior from `WORKFLOW.md`.
 2. A Markdown prompt template body rendered per issue
 
 If the file has no front matter, Kairastra treats the entire file as the prompt body.
+
+## Docker workflow surfaces
+
+Docker deployments have two workflow surfaces:
+
+- Deployment workflow: stored in `/config/WORKFLOW.md`, usually written by `make docker-setup` or
+  the remote bootstrap script. This file owns tracker settings, polling, workspace root,
+  provider defaults, and other deployment-scoped configuration.
+- Repo workflow: optional `WORKFLOW.md` at the root of the seeded repository inside each
+  workspace. This file owns the workspace prompt body plus repo-local lifecycle hooks.
+
+Repo workflow rules in Docker mode:
+
+- Only the prompt body and `hooks.after_create`, `hooks.before_run`, `hooks.after_run`, and
+  `hooks.before_remove` are accepted.
+- Any other front matter fields are rejected as invalid repo workflow config.
+- If the file is absent, Kairastra falls back to its built-in default repo workflow.
+- Repo prompt/hooks replace the deployment prompt/hooks for Docker workers. Deployment config still
+  owns tracker, auth, queue, and other global settings.
+
+Operator implications:
+
+- After changing repo-root `WORKFLOW.md`, run `make docker-sync-seed` so the seed volume matches
+  the checkout Kairastra will clone from.
+- After changing deployment config, run `make docker-setup` or `make docker-config-import` so
+  `/config/WORKFLOW.md` is refreshed.
 
 ## Core sections
 
@@ -111,6 +140,12 @@ Supported hooks:
 - `timeout_ms`
 
 Hooks run in the issue workspace with `CARGO_HOME` redirected to `<workspace>/.cargo-home`.
+
+Mode-specific behavior:
+
+- Native mode runs hooks from the deployment workflow directly.
+- Docker mode first performs Kairastra's internal workspace bootstrap from `/seed-repo`, then runs
+  repo-local hooks from the workspace root `WORKFLOW.md` when present.
 
 Available environment variables include:
 
