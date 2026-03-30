@@ -116,15 +116,31 @@ pub async fn run(options: SetupOptions) -> Result<()> {
     println!("Generated:");
     println!("- workflow: {}", workflow_path.display());
     println!("- env file: {}", env_file_path.display());
+    let provider_auth_ready = providers::inspect_auth_status(&values.provider)
+        .map(|status| status.credentials_present)
+        .unwrap_or(false);
+
     if let Some(path) = service_unit_path.as_ref() {
         println!("- systemd unit: {}", path.display());
         println!("Next steps:");
+        let mut step = 1;
+        if !provider_auth_ready {
+            println!(
+                "{}. Initialize provider auth later if needed: {}",
+                step,
+                native_login_command(&values.provider)
+            );
+            step += 1;
+        }
         println!(
-            "1. Install the unit: sudo cp {} /etc/systemd/system/kairastra.service",
+            "{step}. Install the unit: sudo cp {} /etc/systemd/system/kairastra.service",
             path.display()
         );
-        println!("2. Reload systemd: sudo systemctl daemon-reload");
-        println!("3. Start Kairastra: sudo systemctl enable --now kairastra.service");
+        println!("{}. Reload systemd: sudo systemctl daemon-reload", step + 1);
+        println!(
+            "{}. Start Kairastra: sudo systemctl enable --now kairastra.service",
+            step + 2
+        );
     } else {
         println!("Next steps:");
         println!(
@@ -132,20 +148,20 @@ pub async fn run(options: SetupOptions) -> Result<()> {
             workflow_path.display(),
             env_file_path.display()
         );
-        println!(
-            "2. Start Docker mode: {}",
-            docker_make_command(&layout, "docker-up")
-        );
-        if providers::setup_auth_mode(&values.provider_config)
-            == crate::auth::AuthMode::Subscription
-        {
+        let mut step = 2;
+        if !provider_auth_ready {
             println!(
-                "3. {}: {}",
-                providers::docker_login_message(&values.provider)
-                    .unwrap_or("Initialize provider auth in the container"),
+                "{}. Initialize provider auth later if needed: {}",
+                step,
                 docker_login_command(&layout, &values.provider)
             );
+            step += 1;
         }
+        println!(
+            "{}. Start Docker mode: {}",
+            step,
+            docker_make_command(&layout, "docker-up")
+        );
     }
 
     Ok(())
@@ -253,6 +269,10 @@ fn docker_login_command(layout: &SetupLayout, provider: &str) -> String {
         "{} PROVIDER={provider}",
         docker_make_command(layout, "docker-login")
     )
+}
+
+fn native_login_command(provider: &str) -> String {
+    format!("kairastra auth --provider {provider} login --mode subscription")
 }
 
 async fn collect_values(
