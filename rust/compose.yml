@@ -42,8 +42,8 @@ services:
       KAIRASTRA_GIT_AUTHOR_EMAIL: ${KAIRASTRA_GIT_AUTHOR_EMAIL:-}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
-      - ${WORKFLOW_FILE:-../WORKFLOW.md}:/config/WORKFLOW.md:ro
-      - ${SEED_REPO_PATH:-..}:/seed-repo:ro
+      - kairastra_config:/config
+      - kairastra_seed:/seed-repo:ro
       - kairastra_workspaces:${KAIRASTRA_WORKSPACE_ROOT:-/workspaces}
       - kairastra_home:${KAIRASTRA_HOME:-/home/kairastra}
       - kairastra_codex:/var/lib/kairastra-auth/codex
@@ -52,6 +52,8 @@ services:
     restart: unless-stopped
 
 volumes:
+  kairastra_config:
+  kairastra_seed:
   kairastra_workspaces:
   kairastra_home:
   kairastra_codex:

@@ -7,6 +7,10 @@ use tokio::time::{timeout, Duration};
 
 use crate::config::Settings;
 use crate::model::Issue;
+use crate::providers;
+use crate::workflow::{
+    default_repo_workflow, load_repo_workflow, RepoWorkflow, REPO_WORKFLOW_FILENAME,
+};
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -66,7 +70,13 @@ pub async fn ensure_workspace(settings: &Settings, issue: &Issue) -> Result<Work
     };
 
     if workspace.created_now {
-        if let Some(script) = settings.hooks.after_create.as_deref() {
+        if docker_mode_enabled() {
+            run_internal_docker_after_create(settings, &workspace.path, issue).await?;
+            let repo_workflow = load_workspace_repo_workflow(&workspace.path)?;
+            if let Some(script) = repo_workflow.hooks.after_create.as_deref() {
+                run_hook(settings, "after_create", script, &workspace.path, issue).await?;
+            }
+        } else if let Some(script) = settings.hooks.after_create.as_deref() {
             run_hook(settings, "after_create", script, &workspace.path, issue).await?;
         }
     }
@@ -79,7 +89,13 @@ pub async fn run_before_run_hook(
     workspace: &Path,
     issue: &Issue,
 ) -> Result<()> {
-    if let Some(script) = settings.hooks.before_run.as_deref() {
+    if docker_mode_enabled() {
+        run_internal_docker_before_run(settings, workspace, issue).await?;
+        let repo_workflow = load_workspace_repo_workflow(workspace)?;
+        if let Some(script) = repo_workflow.hooks.before_run.as_deref() {
+            run_hook(settings, "before_run", script, workspace, issue).await?;
+        }
+    } else if let Some(script) = settings.hooks.before_run.as_deref() {
         run_hook(settings, "before_run", script, workspace, issue).await?;
     }
     Ok(())
@@ -90,7 +106,12 @@ pub async fn run_after_run_hook(
     workspace: &Path,
     issue: &Issue,
 ) -> Result<()> {
-    if let Some(script) = settings.hooks.after_run.as_deref() {
+    if docker_mode_enabled() {
+        let repo_workflow = load_workspace_repo_workflow(workspace)?;
+        if let Some(script) = repo_workflow.hooks.after_run.as_deref() {
+            run_hook(settings, "after_run", script, workspace, issue).await?;
+        }
+    } else if let Some(script) = settings.hooks.after_run.as_deref() {
         run_hook(settings, "after_run", script, workspace, issue).await?;
     }
     Ok(())
@@ -105,7 +126,39 @@ pub async fn remove_issue_workspace(settings: &Settings, identifier: &str) -> Re
 
     validate_workspace_path(&root, &workspace)?;
 
-    if let Some(script) = settings.hooks.before_remove.as_deref() {
+    if docker_mode_enabled() {
+        if let Ok(repo_workflow) = load_workspace_repo_workflow(&workspace) {
+            if let Some(script) = repo_workflow.hooks.before_remove.as_deref() {
+                let synthetic_issue = Issue {
+                    id: String::new(),
+                    project_item_id: None,
+                    identifier: identifier.to_string(),
+                    title: String::new(),
+                    description: None,
+                    priority: None,
+                    state: String::new(),
+                    branch_name: None,
+                    url: None,
+                    assignees: Vec::new(),
+                    labels: Vec::new(),
+                    blocked_by: Vec::new(),
+                    created_at: None,
+                    updated_at: None,
+                    workpad_comment_id: None,
+                    workpad_comment_url: None,
+                    workpad_comment_body: None,
+                };
+                let _ = run_hook(
+                    settings,
+                    "before_remove",
+                    script,
+                    &workspace,
+                    &synthetic_issue,
+                )
+                .await;
+            }
+        }
+    } else if let Some(script) = settings.hooks.before_remove.as_deref() {
         let synthetic_issue = Issue {
             id: String::new(),
             project_item_id: None,
@@ -219,10 +272,275 @@ async fn run_hook(
     }
 }
 
+pub fn load_workspace_repo_workflow(workspace: &Path) -> Result<RepoWorkflow> {
+    if !docker_mode_enabled() {
+        return Ok(default_repo_workflow());
+    }
+
+    load_repo_workflow(&workspace.join(REPO_WORKFLOW_FILENAME))
+}
+
+fn docker_mode_enabled() -> bool {
+    matches!(
+        std::env::var("KAIRASTRA_DEPLOY_MODE").as_deref(),
+        Ok("docker")
+    )
+}
+
+fn docker_support_dirs(settings: &Settings) -> Vec<&'static str> {
+    let mut support_dirs = Vec::new();
+    for provider in settings.providers.ids() {
+        for dir in providers::repo_support_dirs(provider).unwrap_or(&[".github"]) {
+            if !support_dirs.iter().any(|existing| existing == dir) {
+                support_dirs.push(*dir);
+            }
+        }
+    }
+
+    if support_dirs.is_empty() {
+        for dir in
+            providers::repo_support_dirs(settings.agent.provider.as_str()).unwrap_or(&[".github"])
+        {
+            support_dirs.push(*dir);
+        }
+    }
+
+    support_dirs
+}
+
+async fn run_internal_docker_after_create(
+    settings: &Settings,
+    workspace: &Path,
+    issue: &Issue,
+) -> Result<()> {
+    let script = render_internal_docker_after_create_script(settings);
+    run_hook(settings, "__docker_after_create", &script, workspace, issue).await
+}
+
+async fn run_internal_docker_before_run(
+    settings: &Settings,
+    workspace: &Path,
+    issue: &Issue,
+) -> Result<()> {
+    let script = render_internal_docker_before_run_script(settings);
+    run_hook(settings, "__docker_before_run", &script, workspace, issue).await
+}
+
+fn render_internal_docker_after_create_script(settings: &Settings) -> String {
+    let support_dirs = docker_support_dirs(settings).join(" ");
+    format!(
+        r#"set -euo pipefail
+
+clone_with_auth() {{
+  clone_url="$1"
+  if [ -n "${{GITHUB_TOKEN:-}}" ] && printf '%s' "$clone_url" | grep -q '^https://github.com/'; then
+    auth_header="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+    git -c http.extraheader="Authorization: Basic ${{auth_header}}" clone --depth 1 "$clone_url" .
+    git config http.https://github.com/.extraheader "Authorization: Basic ${{auth_header}}"
+  else
+    git clone --depth 1 "$clone_url" .
+  fi
+}}
+
+overlay_seed_repo() {{
+  seed_repo="$1"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete --exclude '.git' "${{seed_repo}}/" ./
+  else
+    echo "rsync is required when overlaying KAIRASTRA_SEED_REPO on top of a remote clone." >&2
+    exit 1
+  fi
+}}
+
+github_https_url() {{
+  remote_url="$1"
+  case "$remote_url" in
+    git@github.com:*)
+      printf 'https://github.com/%s\n' "${{remote_url#git@github.com:}}"
+      ;;
+    ssh://git@github.com/*)
+      printf 'https://github.com/%s\n' "${{remote_url#ssh://git@github.com/}}"
+      ;;
+    *)
+      printf '%s\n' "$remote_url"
+      ;;
+  esac
+}}
+
+configure_github_auth() {{
+  if [ -z "${{GITHUB_TOKEN:-}}" ]; then
+    return 0
+  fi
+
+  origin_url="$(git config --get remote.origin.url || true)"
+  normalized_origin_url="$(github_https_url "$origin_url")"
+  if [ -n "$normalized_origin_url" ] && [ "$normalized_origin_url" != "$origin_url" ]; then
+    git remote set-url origin "$normalized_origin_url"
+  fi
+
+  push_url="$(git config --get remote.origin.pushurl || true)"
+  normalized_push_url="$(github_https_url "$push_url")"
+  if [ -n "$normalized_push_url" ] && [ "$normalized_push_url" != "$push_url" ]; then
+    git remote set-url --push origin "$normalized_push_url"
+  fi
+
+  auth_header="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+  git config http.https://github.com/.extraheader "Authorization: Basic ${{auth_header}}"
+}}
+
+restore_support_dir_from_seed() {{
+  support_dir="$1"
+  if [ -e "$support_dir" ]; then
+    return 0
+  fi
+  if [ -n "${{KAIRASTRA_SEED_REPO:-}}" ] && [ -e "${{KAIRASTRA_SEED_REPO}}/$support_dir" ]; then
+    cp -R "${{KAIRASTRA_SEED_REPO}}/$support_dir" "$support_dir"
+  fi
+}}
+
+require_workspace_support_dirs() {{
+  for support_dir in {support_dirs}; do
+    restore_support_dir_from_seed "$support_dir"
+    if [ ! -e "$support_dir" ]; then
+      echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
+      exit 1
+    fi
+  done
+}}
+
+adopt_seed_repo_origin() {{
+  if [ -z "${{KAIRASTRA_SEED_REPO:-}}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+    return 0
+  fi
+  source_remote="$(git -C "$KAIRASTRA_SEED_REPO" config --get remote.origin.url || true)"
+  current_remote="$(git config --get remote.origin.url || true)"
+  if [ -n "$source_remote" ] && {{ [ "$current_remote" = "$KAIRASTRA_SEED_REPO" ] || [ -z "$current_remote" ]; }}; then
+    git remote set-url origin "$source_remote"
+  fi
+}}
+
+if [ -n "${{KAIRASTRA_GIT_CLONE_URL:-}}" ]; then
+  clone_with_auth "$KAIRASTRA_GIT_CLONE_URL"
+  if [ -n "${{KAIRASTRA_SEED_REPO:-}}" ] && [ -d "$KAIRASTRA_SEED_REPO" ]; then
+    overlay_seed_repo "$KAIRASTRA_SEED_REPO"
+  fi
+elif [ -n "${{KAIRASTRA_SEED_REPO:-}}" ] && [ -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+  git clone "$KAIRASTRA_SEED_REPO" .
+  adopt_seed_repo_origin
+else
+  echo "Set KAIRASTRA_GIT_CLONE_URL, or point KAIRASTRA_SEED_REPO at a git checkout, before running Kairastra." >&2
+  exit 1
+fi
+
+if [ -n "${{KAIRASTRA_GIT_PUSH_URL:-}}" ]; then
+  git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
+fi
+
+require_workspace_support_dirs
+configure_github_auth
+
+git config user.name "${{KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}}"
+git config user.email "${{KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}}"
+"#,
+        support_dirs = support_dirs
+    )
+}
+
+fn render_internal_docker_before_run_script(settings: &Settings) -> String {
+    let support_dirs = docker_support_dirs(settings).join(" ");
+    format!(
+        r#"set -euo pipefail
+
+git config --global --add safe.directory "$(pwd)"
+
+restore_support_dir_from_seed() {{
+  support_dir="$1"
+  if [ -e "$support_dir" ]; then
+    return 0
+  fi
+  if [ -n "${{KAIRASTRA_SEED_REPO:-}}" ] && [ -e "${{KAIRASTRA_SEED_REPO}}/$support_dir" ]; then
+    cp -R "${{KAIRASTRA_SEED_REPO}}/$support_dir" "$support_dir"
+  fi
+}}
+
+require_workspace_support_dirs() {{
+  for support_dir in {support_dirs}; do
+    restore_support_dir_from_seed "$support_dir"
+    if [ ! -e "$support_dir" ]; then
+      echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
+      exit 1
+    fi
+  done
+}}
+
+github_https_url() {{
+  remote_url="$1"
+  case "$remote_url" in
+    git@github.com:*)
+      printf 'https://github.com/%s\n' "${{remote_url#git@github.com:}}"
+      ;;
+    ssh://git@github.com/*)
+      printf 'https://github.com/%s\n' "${{remote_url#ssh://git@github.com/}}"
+      ;;
+    *)
+      printf '%s\n' "$remote_url"
+      ;;
+  esac
+}}
+
+configure_github_auth() {{
+  if [ -z "${{GITHUB_TOKEN:-}}" ]; then
+    return 0
+  fi
+
+  origin_url="$(git config --get remote.origin.url || true)"
+  normalized_origin_url="$(github_https_url "$origin_url")"
+  if [ -n "$normalized_origin_url" ] && [ "$normalized_origin_url" != "$origin_url" ]; then
+    git remote set-url origin "$normalized_origin_url"
+  fi
+
+  push_url="$(git config --get remote.origin.pushurl || true)"
+  normalized_push_url="$(github_https_url "$push_url")"
+  if [ -n "$normalized_push_url" ] && [ "$normalized_push_url" != "$push_url" ]; then
+    git remote set-url --push origin "$normalized_push_url"
+  fi
+
+  auth_header="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+  git config http.https://github.com/.extraheader "Authorization: Basic ${{auth_header}}"
+}}
+
+adopt_seed_repo_origin() {{
+  if [ -z "${{KAIRASTRA_SEED_REPO:-}}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+    return 0
+  fi
+  source_remote="$(git -C "$KAIRASTRA_SEED_REPO" config --get remote.origin.url || true)"
+  current_remote="$(git config --get remote.origin.url || true)"
+  if [ -n "$source_remote" ] && {{ [ "$current_remote" = "$KAIRASTRA_SEED_REPO" ] || [ -z "$current_remote" ]; }}; then
+    git remote set-url origin "$source_remote"
+  fi
+}}
+
+require_workspace_support_dirs
+adopt_seed_repo_origin
+
+if [ -n "${{KAIRASTRA_GIT_PUSH_URL:-}}" ]; then
+  git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
+fi
+
+configure_github_auth
+
+git config user.name "${{KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}}"
+git config user.email "${{KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}}"
+"#,
+        support_dirs = support_dirs
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex;
 
     use tempfile::tempdir;
 
@@ -230,9 +548,11 @@ mod tests {
     use crate::model::{Issue, WorkflowDefinition};
 
     use super::{
-        ensure_workspace, remove_issue_workspace, run_after_run_hook, run_hook,
-        sanitize_workspace_key,
+        ensure_workspace, load_workspace_repo_workflow, remove_issue_workspace, run_after_run_hook,
+        run_hook, sanitize_workspace_key,
     };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_settings(root: &Path) -> Settings {
         let definition = WorkflowDefinition {
@@ -347,5 +667,41 @@ workspace:
             .to_string();
 
         assert!(error.contains("workspace_hook_failed: after_run"));
+    }
+
+    #[test]
+    fn docker_repo_workflow_defaults_when_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("KAIRASTRA_DEPLOY_MODE", "docker");
+        let dir = tempdir().unwrap();
+
+        let workflow = load_workspace_repo_workflow(dir.path()).unwrap();
+        assert_eq!(workflow.definition.prompt_template, "");
+        assert!(workflow.hooks.after_create.is_none());
+
+        std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
+    }
+
+    #[test]
+    fn docker_repo_workflow_loads_repo_root_workflow() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("KAIRASTRA_DEPLOY_MODE", "docker");
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("WORKFLOW.md"),
+            r#"---
+hooks:
+  before_run: echo repo
+---
+Repo prompt
+"#,
+        )
+        .unwrap();
+
+        let workflow = load_workspace_repo_workflow(dir.path()).unwrap();
+        assert_eq!(workflow.definition.prompt_template, "Repo prompt");
+        assert_eq!(workflow.hooks.before_run.as_deref(), Some("echo repo"));
+
+        std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
     }
 }

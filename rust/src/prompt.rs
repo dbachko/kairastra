@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use liquid::object;
 
+use crate::config::Settings;
 use crate::model::Issue;
+use crate::model::WorkflowDefinition;
 use crate::providers::is_bootstrap_workpad;
 use crate::workflow::WorkflowSnapshot;
 
@@ -10,10 +12,19 @@ pub fn build_prompt(
     issue: &Issue,
     attempt: Option<u32>,
 ) -> Result<String> {
+    build_prompt_for_workflow(&snapshot.settings, &snapshot.definition, issue, attempt)
+}
+
+pub fn build_prompt_for_workflow(
+    settings: &Settings,
+    workflow: &WorkflowDefinition,
+    issue: &Issue,
+    attempt: Option<u32>,
+) -> Result<String> {
     let parser = liquid::ParserBuilder::with_stdlib()
         .build()
         .context("template_parse_error")?;
-    let template_text = snapshot.settings.workflow_prompt(&snapshot.definition);
+    let template_text = settings.workflow_prompt(workflow);
     let template = parser
         .parse(&template_text)
         .with_context(|| format!("template_parse_error: {template_text}"))?;
@@ -33,16 +44,16 @@ pub fn build_prompt(
 
     let globals = object!({
         "tracker": {
-            "kind": snapshot.settings.tracker.kind.clone(),
-            "mode": match snapshot.settings.tracker.mode {
+            "kind": settings.tracker.kind.clone(),
+            "mode": match settings.tracker.mode {
                 crate::config::GitHubMode::ProjectsV2 => "projects_v2",
                 crate::config::GitHubMode::IssuesOnly => "issues_only",
             },
-            "owner": snapshot.settings.tracker.owner.clone(),
-            "repo": snapshot.settings.tracker.repo.clone(),
-            "project_v2_number": snapshot.settings.tracker.project_v2_number,
-            "project_url": snapshot.settings.tracker.project_url.clone(),
-            "dashboard_url": snapshot.settings.tracker_dashboard_url(),
+            "owner": settings.tracker.owner.clone(),
+            "repo": settings.tracker.repo.clone(),
+            "project_v2_number": settings.tracker.project_v2_number,
+            "project_url": settings.tracker.project_url.clone(),
+            "dashboard_url": settings.tracker_dashboard_url(),
         },
         "attempt": attempt,
         "issue": {
@@ -102,7 +113,7 @@ mod tests {
     use crate::providers::{AGENT_BOOTSTRAP_NOTE, AGENT_WORKPAD_HEADER};
     use crate::workflow::WorkflowSnapshot;
 
-    use super::{build_prompt, continuation_prompt};
+    use super::{build_prompt, build_prompt_for_workflow, continuation_prompt};
 
     #[test]
     fn renders_issue_fields_into_prompt() {
@@ -202,6 +213,55 @@ providers:
 
         let prompt = build_prompt(&snapshot, &issue, None).unwrap();
         assert!(prompt.contains("GitHub dashboard: https://github.com/users/dbachko/projects/7"));
+    }
+
+    #[test]
+    fn build_prompt_for_workflow_uses_explicit_definition() {
+        let workflow = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: dbachko
+  project_v2_number: 7
+  api_key: fake
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+        let settings = Settings::from_workflow(&workflow).unwrap();
+
+        let issue = Issue {
+            id: "1".to_string(),
+            project_item_id: None,
+            identifier: "dbachko/kairastra#1".to_string(),
+            title: "Repo workflow".to_string(),
+            description: Some("body".to_string()),
+            priority: None,
+            state: "Todo".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/dbachko/kairastra/issues/1".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let repo_workflow = WorkflowDefinition {
+            config: serde_yaml::Value::Mapping(Default::default()),
+            prompt_template: "Repo override {{ issue.title }}".to_string(),
+        };
+        let prompt = build_prompt_for_workflow(&settings, &repo_workflow, &issue, None).unwrap();
+        assert_eq!(prompt, "Repo override Repo workflow");
     }
 
     #[test]

@@ -85,6 +85,10 @@ impl ProviderSettings {
     pub fn get(&self, provider: &ProviderId) -> Option<&YamlValue> {
         self.raw.get(provider.as_str())
     }
+
+    pub fn ids(&self) -> Vec<&str> {
+        self.raw.keys().map(String::as_str).collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

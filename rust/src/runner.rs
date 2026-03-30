@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use crate::agent::AgentEvent;
 use crate::github::{GitHubTracker, OpenPullRequest, PullRequestChecksSummary, Tracker};
 use crate::model::Issue;
-use crate::prompt::{build_prompt, continuation_prompt};
+use crate::prompt::{build_prompt, build_prompt_for_workflow, continuation_prompt};
 use crate::providers::{
     self, is_bootstrap_workpad, is_workpad_comment, workpad_header, AGENT_BOOTSTRAP_NOTE,
 };
@@ -94,7 +94,20 @@ pub async fn run_issue(
                 turn_number,
             });
             let prompt = if turn_number == 1 {
-                build_prompt(&snapshot, &current_issue, attempt)?
+                if matches!(
+                    std::env::var("KAIRASTRA_DEPLOY_MODE").as_deref(),
+                    Ok("docker")
+                ) {
+                    let repo_workflow = workspace::load_workspace_repo_workflow(&workspace.path)?;
+                    build_prompt_for_workflow(
+                        &snapshot.settings,
+                        &repo_workflow.definition,
+                        &current_issue,
+                        attempt,
+                    )?
+                } else {
+                    build_prompt(&snapshot, &current_issue, attempt)?
+                }
             } else {
                 continuation_prompt(
                     &current_issue,
