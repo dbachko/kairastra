@@ -134,12 +134,12 @@ fn handle_login_action(status: &AuthStatus, display_name: &str) -> Result<()> {
                     api_key_env_name(&status.provider)
                 );
             }
+            println!("{}", api_key_ready_next_steps(status));
             Ok(())
         }
         LoginAction::NeedsApiKey => Err(anyhow!(
-            "{} is configured for API-key auth. Set {} and rerun doctor.",
-            display_name,
-            api_key_env_name(&status.provider)
+            "{}",
+            api_key_missing_guidance(status, display_name)
         )),
         LoginAction::ProviderUnavailable => Err(anyhow!(
             "{} CLI is not available on PATH in this environment.",
@@ -204,6 +204,35 @@ fn api_key_env_name(provider: &str) -> &'static str {
     }
 }
 
+fn auth_mode_env_name(provider: &str) -> &'static str {
+    match provider {
+        "claude" => "CLAUDE_AUTH_MODE",
+        "codex" => "CODEX_AUTH_MODE",
+        "gemini" => "GEMINI_AUTH_MODE",
+        _ => "AUTH_MODE",
+    }
+}
+
+fn subscription_login_command(provider: &str) -> String {
+    format!("kairastra auth --provider {provider} login --mode subscription")
+}
+
+fn api_key_ready_next_steps(status: &AuthStatus) -> String {
+    let env_name = api_key_env_name(&status.provider);
+    format!(
+        "Next step: run `kairastra doctor` after confirming {env_name} is available in the same shell or env file Kairastra will use."
+    )
+}
+
+fn api_key_missing_guidance(status: &AuthStatus, display_name: &str) -> String {
+    let env_name = api_key_env_name(&status.provider);
+    let auth_mode_env = auth_mode_env_name(&status.provider);
+    let subscription_command = subscription_login_command(&status.provider);
+    format!(
+        "{display_name} is configured for API-key auth. Set {env_name} in the environment or generated env file, then run `kairastra doctor`. If you want browser/device login instead, switch {auth_mode_env}=subscription or rerun setup, then run `{subscription_command}`."
+    )
+}
+
 fn login_action(status: &AuthStatus) -> LoginAction {
     if !status.provider_available {
         return LoginAction::ProviderUnavailable;
@@ -244,7 +273,8 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        inspect_status, login_action, provider_menu_label, AuthMode, AuthStatus, LoginAction,
+        api_key_missing_guidance, api_key_ready_next_steps, inspect_status, login_action,
+        provider_menu_label, AuthMode, AuthStatus, LoginAction,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -324,5 +354,30 @@ mod tests {
             provider_menu_label("Codex", &status),
             "✓ Codex (ready via OPENAI_API_KEY; saved login also present)"
         );
+    }
+
+    #[test]
+    fn api_key_missing_guidance_mentions_env_and_next_steps() {
+        let mut status = status("gemini");
+        status.configured_mode = AuthMode::ApiKey;
+
+        let guidance = api_key_missing_guidance(&status, "Gemini CLI");
+
+        assert!(guidance.contains("GEMINI_API_KEY"));
+        assert!(guidance.contains("kairastra doctor"));
+        assert!(guidance.contains("GEMINI_AUTH_MODE=subscription"));
+        assert!(guidance.contains("kairastra auth --provider gemini login --mode subscription"));
+    }
+
+    #[test]
+    fn api_key_ready_next_steps_mentions_doctor() {
+        let mut status = status("codex");
+        status.inferred_mode = AuthMode::ApiKey;
+        status.api_key_present = true;
+
+        let message = api_key_ready_next_steps(&status);
+
+        assert!(message.contains("OPENAI_API_KEY"));
+        assert!(message.contains("kairastra doctor"));
     }
 }

@@ -83,6 +83,9 @@ Additional operator docs:
 
 ## GitHub token requirements
 
+If `GITHUB_TOKEN` or `GH_TOKEN` is already set, setup uses it and skips the interactive token prompt.
+Otherwise `cargo run -- setup` asks for a GitHub token and now points back to this section.
+
 For `tracker.mode: issues_only`, Kairastra needs repo access only.
 
 For `tracker.mode: projects_v2`, Kairastra needs a GitHub token that can read and usually mutate the
@@ -102,6 +105,11 @@ Recommended classic PAT scopes for Kairastra:
 - `project`
 - `repo` if the target repository is private
 - `workflow` if agent branches may add or edit files under `.github/workflows/`
+
+For `issues_only`, the practical scope guidance is:
+
+- `repo` if the target repository is private
+- `workflow` only when agent branches may add or edit files under `.github/workflows/`
 
 Minimum classic PAT scopes for read-only diagnostics:
 

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
+use dialoguer::{theme::ColorfulTheme, Select};
 
 use crate::auth::AuthMode;
 use crate::deploy::DeployMode;
@@ -15,26 +15,9 @@ pub struct CodexSetupConfig {
 pub fn collect(non_interactive: bool) -> Result<CodexSetupConfig> {
     let theme = ColorfulTheme::default();
     let auth_mode = ask_auth_mode(&theme, non_interactive)?;
-    let model = ask_string(
-        &theme,
-        "Provider model (optional)",
-        std::env::var("KAIRASTRA_CODEX_MODEL").unwrap_or_default(),
-        non_interactive,
-        true,
-    )?;
-    let reasoning_effort = ask_string(
-        &theme,
-        "Thinking effort (optional: none|minimal|low|medium|high|xhigh)",
-        std::env::var("KAIRASTRA_CODEX_REASONING_EFFORT").unwrap_or_default(),
-        non_interactive,
-        true,
-    )?;
-    let fast = ask_bool(
-        &theme,
-        "Enable provider fast mode",
-        env_bool("KAIRASTRA_CODEX_FAST").unwrap_or(false),
-        non_interactive,
-    )?;
+    let model = std::env::var("KAIRASTRA_CODEX_MODEL").unwrap_or_default();
+    let reasoning_effort = std::env::var("KAIRASTRA_CODEX_REASONING_EFFORT").unwrap_or_default();
+    let fast = env_bool("KAIRASTRA_CODEX_FAST").unwrap_or(false);
 
     Ok(CodexSetupConfig {
         auth_mode,
@@ -77,10 +60,22 @@ pub fn render_env_section(mode: DeployMode, config: &CodexSetupConfig) -> String
     lines.join("\n")
 }
 
+fn print_auth_mode_help() {
+    println!();
+    println!("Codex auth options");
+    println!("- OpenAI subscription / device login uses the Codex CLI login flow.");
+    println!(
+        "- API key mode expects OPENAI_API_KEY to already be set before you run `kairastra doctor`."
+    );
+    println!();
+}
+
 fn ask_auth_mode(theme: &ColorfulTheme, non_interactive: bool) -> Result<AuthMode> {
     if non_interactive {
         return Ok(AuthMode::from_env_var("CODEX_AUTH_MODE"));
     }
+
+    print_auth_mode_help();
 
     let items = [
         "OpenAI subscription / device login",
@@ -100,45 +95,6 @@ fn ask_auth_mode(theme: &ColorfulTheme, non_interactive: bool) -> Result<AuthMod
         _ => AuthMode::Subscription,
     })
 }
-
-fn ask_string(
-    theme: &ColorfulTheme,
-    prompt: &str,
-    default: String,
-    non_interactive: bool,
-    allow_empty: bool,
-) -> Result<String> {
-    if non_interactive {
-        return Ok(default);
-    }
-
-    let mut input = Input::<String>::with_theme(theme);
-    input = input.with_prompt(prompt).default(default.clone());
-    let value = input.interact_text()?;
-    if allow_empty || !value.trim().is_empty() {
-        Ok(value.trim().to_string())
-    } else {
-        Ok(default)
-    }
-}
-
-fn ask_bool(
-    theme: &ColorfulTheme,
-    prompt: &str,
-    default: bool,
-    non_interactive: bool,
-) -> Result<bool> {
-    if non_interactive {
-        return Ok(default);
-    }
-
-    Confirm::with_theme(theme)
-        .with_prompt(prompt)
-        .default(default)
-        .interact()
-        .map_err(Into::into)
-}
-
 fn env_bool(name: &str) -> Option<bool> {
     let value = std::env::var(name).ok()?;
     match value.trim().to_ascii_lowercase().as_str() {

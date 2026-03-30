@@ -1,5 +1,5 @@
 use anyhow::Result;
-use dialoguer::{theme::ColorfulTheme, Input, Select};
+use dialoguer::{theme::ColorfulTheme, Select};
 
 use crate::auth::AuthMode;
 use crate::deploy::DeployMode;
@@ -14,20 +14,8 @@ pub struct ClaudeSetupConfig {
 pub fn collect(non_interactive: bool) -> Result<ClaudeSetupConfig> {
     let theme = ColorfulTheme::default();
     let auth_mode = ask_auth_mode(&theme, non_interactive)?;
-    let model = ask_string(
-        &theme,
-        "Provider model (optional)",
-        std::env::var("KAIRASTRA_CLAUDE_MODEL").unwrap_or_default(),
-        non_interactive,
-        true,
-    )?;
-    let reasoning_effort = ask_string(
-        &theme,
-        "Thinking effort (optional: low|medium|high)",
-        std::env::var("KAIRASTRA_CLAUDE_REASONING_EFFORT").unwrap_or_default(),
-        non_interactive,
-        true,
-    )?;
+    let model = std::env::var("KAIRASTRA_CLAUDE_MODEL").unwrap_or_default();
+    let reasoning_effort = std::env::var("KAIRASTRA_CLAUDE_REASONING_EFFORT").unwrap_or_default();
 
     Ok(ClaudeSetupConfig {
         auth_mode,
@@ -58,10 +46,22 @@ pub fn render_env_section(_mode: DeployMode, config: &ClaudeSetupConfig) -> Stri
     .join("\n")
 }
 
+fn print_auth_mode_help() {
+    println!();
+    println!("Claude auth options");
+    println!("- Claude account login uses the Claude CLI/browser login flow.");
+    println!(
+        "- API key mode expects ANTHROPIC_API_KEY to already be set before you run `kairastra doctor`."
+    );
+    println!();
+}
+
 fn ask_auth_mode(theme: &ColorfulTheme, non_interactive: bool) -> Result<AuthMode> {
     if non_interactive {
         return Ok(AuthMode::from_env_var("CLAUDE_AUTH_MODE"));
     }
+
+    print_auth_mode_help();
 
     let items = ["Claude account login", "Anthropic API key from env"];
     let default = match AuthMode::from_env_var("CLAUDE_AUTH_MODE") {
@@ -77,25 +77,4 @@ fn ask_auth_mode(theme: &ColorfulTheme, non_interactive: bool) -> Result<AuthMod
         1 => AuthMode::ApiKey,
         _ => AuthMode::Subscription,
     })
-}
-
-fn ask_string(
-    theme: &ColorfulTheme,
-    prompt: &str,
-    default: String,
-    non_interactive: bool,
-    allow_empty: bool,
-) -> Result<String> {
-    if non_interactive {
-        return Ok(default);
-    }
-
-    let mut input = Input::<String>::with_theme(theme);
-    input = input.with_prompt(prompt).default(default.clone());
-    let value = input.interact_text()?;
-    if allow_empty || !value.trim().is_empty() {
-        Ok(value.trim().to_string())
-    } else {
-        Ok(default)
-    }
 }

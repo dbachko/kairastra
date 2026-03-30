@@ -7,6 +7,7 @@ gemini_auth_mode="${GEMINI_AUTH_MODE:-auto}"
 kairastra_user="${KAIRASTRA_USER:-kairastra}"
 kairastra_home="${KAIRASTRA_HOME:-/home/kairastra}"
 workspace_root="${KAIRASTRA_WORKSPACE_ROOT:-/workspaces}"
+config_root="/config"
 codex_auth_dir="/var/lib/kairastra-auth/codex"
 claude_auth_dir="/var/lib/kairastra-auth/claude"
 gemini_auth_dir="/var/lib/kairastra-auth/gemini"
@@ -88,7 +89,7 @@ EOF
 }
 
 ensure_runtime_home() {
-  mkdir -p "$kairastra_home" "$workspace_root" "$codex_auth_dir" "$claude_auth_dir" "$gemini_auth_dir"
+  mkdir -p "$kairastra_home" "$workspace_root" "$config_root" "$codex_auth_dir" "$claude_auth_dir" "$gemini_auth_dir"
   mkdir -p "$kairastra_home/.local/bin"
 
   if [[ ! -e "$kairastra_home/.codex" ]]; then
@@ -114,6 +115,7 @@ ensure_runtime_home() {
 
   chown -R "$kairastra_user:$kairastra_user" \
     "$workspace_root" \
+    "$config_root" \
     "$kairastra_home" \
     "$codex_auth_dir" \
     "$claude_auth_dir" \
