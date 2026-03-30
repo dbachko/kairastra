@@ -96,6 +96,12 @@ For a user-owned Project v2 like `https://github.com/users/<user>/projects/<numb
 - Use a personal access token (classic)
 - Do not use a fine-grained personal access token
 
+For an org-owned Project v2 like `https://github.com/orgs/<org>/projects/<number>`:
+
+- A classic PAT works
+- A fine-grained PAT may work if the org exposes an org-level `Projects` permission during token creation
+- If you do not see a `Projects` permission on the fine-grained token form, create a classic PAT instead
+
 The reason is GitHub does not support fine-grained PATs for Projects owned by a user account, and
 the Projects API docs require `read:project` for queries or `project` for queries plus mutations.
 GitHub also documents `repo` for command-line repository access.
@@ -146,9 +152,9 @@ References:
 - GitHub token creation and `repo` scope guidance: https://docs.github.com/en/enterprise-server%403.19/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
 - GitHub note that fine-grained PATs do not support user-owned Projects: https://docs.github.com/ko/enterprise-server%403.14/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
 
-Kairastra currently assumes a classic PAT for user-owned Project v2 workflows. If you want to stay
-on a fine-grained PAT, use `issues_only` mode or move the project to an organization and verify the
-token policy there.
+Kairastra currently requires a classic PAT for user-owned Project v2 workflows. If you want to stay
+on a fine-grained PAT, use `issues_only` mode or move the project to an organization and verify that
+the org-owned project exposes the `Projects` permission on the fine-grained token form.
 
 ### Native VPS
 

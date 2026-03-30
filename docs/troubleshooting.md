@@ -48,6 +48,7 @@ Fix:
 
 - verify the project URL
 - use a classic PAT for user-owned projects
+- for org-owned projects, a fine-grained PAT may work if the org exposes the `Projects` permission; if not, use a classic PAT
 - authorize the token for SSO if needed
 - verify the token includes `project` or `read:project` as appropriate
 
