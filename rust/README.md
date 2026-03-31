@@ -253,6 +253,20 @@ Notes:
 - If setup still shows the old prompt text `GitHub Project URL (optional, can auto-fill owner and number)`,
   you are running an older ref or image. Re-run the latest `main` command above, or on an existing host run
   `~/kairastra/repo/scripts/install-remote-docker.sh --ref main --reconfigure`.
+- To test this bootstrap flow from a local checkout before merging, run `make docker-bootstrap-local`
+  from `rust/`. That wrapper uses your local `scripts/install-remote-docker.sh`, points `--repo` at the
+  local checkout, and defaults `--ref` to the current branch or detached `HEAD`.
+- Override `LOCAL_BOOTSTRAP_INSTALL_DIR`, `LOCAL_BOOTSTRAP_REF`, `RECONFIGURE=1`, or `SKIP_AUTH=1` as
+  needed, for example:
+
+```bash
+make docker-bootstrap-local RECONFIGURE=1
+make docker-bootstrap-local SKIP_AUTH=1
+make docker-bootstrap-local LOCAL_BOOTSTRAP_INSTALL_DIR=~/kairastra-test
+```
+
+- The local bootstrap wrapper still clones the repo, so uncommitted working-tree changes are not included
+  in the test install.
 - If the repo is still private, raw URLs return `404`; bootstrap by cloning over Git SSH instead:
 
 ```bash

@@ -6,12 +6,14 @@ COMPOSE_PROJECT ?= $(notdir $(CURDIR))
 ENV_FILE_DIR := $(abspath $(dir $(ENV_FILE)))
 ENV_FILE_BASENAME := $(notdir $(ENV_FILE))
 HOST_REPO_ROOT := $(abspath ..)
+LOCAL_BOOTSTRAP_REF ?= $(shell git -C "$(HOST_REPO_ROOT)" symbolic-ref --quiet --short HEAD 2>/dev/null || git -C "$(HOST_REPO_ROOT)" rev-parse HEAD 2>/dev/null || echo HEAD)
+LOCAL_BOOTSTRAP_INSTALL_DIR ?= $(HOME)/kairastra-local-bootstrap
 CONFIG_VOLUME := $(COMPOSE_PROJECT)_kairastra_config
 SEED_VOLUME := $(COMPOSE_PROJECT)_kairastra_seed
 
 DOCKER_COMPOSE := docker compose -p $(COMPOSE_PROJECT) -f $(COMPOSE_FILE) --env-file $(ENV_FILE)
 
-.PHONY: docker-build docker-up docker-down docker-logs docker-login docker-login-codex docker-login-claude docker-login-gemini docker-clean-oneoff docker-doctor docker-setup docker-sync-seed docker-config-export docker-config-import
+.PHONY: docker-build docker-up docker-down docker-logs docker-login docker-login-codex docker-login-claude docker-login-gemini docker-clean-oneoff docker-doctor docker-setup docker-sync-seed docker-config-export docker-config-import docker-bootstrap-local
 
 docker-clean-oneoff:
 	@ids="$$(docker ps -aq --filter label=com.docker.compose.project=$(COMPOSE_PROJECT) --filter label=com.docker.compose.oneoff=True)"; \
@@ -70,3 +72,25 @@ docker-login-claude:
 
 docker-login-gemini:
 	$(MAKE) docker-login PROVIDER=gemini
+
+docker-bootstrap-local:
+	@set -euo pipefail; \
+	extra_args=""; \
+	if [ -n "$${RECONFIGURE:-}" ]; then \
+	  extra_args="$$extra_args --reconfigure"; \
+	fi; \
+	if [ -n "$${SKIP_AUTH:-}" ]; then \
+	  extra_args="$$extra_args --skip-auth"; \
+	fi; \
+	echo "Running local bootstrap test from $(HOST_REPO_ROOT)"; \
+	echo "  install dir: $(LOCAL_BOOTSTRAP_INSTALL_DIR)"; \
+	echo "  ref: $(LOCAL_BOOTSTRAP_REF)"; \
+	echo "  extra args: $${extra_args:-<none>}"; \
+	if ! git -C "$(HOST_REPO_ROOT)" diff --quiet --ignore-submodules --; then \
+	  echo "warning: uncommitted changes in $(HOST_REPO_ROOT) are not included because the bootstrap script clones the local repo state." >&2; \
+	fi; \
+	bash "$(HOST_REPO_ROOT)/scripts/install-remote-docker.sh" \
+	  --repo "$(HOST_REPO_ROOT)" \
+	  --ref "$(LOCAL_BOOTSTRAP_REF)" \
+	  --install-dir "$(LOCAL_BOOTSTRAP_INSTALL_DIR)" \
+	  $$extra_args
