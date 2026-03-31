@@ -17,7 +17,8 @@ ARG GEMINI_CLI_VERSION=0.35.0
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates curl dbus dbus-user-session docker-compose docker.io gcc gh git gnome-keyring gosu jq libc6-dev libsecret-1-0 libsecret-tools make openssh-client pkg-config rsync \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl dbus dbus-user-session docker-compose docker.io gcc gh git gnome-keyring gosu jq libc6-dev libsecret-1-0 libsecret-tools make openssh-client pkg-config ripgrep rsync \
+    && corepack enable pnpm \
     && npm install -g "@openai/codex@${CODEX_CLI_VERSION}" \
     && npm install -g "@google/gemini-cli@${GEMINI_CLI_VERSION}" \
     && claude_bucket="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases" \

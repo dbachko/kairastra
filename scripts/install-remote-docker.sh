@@ -135,14 +135,14 @@ KAIRASTRA_GITHUB_OWNER=
 KAIRASTRA_GITHUB_REPO=
 KAIRASTRA_GITHUB_PROJECT_NUMBER=
 KAIRASTRA_GITHUB_PROJECT_URL=
-KAIRASTRA_GIT_CLONE_URL=${repo_url}
+KAIRASTRA_GIT_CLONE_URL=
 KAIRASTRA_GIT_PUSH_URL=
 KAIRASTRA_AGENT_ASSIGNEE=
 KAIRASTRA_GIT_AUTHOR_NAME=Kairastra
 KAIRASTRA_GIT_AUTHOR_EMAIL=kairastra@users.noreply.github.com
 KAIRASTRA_CODEX_MODEL=
 KAIRASTRA_CODEX_REASONING_EFFORT=
-KAIRASTRA_CODEX_FAST=false
+KAIRASTRA_CODEX_FAST=
 KAIRASTRA_CLAUDE_MODEL=
 KAIRASTRA_CLAUDE_REASONING_EFFORT=
 KAIRASTRA_GEMINI_MODEL=
@@ -243,7 +243,7 @@ sync_seed_volume() {
   docker_compose run --rm --entrypoint bash \
     -v "$repo_dir:/seed-src:ro" \
     -v "${compose_project}_kairastra_seed:/seed-dest" \
-    kairastra -lc 'set -euo pipefail; mkdir -p /seed-dest; rsync -a --delete /seed-src/ /seed-dest/'
+    kairastra -lc 'set -euo pipefail; mkdir -p /seed-dest; rsync -a --delete --chmod=a+rX /seed-src/ /seed-dest/'
 }
 
 setup_required=false

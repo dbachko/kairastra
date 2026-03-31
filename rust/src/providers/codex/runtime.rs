@@ -97,6 +97,7 @@ impl CodexSession {
         let mut command = Command::new("bash");
         command.arg("-lc").arg(&config.command);
         command.current_dir(workspace);
+        crate::workspace::apply_runtime_tool_env(&mut command);
         command.env("CARGO_HOME", &cargo_home);
         command.env("GITHUB_TOKEN", tracker.settings().api_key.as_str());
         command.env("GH_TOKEN", tracker.settings().api_key.as_str());
@@ -746,7 +747,9 @@ async fn log_stderr(stderr: ChildStderr) {
             continue;
         }
 
-        if looks_like_error(trimmed) {
+        if is_downstream_build_diagnostic(trimmed) {
+            debug!(line = trimmed, "codex stderr");
+        } else if looks_like_error(trimmed) {
             warn!(line = trimmed, "codex stderr");
         } else {
             debug!(line = trimmed, "codex stderr");
@@ -759,6 +762,8 @@ fn is_noisy_codex_stderr(line: &str) -> bool {
         || line.contains("event.name=")
         || line.contains("session_loop")
         || line.contains("submission_dispatch")
+        || line.contains("codex_app_server::message_processor: <- response: JSONRPCResponse")
+        || line.contains("codex_app_server::message_processor: -> request: JSONRPCRequest")
         || line.contains("turn.id=")
         || line.contains("conversation.id=")
         || line.contains("app.version=")
@@ -776,6 +781,7 @@ fn is_noisy_codex_stderr(line: &str) -> bool {
         || line.contains("processor task exited")
         || line.contains("outbound router task exited")
         || line.contains("stdout writer exited")
+        || line == "error: {"
         || line.starts_with("Wall time:")
         || line.starts_with("Process exited with code")
         || line.starts_with("Original token count:")
@@ -783,32 +789,56 @@ fn is_noisy_codex_stderr(line: &str) -> bool {
 }
 
 fn looks_like_error(line: &str) -> bool {
+    if is_downstream_build_diagnostic(line) {
+        return false;
+    }
+
     let lower = line.to_ascii_lowercase();
-    lower.contains(" error")
-        || lower.starts_with("error")
-        || lower.contains(" failed")
-        || lower.contains(" failure")
-        || lower.contains("panic")
-        || lower.contains("fatal")
-        || lower.contains("denied")
-        || lower.contains("exception")
+    lower.starts_with("error:")
+        || lower.starts_with("error ")
+        || lower.starts_with("fatal:")
+        || lower.starts_with("fatal ")
+        || lower.starts_with("panic")
+        || lower.contains("assertion failed")
+        || lower.contains("permission denied")
+        || lower.contains("access denied")
+        || lower.contains("command not found")
+        || lower.contains("no such file or directory")
+        || lower.contains("syntax error")
         || lower.contains("timed out")
+        || lower.contains("unsupported service_tier")
+        || lower.contains("cannot find module")
+        || lower.contains("workspace_hook_failed")
+        || lower.contains("failed to launch")
+}
+
+fn is_downstream_build_diagnostic(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("err_pnpm_recursive_run_first_fail")
+        || lower.contains("err_pnpm_recursive_run_no_script")
+        || lower.contains("none of the selected packages has a \"typecheck\" script")
+        || lower.contains(": error ts")
+        || lower.contains(" error ts")
+        || lower.contains("error[")
+        || lower.contains(": error[")
+        || lower.contains(" error[")
+        || lower.contains("prisma schema validation")
+        || lower.contains("schema.prisma")
+        || lower.contains("prismaclient")
+        || lower.contains("error code: p")
+        || lower.contains("failed to push some refs")
 }
 
 fn strip_ansi_sequences(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut index = 0;
+    let mut chars = input.chars().peekable();
 
-    while index < bytes.len() {
-        if bytes[index] == 0x1b {
-            index += 1;
-            if index < bytes.len() && bytes[index] == b'[' {
-                index += 1;
-                while index < bytes.len() {
-                    let byte = bytes[index];
-                    index += 1;
-                    if (byte as char).is_ascii_alphabetic() {
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[')) {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
                         break;
                     }
                 }
@@ -816,8 +846,7 @@ fn strip_ansi_sequences(input: &str) -> String {
             continue;
         }
 
-        output.push(bytes[index] as char);
-        index += 1;
+        output.push(ch);
     }
 
     output
@@ -1274,6 +1303,15 @@ done
     }
 
     #[test]
+    fn strips_ansi_sequences_without_garbling_utf8() {
+        let line = "\u{1b}[33mhello caf\u{e9} \u{3053}\u{3093}\u{306b}\u{3061}\u{306f}\u{1b}[0m";
+        assert_eq!(
+            super::strip_ansi_sequences(line),
+            "hello caf\u{e9} \u{3053}\u{3093}\u{306b}\u{3061}\u{306f}"
+        );
+    }
+
+    #[test]
     fn filters_codex_telemetry_noise() {
         assert!(super::is_noisy_codex_stderr(
             "INFO codex_otel.log_only: event.name=codex.tool_result app.version=0.114.0"
@@ -1294,13 +1332,48 @@ done
         assert!(super::is_noisy_codex_stderr(
             "To see what failed, try: gh run view 23131072410 --log-failed"
         ));
+        assert!(super::is_noisy_codex_stderr(
+            "2026-03-31T01:14:32.802919Z  INFO codex_app_server::message_processor: <- response: JSONRPCResponse { id: Integer(4), result: Object {...} }"
+        ));
+        assert!(super::is_noisy_codex_stderr("error: {"));
     }
 
     #[test]
     fn detects_error_like_stderr_lines() {
         assert!(super::looks_like_error("Error: invalid_workflow_config"));
         assert!(super::looks_like_error("permission denied"));
+        assert!(!super::looks_like_error(
+            "app/(tabs)/assets.tsx(17,28): error TS2307: Cannot find module '@acme/api-client'"
+        ));
+        assert!(super::looks_like_error(
+            "/bin/bash: line 1: pnpm: command not found"
+        ));
+        assert!(!super::looks_like_error(
+            "return reply.code(400).send({ error: 'brandId is required' });"
+        ));
         assert!(!super::looks_like_error("origin /seed-repo (fetch)"));
+    }
+
+    #[test]
+    fn downstream_build_diagnostics_are_debug_only() {
+        assert!(super::is_downstream_build_diagnostic(
+            "app/(tabs)/assets.tsx(17,28): error TS2307: Cannot find module '@acme/api-client'"
+        ));
+        assert!(super::is_downstream_build_diagnostic(
+            "ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL @acme/app@0.1.0 build: `tsup`"
+        ));
+        assert!(super::is_downstream_build_diagnostic(
+            "ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT None of the selected packages has a \"typecheck\" script"
+        ));
+        assert!(super::is_downstream_build_diagnostic(
+            "Error: Prisma schema validation - (get-config wasm)"
+        ));
+        assert!(super::is_downstream_build_diagnostic(
+            "error: failed to push some refs to 'https://github.com/acme/repo.git'"
+        ));
+        assert!(!super::is_downstream_build_diagnostic(
+            "/bin/bash: line 1: pnpm: command not found"
+        ));
     }
 
     #[tokio::test]

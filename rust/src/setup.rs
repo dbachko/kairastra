@@ -416,13 +416,7 @@ async fn collect_values(
     } else {
         "/seed-repo".to_string()
     };
-    let default_git_clone_url =
-        default_target_clone_url(&env_git_clone_url, &github_owner, &github_repo);
-    let git_clone_url = if env_git_clone_url.trim().is_empty() {
-        default_git_clone_url
-    } else {
-        env_git_clone_url
-    };
+    let git_clone_url = default_target_clone_url(&env_git_clone_url, &github_owner, &github_repo);
     let assignee_login = std::env::var("KAIRASTRA_AGENT_ASSIGNEE").unwrap_or_default();
     let max_concurrent_agents = "4".to_string();
     let max_turns = "20".to_string();
@@ -770,6 +764,69 @@ fn print_setup_help_block<T: AsRef<str>>(title: &str, lines: &[T]) {
         println!("{}", line.as_ref());
     }
     println!();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectStatusHelpTopic {
+    Handling,
+    ActiveStates,
+    TerminalStates,
+    ClaimableStates,
+    InProgressState,
+    HumanReviewState,
+    DoneState,
+}
+
+fn project_status_help_title(topic: ProjectStatusHelpTopic) -> &'static str {
+    match topic {
+        ProjectStatusHelpTopic::Handling => "Project status handling",
+        ProjectStatusHelpTopic::ActiveStates => "Dispatchable active states",
+        ProjectStatusHelpTopic::TerminalStates => "Terminal states",
+        ProjectStatusHelpTopic::ClaimableStates => "States treated as ready to claim",
+        ProjectStatusHelpTopic::InProgressState => "Status to set when a claim starts",
+        ProjectStatusHelpTopic::HumanReviewState => "Status to set for review or blocked handoff",
+        ProjectStatusHelpTopic::DoneState => "Status to set when a closed issue is reconciled",
+    }
+}
+
+fn project_status_help_lines(topic: ProjectStatusHelpTopic) -> Vec<&'static str> {
+    match topic {
+        ProjectStatusHelpTopic::Handling => vec![
+            "- Choose whether Kairastra should map onto your existing Project statuses or rewrite the Project to Kairastra's default status set.",
+            "- Keeping existing statuses is the safe default and does not mutate GitHub.",
+        ],
+        ProjectStatusHelpTopic::ActiveStates => vec![
+            "- Pick the Project statuses Kairastra should treat as still in the working queue.",
+            "- Only items in these active states are polled and dispatched until they move to a terminal state.",
+        ],
+        ProjectStatusHelpTopic::TerminalStates => vec![
+            "- Pick the statuses Kairastra should treat as final or no longer dispatchable.",
+            "- Closed issues and completed Project items should end up in one of these states.",
+        ],
+        ProjectStatusHelpTopic::ClaimableStates => vec![
+            "- Optionally choose the subset of active states that mean an issue is ready to claim right now.",
+            "- Leave this empty if any active state should be considered claimable.",
+        ],
+        ProjectStatusHelpTopic::InProgressState => vec![
+            "- Choose the Project status Kairastra should set automatically when work begins on a claimed issue.",
+            "- Select `Do not change project status` to leave the status untouched at claim time.",
+        ],
+        ProjectStatusHelpTopic::HumanReviewState => vec![
+            "- Choose the Project status Kairastra should set when work needs human follow-up, review, or a blocked handoff.",
+            "- Select `Do not change project status` to disable that automatic transition.",
+        ],
+        ProjectStatusHelpTopic::DoneState => vec![
+            "- Choose the Project status Kairastra should set after it sees the issue is closed and reconciles the Project item.",
+            "- Select `Do not change project status` to keep the Project status unchanged when the issue closes.",
+        ],
+    }
+}
+
+fn print_project_status_help(topic: ProjectStatusHelpTopic) {
+    print_setup_help_block(
+        project_status_help_title(topic),
+        &project_status_help_lines(topic),
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1142,6 +1199,7 @@ fn collect_existing_project_status_config(
     overview: &ProjectStatusOverview,
 ) -> Result<ProjectStatusConfig> {
     let defaults = canonical_project_status_config();
+    print_project_status_help(ProjectStatusHelpTopic::ActiveStates);
     let active_states = prompt_multi_select_states(
         theme,
         "Dispatchable active states",
@@ -1152,6 +1210,7 @@ fn collect_existing_project_status_config(
     )?;
     let mut terminal_options = vec!["Closed".to_string()];
     terminal_options.extend(overview.options.clone());
+    print_project_status_help(ProjectStatusHelpTopic::TerminalStates);
     let terminal_states = prompt_multi_select_states(
         theme,
         "Terminal states",
@@ -1160,6 +1219,7 @@ fn collect_existing_project_status_config(
         Some(&overview.item_counts),
         false,
     )?;
+    print_project_status_help(ProjectStatusHelpTopic::ClaimableStates);
     let claimable_states = prompt_multi_select_states(
         theme,
         "States treated as ready to claim (optional)",
@@ -1168,6 +1228,7 @@ fn collect_existing_project_status_config(
         Some(&overview.item_counts),
         true,
     )?;
+    print_project_status_help(ProjectStatusHelpTopic::InProgressState);
     let in_progress_state = prompt_optional_state(
         theme,
         "Status to set when a claim starts",
@@ -1175,6 +1236,7 @@ fn collect_existing_project_status_config(
         defaults.in_progress_state.as_deref(),
         Some(&overview.item_counts),
     )?;
+    print_project_status_help(ProjectStatusHelpTopic::HumanReviewState);
     let human_review_state = prompt_optional_state(
         theme,
         "Status to set for review or blocked handoff",
@@ -1182,6 +1244,7 @@ fn collect_existing_project_status_config(
         defaults.human_review_state.as_deref(),
         Some(&overview.item_counts),
     )?;
+    print_project_status_help(ProjectStatusHelpTopic::DoneState);
     let done_state = prompt_optional_state(
         theme,
         "Status to set when a closed issue is reconciled",
@@ -1205,36 +1268,42 @@ fn collect_manual_project_status_config(
     non_interactive: bool,
 ) -> Result<ProjectStatusConfig> {
     let defaults = canonical_project_status_config();
+    print_project_status_help(ProjectStatusHelpTopic::ActiveStates);
     let active_states = ask_string_list(
         theme,
         "Dispatchable active states (comma-separated)",
         &defaults.active_states,
         non_interactive,
     )?;
+    print_project_status_help(ProjectStatusHelpTopic::TerminalStates);
     let terminal_states = ask_string_list(
         theme,
         "Terminal states (comma-separated)",
         &defaults.terminal_states,
         non_interactive,
     )?;
+    print_project_status_help(ProjectStatusHelpTopic::ClaimableStates);
     let claimable_states = ask_string_list(
         theme,
         "Claimable states (comma-separated, optional)",
         &defaults.claimable_states,
         non_interactive,
     )?;
+    print_project_status_help(ProjectStatusHelpTopic::InProgressState);
     let in_progress_state = ask_optional_string(
         theme,
         "Status to set when a claim starts (optional)",
         defaults.in_progress_state.as_deref(),
         non_interactive,
     )?;
+    print_project_status_help(ProjectStatusHelpTopic::HumanReviewState);
     let human_review_state = ask_optional_string(
         theme,
         "Status to set for review or blocked handoff (optional)",
         defaults.human_review_state.as_deref(),
         non_interactive,
     )?;
+    print_project_status_help(ProjectStatusHelpTopic::DoneState);
     let done_state = ask_optional_string(
         theme,
         "Status to set when a closed issue is reconciled (optional)",
@@ -1319,6 +1388,7 @@ fn collect_project_status_config(
         } else {
             "Normalize Project to Kairastra statuses".to_string()
         };
+        print_project_status_help(ProjectStatusHelpTopic::Handling);
         let choice = Select::with_theme(theme)
             .with_prompt("Project status handling")
             .items(&[
@@ -1538,7 +1608,8 @@ Docker deployment config.
 
 Workspace prompts and repo-local hooks come from `<repo>/WORKFLOW.md` inside each workspace when
 present. When a repo does not define that file, Kairastra uses its built-in default workspace
-workflow.
+workflow. Provider-specific Codex skills are synced into the agent home and do not live in the
+managed repo checkout.
 "#,
             tracker_block = tracker_block,
             provider = values.provider,
@@ -1686,6 +1757,30 @@ hooks:
       fi
     }}
 
+    exclude_workspace_support_dir() {{
+      support_dir="$1"
+      exclude_path="$(git rev-parse --git-path info/exclude 2>/dev/null || true)"
+      if [ -z "$exclude_path" ]; then
+        return 0
+      fi
+      mkdir -p "$(dirname "$exclude_path")"
+      touch "$exclude_path"
+      entry="$support_dir/"
+      if ! grep -Fqx "$entry" "$exclude_path" 2>/dev/null; then
+        printf '%s\n' "$entry" >> "$exclude_path"
+      fi
+    }}
+
+    remove_legacy_codex_workspace_support() {{
+      if [ ! -e ".codex" ]; then
+        return 0
+      fi
+      if git ls-files -- .codex 2>/dev/null | grep -q .; then
+        return 0
+      fi
+      rm -rf .codex
+    }}
+
     require_workspace_support_dirs() {{
       for support_dir in {support_dirs}; do
         restore_support_dir_from_seed "$support_dir"
@@ -1693,6 +1788,7 @@ hooks:
           echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
           exit 1
         fi
+        exclude_workspace_support_dir "$support_dir"
       done
     }}
 
@@ -1704,6 +1800,75 @@ hooks:
       current_remote="$(git config --get remote.origin.url || true)"
       if [ -n "$source_remote" ] && {{ [ "$current_remote" = "$KAIRASTRA_SEED_REPO" ] || [ -z "$current_remote" ]; }}; then
         git remote set-url origin "$source_remote"
+      fi
+    }}
+
+    resolve_default_branch() {{
+      if [ -n "${{KAIRASTRA_GIT_DEFAULT_BRANCH:-}}" ]; then
+        printf '%s\n' "${{KAIRASTRA_GIT_DEFAULT_BRANCH}}"
+        return 0
+      fi
+
+      remote_head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+      if [ -n "$remote_head" ]; then
+        printf '%s\n' "${{remote_head#origin/}}"
+        return 0
+      fi
+
+      remote_head="$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | head -n 1)"
+      if [ -n "$remote_head" ]; then
+        printf '%s\n' "$remote_head"
+        return 0
+      fi
+
+      printf 'main\n'
+    }}
+
+    fetch_origin_branch() {{
+      branch_name="$1"
+      if [ -z "$branch_name" ] || [ "$branch_name" = "HEAD" ]; then
+        return 0
+      fi
+      git fetch --quiet origin "refs/heads/$branch_name:refs/remotes/origin/$branch_name" || true
+    }}
+
+    ensure_default_branch_baseline() {{
+      current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+      default_branch="$(resolve_default_branch)"
+      if [ -z "$default_branch" ]; then
+        return 0
+      fi
+
+      fetch_origin_branch "$default_branch"
+      if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ]; then
+        fetch_origin_branch "$current_branch"
+      fi
+
+      is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+      if [ "$is_shallow" = "true" ]; then
+        if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ] && [ "$current_branch" != "HEAD" ]; then
+          git fetch --quiet --unshallow origin \
+            "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+            "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+            || true
+        else
+          git fetch --quiet --unshallow origin \
+            "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+            || true
+        fi
+      fi
+
+      if git merge-base "origin/$default_branch" HEAD >/dev/null 2>&1; then
+        return 0
+      fi
+
+      if [ -n "$current_branch" ] && [ "$current_branch" != "HEAD" ]; then
+        git fetch --quiet origin \
+          "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+          "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+          || true
+      else
+        git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
       fi
     }}
 
@@ -1724,8 +1889,10 @@ hooks:
       git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
     fi
 
+    remove_legacy_codex_workspace_support
     require_workspace_support_dirs
     configure_github_auth
+    ensure_default_branch_baseline
 
     git config user.name "${{KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}}"
     git config user.email "${{KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}}"
@@ -1744,6 +1911,30 @@ hooks:
       fi
     }}
 
+    exclude_workspace_support_dir() {{
+      support_dir="$1"
+      exclude_path="$(git rev-parse --git-path info/exclude 2>/dev/null || true)"
+      if [ -z "$exclude_path" ]; then
+        return 0
+      fi
+      mkdir -p "$(dirname "$exclude_path")"
+      touch "$exclude_path"
+      entry="$support_dir/"
+      if ! grep -Fqx "$entry" "$exclude_path" 2>/dev/null; then
+        printf '%s\n' "$entry" >> "$exclude_path"
+      fi
+    }}
+
+    remove_legacy_codex_workspace_support() {{
+      if [ ! -e ".codex" ]; then
+        return 0
+      fi
+      if git ls-files -- .codex 2>/dev/null | grep -q .; then
+        return 0
+      fi
+      rm -rf .codex
+    }}
+
     require_workspace_support_dirs() {{
       for support_dir in {support_dirs}; do
         restore_support_dir_from_seed "$support_dir"
@@ -1751,6 +1942,7 @@ hooks:
           echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
           exit 1
         fi
+        exclude_workspace_support_dir "$support_dir"
       done
     }}
 
@@ -1801,6 +1993,76 @@ hooks:
       fi
     }}
 
+    resolve_default_branch() {{
+      if [ -n "${{KAIRASTRA_GIT_DEFAULT_BRANCH:-}}" ]; then
+        printf '%s\n' "${{KAIRASTRA_GIT_DEFAULT_BRANCH}}"
+        return 0
+      fi
+
+      remote_head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+      if [ -n "$remote_head" ]; then
+        printf '%s\n' "${{remote_head#origin/}}"
+        return 0
+      fi
+
+      remote_head="$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | head -n 1)"
+      if [ -n "$remote_head" ]; then
+        printf '%s\n' "$remote_head"
+        return 0
+      fi
+
+      printf 'main\n'
+    }}
+
+    fetch_origin_branch() {{
+      branch_name="$1"
+      if [ -z "$branch_name" ] || [ "$branch_name" = "HEAD" ]; then
+        return 0
+      fi
+      git fetch --quiet origin "refs/heads/$branch_name:refs/remotes/origin/$branch_name" || true
+    }}
+
+    ensure_default_branch_baseline() {{
+      current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+      default_branch="$(resolve_default_branch)"
+      if [ -z "$default_branch" ]; then
+        return 0
+      fi
+
+      fetch_origin_branch "$default_branch"
+      if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ]; then
+        fetch_origin_branch "$current_branch"
+      fi
+
+      is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+      if [ "$is_shallow" = "true" ]; then
+        if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ] && [ "$current_branch" != "HEAD" ]; then
+          git fetch --quiet --unshallow origin \
+            "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+            "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+            || true
+        else
+          git fetch --quiet --unshallow origin \
+            "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+            || true
+        fi
+      fi
+
+      if git merge-base "origin/$default_branch" HEAD >/dev/null 2>&1; then
+        return 0
+      fi
+
+      if [ -n "$current_branch" ] && [ "$current_branch" != "HEAD" ]; then
+        git fetch --quiet origin \
+          "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+          "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+          || true
+      else
+        git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
+      fi
+    }}
+
+    remove_legacy_codex_workspace_support
     require_workspace_support_dirs
     adopt_seed_repo_origin
 
@@ -1809,6 +2071,7 @@ hooks:
     fi
 
     configure_github_auth
+    ensure_default_branch_baseline
 
     git config user.name "${{KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}}"
     git config user.email "${{KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}}"
@@ -1993,7 +2256,7 @@ mod tests {
                     auth_mode: crate::auth::AuthMode::Subscription,
                     model: "gpt-5.4".to_string(),
                     reasoning_effort: "high".to_string(),
-                    fast: true,
+                    fast: Some(true),
                 }),
                 ProviderSetupConfig::Claude(ClaudeSetupConfig {
                     auth_mode: crate::auth::AuthMode::ApiKey,
@@ -2044,7 +2307,12 @@ mod tests {
         assert!(rendered.contains("reasoning_effort: $KAIRASTRA_CLAUDE_REASONING_EFFORT"));
         assert!(rendered.contains("approval_mode: $KAIRASTRA_GEMINI_APPROVAL_MODE"));
         assert!(rendered.contains("fast: $KAIRASTRA_CODEX_FAST"));
-        assert!(rendered.contains("for support_dir in .codex .github; do"));
+        assert!(rendered.contains("for support_dir in .github; do"));
+        assert!(!rendered.contains("for support_dir in .codex .github; do"));
+        assert!(rendered.contains("git rev-parse --git-path info/exclude"));
+        assert!(rendered.contains("entry=\"$support_dir/\""));
+        assert!(rendered.contains("remove_legacy_codex_workspace_support"));
+        assert!(rendered.contains("git ls-files -- .codex"));
         assert!(
             rendered.contains("Workspace bootstrap missing required repository support directory")
         );
@@ -2053,6 +2321,12 @@ mod tests {
         assert!(rendered.contains("git remote set-url --push origin \"$KAIRASTRA_GIT_PUSH_URL\""));
         assert!(rendered.contains("git config --get remote.origin.pushurl || true"));
         assert!(rendered.contains("http.https://github.com/.extraheader"));
+        assert!(rendered.contains("resolve_default_branch()"));
+        assert!(rendered.contains("fetch_origin_branch()"));
+        assert!(rendered.contains("fetch_origin_branch \"$default_branch\""));
+        assert!(rendered.contains("fetch_origin_branch \"$current_branch\""));
+        assert!(rendered.contains("ensure_default_branch_baseline()"));
+        assert!(rendered.contains("git fetch --quiet --unshallow origin \\"));
         assert!(rendered.contains("before_run: |"));
         assert!(
             rendered.contains("current_remote=\"$(git config --get remote.origin.url || true)\"")
@@ -2069,7 +2343,7 @@ mod tests {
 
         let rendered = render_workflow(DeployMode::Native, &values);
         assert!(rendered.contains("provider: claude"));
-        assert!(rendered.contains("for support_dir in .codex .github; do"));
+        assert!(rendered.contains("for support_dir in .github; do"));
         assert!(rendered.contains("  codex:"));
         assert!(rendered.contains("  claude:"));
         assert!(rendered.contains("  gemini:"));
@@ -2081,6 +2355,7 @@ mod tests {
     fn docker_workflow_describes_repo_owned_workspace_behavior() {
         let rendered = render_workflow(DeployMode::Docker, &sample_values());
         assert!(rendered.contains("Workspace prompts and repo-local hooks come from"));
+        assert!(rendered.contains("Codex skills are synced into the agent home"));
         assert!(!rendered.contains("before_run: |"));
     }
 
@@ -2149,24 +2424,28 @@ mod tests {
     #[test]
     fn default_clone_url_prefers_selected_target_repo() {
         assert_eq!(
-            super::default_target_clone_url("", "dbachko", "postolio"),
-            "https://github.com/dbachko/postolio.git"
+            super::default_target_clone_url("", "acme", "target-repo"),
+            "https://github.com/acme/target-repo.git"
+        );
+        assert_eq!(
+            super::default_target_clone_url("/tmp/bootstrap-source-repo", "acme", "target-repo"),
+            "https://github.com/acme/target-repo.git"
         );
         assert_eq!(
             super::default_target_clone_url(
-                "https://github.com/dbachko/kairastra.git",
-                "dbachko",
-                "postolio"
+                "https://github.com/acme/bootstrap-source.git",
+                "acme",
+                "target-repo"
             ),
-            "https://github.com/dbachko/postolio.git"
+            "https://github.com/acme/target-repo.git"
         );
         assert_eq!(
             super::default_target_clone_url(
-                "git@github.com:dbachko/postolio.git",
-                "dbachko",
-                "postolio"
+                "git@github.com:acme/target-repo.git",
+                "acme",
+                "target-repo"
             ),
-            "git@github.com:dbachko/postolio.git"
+            "git@github.com:acme/target-repo.git"
         );
     }
 
@@ -2333,6 +2612,48 @@ mod tests {
 
         assert!(lines.contains("`repo`"));
         assert!(!lines.contains("`read:project`"));
+    }
+
+    #[test]
+    fn project_status_handling_help_explains_safe_default() {
+        let lines =
+            super::project_status_help_lines(super::ProjectStatusHelpTopic::Handling).join("\n");
+
+        assert!(lines.contains("existing Project statuses"));
+        assert!(lines.contains("safe default"));
+        assert!(lines.contains("does not mutate GitHub"));
+    }
+
+    #[test]
+    fn project_status_active_states_help_explains_dispatch_queue() {
+        let lines = super::project_status_help_lines(super::ProjectStatusHelpTopic::ActiveStates)
+            .join("\n");
+
+        assert!(lines.contains("working queue"));
+        assert!(lines.contains("Only items in these active states are polled and dispatched"));
+        assert!(lines.contains("terminal state"));
+    }
+
+    #[test]
+    fn project_status_claimable_help_explains_optional_subset() {
+        let lines =
+            super::project_status_help_lines(super::ProjectStatusHelpTopic::ClaimableStates)
+                .join("\n");
+
+        assert!(lines.contains("subset of active states"));
+        assert!(lines.contains("ready to claim right now"));
+        assert!(lines.contains("Leave this empty"));
+    }
+
+    #[test]
+    fn project_status_transition_help_mentions_disabling_automatic_updates() {
+        let lines =
+            super::project_status_help_lines(super::ProjectStatusHelpTopic::HumanReviewState)
+                .join("\n");
+
+        assert!(lines.contains("human follow-up"));
+        assert!(lines.contains("Do not change project status"));
+        assert!(lines.contains("disable that automatic transition"));
     }
 
     #[test]

@@ -12,6 +12,11 @@ use crate::workflow::{
     default_repo_workflow, load_repo_workflow, RepoWorkflow, REPO_WORKFLOW_FILENAME,
 };
 
+const DEFAULT_XDG_CACHE_HOME: &str = "/tmp/kairastra/xdg-cache";
+const DEFAULT_COREPACK_HOME: &str = "/tmp/kairastra/corepack";
+const DEFAULT_PNPM_HOME: &str = "/tmp/kairastra/pnpm";
+const DEFAULT_NPM_CONFIG_CACHE: &str = "/tmp/kairastra/npm-cache";
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub path: PathBuf,
@@ -41,6 +46,12 @@ pub fn sanitize_workspace_key(identifier: &str) -> String {
 pub fn workspace_path(settings: &Settings, identifier: &str) -> Result<PathBuf> {
     let root = ensure_workspace_root(&settings.workspace.root)?;
     Ok(root.join(sanitize_workspace_key(identifier)))
+}
+
+pub(crate) fn apply_runtime_tool_env(command: &mut Command) {
+    for (name, value) in runtime_tool_env_overrides() {
+        command.env(name, value);
+    }
 }
 
 pub async fn ensure_workspace(settings: &Settings, issue: &Issue) -> Result<Workspace> {
@@ -243,6 +254,7 @@ async fn run_hook(
     let mut command = Command::new("bash");
     command.arg("-lc").arg(script);
     command.current_dir(workspace);
+    apply_runtime_tool_env(&mut command);
     command.env("CARGO_HOME", &cargo_home);
     command.env("ISSUE_ID", &issue.id);
     command.env("ISSUE_IDENTIFIER", &issue.identifier);
@@ -285,6 +297,35 @@ fn docker_mode_enabled() -> bool {
         std::env::var("KAIRASTRA_DEPLOY_MODE").as_deref(),
         Ok("docker")
     )
+}
+
+fn runtime_tool_env_overrides() -> [(&'static str, String); 4] {
+    [
+        (
+            "XDG_CACHE_HOME",
+            runtime_tool_env_value("XDG_CACHE_HOME", DEFAULT_XDG_CACHE_HOME),
+        ),
+        (
+            "COREPACK_HOME",
+            runtime_tool_env_value("COREPACK_HOME", DEFAULT_COREPACK_HOME),
+        ),
+        (
+            "PNPM_HOME",
+            runtime_tool_env_value("PNPM_HOME", DEFAULT_PNPM_HOME),
+        ),
+        (
+            "NPM_CONFIG_CACHE",
+            runtime_tool_env_value("NPM_CONFIG_CACHE", DEFAULT_NPM_CONFIG_CACHE),
+        ),
+    ]
+}
+
+fn runtime_tool_env_value(name: &str, default: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn docker_support_dirs(settings: &Settings) -> Vec<&'static str> {
@@ -398,6 +439,30 @@ restore_support_dir_from_seed() {{
   fi
 }}
 
+exclude_workspace_support_dir() {{
+  support_dir="$1"
+  exclude_path="$(git rev-parse --git-path info/exclude 2>/dev/null || true)"
+  if [ -z "$exclude_path" ]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$exclude_path")"
+  touch "$exclude_path"
+  entry="$support_dir/"
+  if ! grep -Fqx "$entry" "$exclude_path" 2>/dev/null; then
+    printf '%s\n' "$entry" >> "$exclude_path"
+  fi
+}}
+
+remove_legacy_codex_workspace_support() {{
+  if [ ! -e ".codex" ]; then
+    return 0
+  fi
+  if git ls-files -- .codex 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  rm -rf .codex
+}}
+
 require_workspace_support_dirs() {{
   for support_dir in {support_dirs}; do
     restore_support_dir_from_seed "$support_dir"
@@ -405,6 +470,7 @@ require_workspace_support_dirs() {{
       echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
       exit 1
     fi
+    exclude_workspace_support_dir "$support_dir"
   done
 }}
 
@@ -416,6 +482,75 @@ adopt_seed_repo_origin() {{
   current_remote="$(git config --get remote.origin.url || true)"
   if [ -n "$source_remote" ] && {{ [ "$current_remote" = "$KAIRASTRA_SEED_REPO" ] || [ -z "$current_remote" ]; }}; then
     git remote set-url origin "$source_remote"
+  fi
+}}
+
+resolve_default_branch() {{
+  if [ -n "${{KAIRASTRA_GIT_DEFAULT_BRANCH:-}}" ]; then
+    printf '%s\n' "${{KAIRASTRA_GIT_DEFAULT_BRANCH}}"
+    return 0
+  fi
+
+  remote_head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [ -n "$remote_head" ]; then
+    printf '%s\n' "${{remote_head#origin/}}"
+    return 0
+  fi
+
+  remote_head="$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | head -n 1)"
+  if [ -n "$remote_head" ]; then
+    printf '%s\n' "$remote_head"
+    return 0
+  fi
+
+  printf 'main\n'
+}}
+
+fetch_origin_branch() {{
+  branch_name="$1"
+  if [ -z "$branch_name" ] || [ "$branch_name" = "HEAD" ]; then
+    return 0
+  fi
+  git fetch --quiet origin "refs/heads/$branch_name:refs/remotes/origin/$branch_name" || true
+}}
+
+ensure_default_branch_baseline() {{
+  current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  default_branch="$(resolve_default_branch)"
+  if [ -z "$default_branch" ]; then
+    return 0
+  fi
+
+  fetch_origin_branch "$default_branch"
+  if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ]; then
+    fetch_origin_branch "$current_branch"
+  fi
+
+  is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+  if [ "$is_shallow" = "true" ]; then
+    if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ] && [ "$current_branch" != "HEAD" ]; then
+      git fetch --quiet --unshallow origin \
+        "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+        "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+        || true
+    else
+      git fetch --quiet --unshallow origin \
+        "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+        || true
+    fi
+  fi
+
+  if git merge-base "origin/$default_branch" HEAD >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [ -n "$current_branch" ] && [ "$current_branch" != "HEAD" ]; then
+    git fetch --quiet origin \
+      "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+      "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+      || true
+  else
+    git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
   fi
 }}
 
@@ -436,8 +571,10 @@ if [ -n "${{KAIRASTRA_GIT_PUSH_URL:-}}" ]; then
   git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
 fi
 
+remove_legacy_codex_workspace_support
 require_workspace_support_dirs
 configure_github_auth
+ensure_default_branch_baseline
 
 git config user.name "${{KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}}"
 git config user.email "${{KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}}"
@@ -463,6 +600,30 @@ restore_support_dir_from_seed() {{
   fi
 }}
 
+exclude_workspace_support_dir() {{
+  support_dir="$1"
+  exclude_path="$(git rev-parse --git-path info/exclude 2>/dev/null || true)"
+  if [ -z "$exclude_path" ]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$exclude_path")"
+  touch "$exclude_path"
+  entry="$support_dir/"
+  if ! grep -Fqx "$entry" "$exclude_path" 2>/dev/null; then
+    printf '%s\n' "$entry" >> "$exclude_path"
+  fi
+}}
+
+remove_legacy_codex_workspace_support() {{
+  if [ ! -e ".codex" ]; then
+    return 0
+  fi
+  if git ls-files -- .codex 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  rm -rf .codex
+}}
+
 require_workspace_support_dirs() {{
   for support_dir in {support_dirs}; do
     restore_support_dir_from_seed "$support_dir"
@@ -470,6 +631,7 @@ require_workspace_support_dirs() {{
       echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
       exit 1
     fi
+    exclude_workspace_support_dir "$support_dir"
   done
 }}
 
@@ -520,6 +682,76 @@ adopt_seed_repo_origin() {{
   fi
 }}
 
+resolve_default_branch() {{
+  if [ -n "${{KAIRASTRA_GIT_DEFAULT_BRANCH:-}}" ]; then
+    printf '%s\n' "${{KAIRASTRA_GIT_DEFAULT_BRANCH}}"
+    return 0
+  fi
+
+  remote_head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [ -n "$remote_head" ]; then
+    printf '%s\n' "${{remote_head#origin/}}"
+    return 0
+  fi
+
+  remote_head="$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | head -n 1)"
+  if [ -n "$remote_head" ]; then
+    printf '%s\n' "$remote_head"
+    return 0
+  fi
+
+  printf 'main\n'
+}}
+
+fetch_origin_branch() {{
+  branch_name="$1"
+  if [ -z "$branch_name" ] || [ "$branch_name" = "HEAD" ]; then
+    return 0
+  fi
+  git fetch --quiet origin "refs/heads/$branch_name:refs/remotes/origin/$branch_name" || true
+}}
+
+ensure_default_branch_baseline() {{
+  current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  default_branch="$(resolve_default_branch)"
+  if [ -z "$default_branch" ]; then
+    return 0
+  fi
+
+  fetch_origin_branch "$default_branch"
+  if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ]; then
+    fetch_origin_branch "$current_branch"
+  fi
+
+  is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+  if [ "$is_shallow" = "true" ]; then
+    if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ] && [ "$current_branch" != "HEAD" ]; then
+      git fetch --quiet --unshallow origin \
+        "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+        "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+        || true
+    else
+      git fetch --quiet --unshallow origin \
+        "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+        || true
+    fi
+  fi
+
+  if git merge-base "origin/$default_branch" HEAD >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [ -n "$current_branch" ] && [ "$current_branch" != "HEAD" ]; then
+    git fetch --quiet origin \
+      "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+      "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+      || true
+  else
+    git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
+  fi
+}}
+
+remove_legacy_codex_workspace_support
 require_workspace_support_dirs
 adopt_seed_repo_origin
 
@@ -528,6 +760,7 @@ if [ -n "${{KAIRASTRA_GIT_PUSH_URL:-}}" ]; then
 fi
 
 configure_github_auth
+ensure_default_branch_baseline
 
 git config user.name "${{KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}}"
 git config user.email "${{KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}}"
@@ -540,19 +773,20 @@ git config user.email "${{KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.gi
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
 
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
 
     use crate::config::Settings;
     use crate::model::{Issue, WorkflowDefinition};
 
     use super::{
-        ensure_workspace, load_workspace_repo_workflow, remove_issue_workspace, run_after_run_hook,
-        run_hook, sanitize_workspace_key,
+        ensure_workspace, load_workspace_repo_workflow, remove_issue_workspace,
+        render_internal_docker_after_create_script, render_internal_docker_before_run_script,
+        run_after_run_hook, run_hook, sanitize_workspace_key,
     };
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     fn test_settings(root: &Path) -> Settings {
         let definition = WorkflowDefinition {
@@ -602,6 +836,8 @@ workspace:
 
     #[tokio::test]
     async fn workspace_paths_are_sanitized_and_reused() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
         let dir = tempdir().unwrap();
         let settings = test_settings(dir.path());
 
@@ -619,6 +855,8 @@ workspace:
 
     #[tokio::test]
     async fn removes_target_issue_workspace_only() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
         let dir = tempdir().unwrap();
         let settings = test_settings(dir.path());
         let target = ensure_workspace(&settings, &issue("MT-1")).await.unwrap();
@@ -632,6 +870,8 @@ workspace:
 
     #[tokio::test]
     async fn hook_commands_get_workspace_local_cargo_home() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
         let dir = tempdir().unwrap();
         let settings = test_settings(dir.path());
         let workspace = dir.path().join("workspace");
@@ -654,7 +894,38 @@ workspace:
     }
 
     #[tokio::test]
+    async fn hook_commands_get_runtime_tool_cache_env_defaults() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("COREPACK_HOME");
+        std::env::remove_var("PNPM_HOME");
+        std::env::remove_var("NPM_CONFIG_CACHE");
+        let dir = tempdir().unwrap();
+        let settings = test_settings(dir.path());
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        run_hook(
+            &settings,
+            "after_create",
+            "printf '%s\\n%s\\n%s\\n%s' \"$XDG_CACHE_HOME\" \"$COREPACK_HOME\" \"$PNPM_HOME\" \"$NPM_CONFIG_CACHE\" > runtime-env.txt",
+            &workspace,
+            &issue("MT-ENV"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(workspace.join("runtime-env.txt")).unwrap(),
+            "/tmp/kairastra/xdg-cache\n/tmp/kairastra/corepack\n/tmp/kairastra/pnpm\n/tmp/kairastra/npm-cache"
+        );
+    }
+
+    #[tokio::test]
     async fn after_run_hook_errors_are_returned() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
         let dir = tempdir().unwrap();
         let mut settings = test_settings(dir.path());
         settings.hooks.after_run = Some("exit 7".to_string());
@@ -671,7 +942,7 @@ workspace:
 
     #[test]
     fn docker_repo_workflow_defaults_when_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.blocking_lock();
         std::env::set_var("KAIRASTRA_DEPLOY_MODE", "docker");
         let dir = tempdir().unwrap();
 
@@ -684,7 +955,7 @@ workspace:
 
     #[test]
     fn docker_repo_workflow_loads_repo_root_workflow() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.blocking_lock();
         std::env::set_var("KAIRASTRA_DEPLOY_MODE", "docker");
         let dir = tempdir().unwrap();
         fs::write(
@@ -703,5 +974,34 @@ Repo prompt
         assert_eq!(workflow.hooks.before_run.as_deref(), Some("echo repo"));
 
         std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
+    }
+
+    #[test]
+    fn docker_workspace_scripts_exclude_seeded_support_dirs_from_git_status() {
+        let dir = tempdir().unwrap();
+        let settings = test_settings(dir.path());
+
+        let after_create = render_internal_docker_after_create_script(&settings);
+        let before_run = render_internal_docker_before_run_script(&settings);
+
+        assert!(after_create.contains("git rev-parse --git-path info/exclude"));
+        assert!(after_create.contains("entry=\"$support_dir/\""));
+        assert!(after_create.contains("remove_legacy_codex_workspace_support"));
+        assert!(after_create.contains("git ls-files -- .codex"));
+        assert!(!after_create.contains("for support_dir in .codex .github; do"));
+        assert!(after_create.contains("resolve_default_branch()"));
+        assert!(after_create.contains("fetch_origin_branch()"));
+        assert!(after_create.contains("fetch_origin_branch \"$default_branch\""));
+        assert!(after_create.contains("fetch_origin_branch \"$current_branch\""));
+        assert!(after_create.contains("git fetch --quiet --unshallow origin \\"));
+        assert!(before_run.contains("git rev-parse --git-path info/exclude"));
+        assert!(before_run.contains("entry=\"$support_dir/\""));
+        assert!(before_run.contains("remove_legacy_codex_workspace_support"));
+        assert!(before_run.contains("git ls-files -- .codex"));
+        assert!(!before_run.contains("for support_dir in .codex .github; do"));
+        assert!(before_run.contains("resolve_default_branch()"));
+        assert!(before_run.contains("fetch_origin_branch()"));
+        assert!(before_run.contains("git fetch --quiet --unshallow origin \\"));
+        assert!(before_run.contains("ensure_default_branch_baseline"));
     }
 }
