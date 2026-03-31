@@ -117,7 +117,25 @@ sync_codex_seed_skills() {
   fi
 }
 
+ensure_safe_runtime_dir() {
+  local dir_path="$1"
+  local env_name="$2"
+
+  if [[ "$dir_path" == /tmp/* || "$dir_path" == /var/tmp/* || "$dir_path" == "$kairastra_home"/* ]]; then
+    return 0
+  fi
+
+  echo "$env_name must point inside /tmp, /var/tmp, or $kairastra_home (got '$dir_path')" >&2
+  exit 1
+}
+
 ensure_runtime_home() {
+  ensure_safe_runtime_dir "$tool_cache_root" "KAIRASTRA_TOOL_CACHE_ROOT"
+  ensure_safe_runtime_dir "$xdg_cache_home" "XDG_CACHE_HOME"
+  ensure_safe_runtime_dir "$corepack_home" "COREPACK_HOME"
+  ensure_safe_runtime_dir "$pnpm_home" "PNPM_HOME"
+  ensure_safe_runtime_dir "$npm_config_cache" "NPM_CONFIG_CACHE"
+
   mkdir -p \
     "$kairastra_home" \
     "$workspace_root" \

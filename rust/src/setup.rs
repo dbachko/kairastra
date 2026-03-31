@@ -1771,14 +1771,32 @@ hooks:
       fi
     }}
 
-    prune_legacy_codex_workspace_support() {{
+    legacy_codex_backup_root() {{
+      if [ -n "${{KAIRASTRA_HOME:-}}" ]; then
+        printf '%s/.local/state/kairastra/legacy-workspace-codex\n' "${{KAIRASTRA_HOME}}"
+        return 0
+      fi
+      if [ -n "${{HOME:-}}" ]; then
+        printf '%s/.local/state/kairastra/legacy-workspace-codex\n' "${{HOME}}"
+        return 0
+      fi
+      return 1
+    }}
+
+    migrate_legacy_codex_workspace_support() {{
       if [ ! -e ".codex" ]; then
         return 0
       fi
       if git ls-files -- .codex 2>/dev/null | grep -q .; then
         return 0
       fi
-      rm -rf .codex
+      backup_root="$(legacy_codex_backup_root || true)"
+      if [ -z "$backup_root" ]; then
+        return 0
+      fi
+      mkdir -p "$backup_root"
+      backup_dir="$(mktemp -d "$backup_root/$(basename "$(pwd)").XXXXXX")"
+      mv .codex "$backup_dir/.codex"
     }}
 
     require_workspace_support_dirs() {{
@@ -1889,7 +1907,7 @@ hooks:
       git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
     fi
 
-    prune_legacy_codex_workspace_support
+    migrate_legacy_codex_workspace_support
     require_workspace_support_dirs
     configure_github_auth
     ensure_default_branch_baseline
@@ -1925,14 +1943,32 @@ hooks:
       fi
     }}
 
-    prune_legacy_codex_workspace_support() {{
+    legacy_codex_backup_root() {{
+      if [ -n "${{KAIRASTRA_HOME:-}}" ]; then
+        printf '%s/.local/state/kairastra/legacy-workspace-codex\n' "${{KAIRASTRA_HOME}}"
+        return 0
+      fi
+      if [ -n "${{HOME:-}}" ]; then
+        printf '%s/.local/state/kairastra/legacy-workspace-codex\n' "${{HOME}}"
+        return 0
+      fi
+      return 1
+    }}
+
+    migrate_legacy_codex_workspace_support() {{
       if [ ! -e ".codex" ]; then
         return 0
       fi
       if git ls-files -- .codex 2>/dev/null | grep -q .; then
         return 0
       fi
-      rm -rf .codex
+      backup_root="$(legacy_codex_backup_root || true)"
+      if [ -z "$backup_root" ]; then
+        return 0
+      fi
+      mkdir -p "$backup_root"
+      backup_dir="$(mktemp -d "$backup_root/$(basename "$(pwd)").XXXXXX")"
+      mv .codex "$backup_dir/.codex"
     }}
 
     require_workspace_support_dirs() {{
@@ -2062,7 +2098,7 @@ hooks:
       fi
     }}
 
-    prune_legacy_codex_workspace_support
+    migrate_legacy_codex_workspace_support
     require_workspace_support_dirs
     adopt_seed_repo_origin
 
@@ -2311,8 +2347,9 @@ mod tests {
         assert!(!rendered.contains("for support_dir in .codex .github; do"));
         assert!(rendered.contains("git rev-parse --git-path info/exclude"));
         assert!(rendered.contains("entry=\"$support_dir/\""));
-        assert!(rendered.contains("prune_legacy_codex_workspace_support"));
+        assert!(rendered.contains("migrate_legacy_codex_workspace_support"));
         assert!(rendered.contains("git ls-files -- .codex"));
+        assert!(rendered.contains("legacy-workspace-codex"));
         assert!(
             rendered.contains("Workspace bootstrap missing required repository support directory")
         );

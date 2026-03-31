@@ -453,14 +453,32 @@ exclude_workspace_support_dir() {{
   fi
 }}
 
-prune_legacy_codex_workspace_support() {{
+legacy_codex_backup_root() {{
+  if [ -n "${{KAIRASTRA_HOME:-}}" ]; then
+    printf '%s/.local/state/kairastra/legacy-workspace-codex\n' "${{KAIRASTRA_HOME}}"
+    return 0
+  fi
+  if [ -n "${{HOME:-}}" ]; then
+    printf '%s/.local/state/kairastra/legacy-workspace-codex\n' "${{HOME}}"
+    return 0
+  fi
+  return 1
+}}
+
+migrate_legacy_codex_workspace_support() {{
   if [ ! -e ".codex" ]; then
     return 0
   fi
   if git ls-files -- .codex 2>/dev/null | grep -q .; then
     return 0
   fi
-  rm -rf .codex
+  backup_root="$(legacy_codex_backup_root || true)"
+  if [ -z "$backup_root" ]; then
+    return 0
+  fi
+  mkdir -p "$backup_root"
+  backup_dir="$(mktemp -d "$backup_root/$(basename "$(pwd)").XXXXXX")"
+  mv .codex "$backup_dir/.codex"
 }}
 
 require_workspace_support_dirs() {{
@@ -571,7 +589,7 @@ if [ -n "${{KAIRASTRA_GIT_PUSH_URL:-}}" ]; then
   git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
 fi
 
-prune_legacy_codex_workspace_support
+migrate_legacy_codex_workspace_support
 require_workspace_support_dirs
 configure_github_auth
 ensure_default_branch_baseline
@@ -614,14 +632,32 @@ exclude_workspace_support_dir() {{
   fi
 }}
 
-prune_legacy_codex_workspace_support() {{
+legacy_codex_backup_root() {{
+  if [ -n "${{KAIRASTRA_HOME:-}}" ]; then
+    printf '%s/.local/state/kairastra/legacy-workspace-codex\n' "${{KAIRASTRA_HOME}}"
+    return 0
+  fi
+  if [ -n "${{HOME:-}}" ]; then
+    printf '%s/.local/state/kairastra/legacy-workspace-codex\n' "${{HOME}}"
+    return 0
+  fi
+  return 1
+}}
+
+migrate_legacy_codex_workspace_support() {{
   if [ ! -e ".codex" ]; then
     return 0
   fi
   if git ls-files -- .codex 2>/dev/null | grep -q .; then
     return 0
   fi
-  rm -rf .codex
+  backup_root="$(legacy_codex_backup_root || true)"
+  if [ -z "$backup_root" ]; then
+    return 0
+  fi
+  mkdir -p "$backup_root"
+  backup_dir="$(mktemp -d "$backup_root/$(basename "$(pwd)").XXXXXX")"
+  mv .codex "$backup_dir/.codex"
 }}
 
 require_workspace_support_dirs() {{
@@ -751,7 +787,7 @@ ensure_default_branch_baseline() {{
   fi
 }}
 
-prune_legacy_codex_workspace_support
+migrate_legacy_codex_workspace_support
 require_workspace_support_dirs
 adopt_seed_repo_origin
 
@@ -986,8 +1022,9 @@ Repo prompt
 
         assert!(after_create.contains("git rev-parse --git-path info/exclude"));
         assert!(after_create.contains("entry=\"$support_dir/\""));
-        assert!(after_create.contains("prune_legacy_codex_workspace_support"));
+        assert!(after_create.contains("migrate_legacy_codex_workspace_support"));
         assert!(after_create.contains("git ls-files -- .codex"));
+        assert!(after_create.contains("legacy-workspace-codex"));
         assert!(!after_create.contains("for support_dir in .codex .github; do"));
         assert!(after_create.contains("resolve_default_branch()"));
         assert!(after_create.contains("fetch_origin_branch()"));
@@ -996,8 +1033,9 @@ Repo prompt
         assert!(after_create.contains("git fetch --quiet --unshallow origin \\"));
         assert!(before_run.contains("git rev-parse --git-path info/exclude"));
         assert!(before_run.contains("entry=\"$support_dir/\""));
-        assert!(before_run.contains("prune_legacy_codex_workspace_support"));
+        assert!(before_run.contains("migrate_legacy_codex_workspace_support"));
         assert!(before_run.contains("git ls-files -- .codex"));
+        assert!(before_run.contains("legacy-workspace-codex"));
         assert!(!before_run.contains("for support_dir in .codex .github; do"));
         assert!(before_run.contains("resolve_default_branch()"));
         assert!(before_run.contains("fetch_origin_branch()"));
