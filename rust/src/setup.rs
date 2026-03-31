@@ -1824,26 +1824,44 @@ hooks:
       printf 'main\n'
     }}
 
-    ensure_default_branch_baseline() {{
-      git fetch --quiet origin "+refs/heads/*:refs/remotes/origin/*" || true
-
-      is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
-      if [ "$is_shallow" = "true" ]; then
-        git fetch --quiet --unshallow origin || true
+    fetch_origin_branch() {{
+      branch_name="$1"
+      if [ -z "$branch_name" ] || [ "$branch_name" = "HEAD" ]; then
+        return 0
       fi
+      git fetch --quiet origin "refs/heads/$branch_name:refs/remotes/origin/$branch_name" || true
+    }}
 
+    ensure_default_branch_baseline() {{
+      current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
       default_branch="$(resolve_default_branch)"
       if [ -z "$default_branch" ]; then
         return 0
       fi
 
-      git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
+      fetch_origin_branch "$default_branch"
+      if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ]; then
+        fetch_origin_branch "$current_branch"
+      fi
+
+      is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+      if [ "$is_shallow" = "true" ]; then
+        if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ] && [ "$current_branch" != "HEAD" ]; then
+          git fetch --quiet --unshallow origin \
+            "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+            "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+            || true
+        else
+          git fetch --quiet --unshallow origin \
+            "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+            || true
+        fi
+      fi
 
       if git merge-base "origin/$default_branch" HEAD >/dev/null 2>&1; then
         return 0
       fi
 
-      current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
       if [ -n "$current_branch" ] && [ "$current_branch" != "HEAD" ]; then
         git fetch --quiet origin \
           "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
@@ -1996,26 +2014,44 @@ hooks:
       printf 'main\n'
     }}
 
-    ensure_default_branch_baseline() {{
-      git fetch --quiet origin "+refs/heads/*:refs/remotes/origin/*" || true
-
-      is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
-      if [ "$is_shallow" = "true" ]; then
-        git fetch --quiet --unshallow origin || true
+    fetch_origin_branch() {{
+      branch_name="$1"
+      if [ -z "$branch_name" ] || [ "$branch_name" = "HEAD" ]; then
+        return 0
       fi
+      git fetch --quiet origin "refs/heads/$branch_name:refs/remotes/origin/$branch_name" || true
+    }}
 
+    ensure_default_branch_baseline() {{
+      current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
       default_branch="$(resolve_default_branch)"
       if [ -z "$default_branch" ]; then
         return 0
       fi
 
-      git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
+      fetch_origin_branch "$default_branch"
+      if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ]; then
+        fetch_origin_branch "$current_branch"
+      fi
+
+      is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+      if [ "$is_shallow" = "true" ]; then
+        if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ] && [ "$current_branch" != "HEAD" ]; then
+          git fetch --quiet --unshallow origin \
+            "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+            "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+            || true
+        else
+          git fetch --quiet --unshallow origin \
+            "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+            || true
+        fi
+      fi
 
       if git merge-base "origin/$default_branch" HEAD >/dev/null 2>&1; then
         return 0
       fi
 
-      current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
       if [ -n "$current_branch" ] && [ "$current_branch" != "HEAD" ]; then
         git fetch --quiet origin \
           "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
@@ -2286,10 +2322,11 @@ mod tests {
         assert!(rendered.contains("git config --get remote.origin.pushurl || true"));
         assert!(rendered.contains("http.https://github.com/.extraheader"));
         assert!(rendered.contains("resolve_default_branch()"));
-        assert!(rendered
-            .contains("git fetch --quiet origin \"+refs/heads/*:refs/remotes/origin/*\" || true"));
+        assert!(rendered.contains("fetch_origin_branch()"));
+        assert!(rendered.contains("fetch_origin_branch \"$default_branch\""));
+        assert!(rendered.contains("fetch_origin_branch \"$current_branch\""));
         assert!(rendered.contains("ensure_default_branch_baseline()"));
-        assert!(rendered.contains("git fetch --quiet --unshallow origin || true"));
+        assert!(rendered.contains("git fetch --quiet --unshallow origin \\"));
         assert!(rendered.contains("before_run: |"));
         assert!(
             rendered.contains("current_remote=\"$(git config --get remote.origin.url || true)\"")

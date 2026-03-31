@@ -506,26 +506,44 @@ resolve_default_branch() {{
   printf 'main\n'
 }}
 
-ensure_default_branch_baseline() {{
-  git fetch --quiet origin "+refs/heads/*:refs/remotes/origin/*" || true
-
-  is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
-  if [ "$is_shallow" = "true" ]; then
-    git fetch --quiet --unshallow origin || true
+fetch_origin_branch() {{
+  branch_name="$1"
+  if [ -z "$branch_name" ] || [ "$branch_name" = "HEAD" ]; then
+    return 0
   fi
+  git fetch --quiet origin "refs/heads/$branch_name:refs/remotes/origin/$branch_name" || true
+}}
 
+ensure_default_branch_baseline() {{
+  current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   default_branch="$(resolve_default_branch)"
   if [ -z "$default_branch" ]; then
     return 0
   fi
 
-  git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
+  fetch_origin_branch "$default_branch"
+  if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ]; then
+    fetch_origin_branch "$current_branch"
+  fi
+
+  is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+  if [ "$is_shallow" = "true" ]; then
+    if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ] && [ "$current_branch" != "HEAD" ]; then
+      git fetch --quiet --unshallow origin \
+        "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+        "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+        || true
+    else
+      git fetch --quiet --unshallow origin \
+        "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+        || true
+    fi
+  fi
 
   if git merge-base "origin/$default_branch" HEAD >/dev/null 2>&1; then
     return 0
   fi
 
-  current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   if [ -n "$current_branch" ] && [ "$current_branch" != "HEAD" ]; then
     git fetch --quiet origin \
       "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
@@ -685,26 +703,44 @@ resolve_default_branch() {{
   printf 'main\n'
 }}
 
-ensure_default_branch_baseline() {{
-  git fetch --quiet origin "+refs/heads/*:refs/remotes/origin/*" || true
-
-  is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
-  if [ "$is_shallow" = "true" ]; then
-    git fetch --quiet --unshallow origin || true
+fetch_origin_branch() {{
+  branch_name="$1"
+  if [ -z "$branch_name" ] || [ "$branch_name" = "HEAD" ]; then
+    return 0
   fi
+  git fetch --quiet origin "refs/heads/$branch_name:refs/remotes/origin/$branch_name" || true
+}}
 
+ensure_default_branch_baseline() {{
+  current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   default_branch="$(resolve_default_branch)"
   if [ -z "$default_branch" ]; then
     return 0
   fi
 
-  git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
+  fetch_origin_branch "$default_branch"
+  if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ]; then
+    fetch_origin_branch "$current_branch"
+  fi
+
+  is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+  if [ "$is_shallow" = "true" ]; then
+    if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ] && [ "$current_branch" != "HEAD" ]; then
+      git fetch --quiet --unshallow origin \
+        "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+        "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+        || true
+    else
+      git fetch --quiet --unshallow origin \
+        "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+        || true
+    fi
+  fi
 
   if git merge-base "origin/$default_branch" HEAD >/dev/null 2>&1; then
     return 0
   fi
 
-  current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   if [ -n "$current_branch" ] && [ "$current_branch" != "HEAD" ]; then
     git fetch --quiet origin \
       "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
@@ -737,9 +773,9 @@ git config user.email "${{KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.gi
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
 
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
 
     use crate::config::Settings;
     use crate::model::{Issue, WorkflowDefinition};
@@ -750,7 +786,7 @@ mod tests {
         run_after_run_hook, run_hook, sanitize_workspace_key,
     };
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     fn test_settings(root: &Path) -> Settings {
         let definition = WorkflowDefinition {
@@ -800,7 +836,7 @@ workspace:
 
     #[tokio::test]
     async fn workspace_paths_are_sanitized_and_reused() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
         let dir = tempdir().unwrap();
         let settings = test_settings(dir.path());
@@ -819,7 +855,7 @@ workspace:
 
     #[tokio::test]
     async fn removes_target_issue_workspace_only() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
         let dir = tempdir().unwrap();
         let settings = test_settings(dir.path());
@@ -834,7 +870,7 @@ workspace:
 
     #[tokio::test]
     async fn hook_commands_get_workspace_local_cargo_home() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
         let dir = tempdir().unwrap();
         let settings = test_settings(dir.path());
@@ -859,7 +895,7 @@ workspace:
 
     #[tokio::test]
     async fn hook_commands_get_runtime_tool_cache_env_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
         std::env::remove_var("XDG_CACHE_HOME");
         std::env::remove_var("COREPACK_HOME");
@@ -888,7 +924,7 @@ workspace:
 
     #[tokio::test]
     async fn after_run_hook_errors_are_returned() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
         let dir = tempdir().unwrap();
         let mut settings = test_settings(dir.path());
@@ -906,7 +942,7 @@ workspace:
 
     #[test]
     fn docker_repo_workflow_defaults_when_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.blocking_lock();
         std::env::set_var("KAIRASTRA_DEPLOY_MODE", "docker");
         let dir = tempdir().unwrap();
 
@@ -919,7 +955,7 @@ workspace:
 
     #[test]
     fn docker_repo_workflow_loads_repo_root_workflow() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.blocking_lock();
         std::env::set_var("KAIRASTRA_DEPLOY_MODE", "docker");
         let dir = tempdir().unwrap();
         fs::write(
@@ -954,18 +990,18 @@ Repo prompt
         assert!(after_create.contains("git ls-files -- .codex"));
         assert!(!after_create.contains("for support_dir in .codex .github; do"));
         assert!(after_create.contains("resolve_default_branch()"));
-        assert!(after_create
-            .contains("git fetch --quiet origin \"+refs/heads/*:refs/remotes/origin/*\" || true"));
-        assert!(after_create.contains("git fetch --quiet origin \"refs/heads/$default_branch:refs/remotes/origin/$default_branch\""));
-        assert!(after_create.contains("git fetch --quiet --unshallow origin || true"));
+        assert!(after_create.contains("fetch_origin_branch()"));
+        assert!(after_create.contains("fetch_origin_branch \"$default_branch\""));
+        assert!(after_create.contains("fetch_origin_branch \"$current_branch\""));
+        assert!(after_create.contains("git fetch --quiet --unshallow origin \\"));
         assert!(before_run.contains("git rev-parse --git-path info/exclude"));
         assert!(before_run.contains("entry=\"$support_dir/\""));
         assert!(before_run.contains("prune_legacy_codex_workspace_support"));
         assert!(before_run.contains("git ls-files -- .codex"));
         assert!(!before_run.contains("for support_dir in .codex .github; do"));
         assert!(before_run.contains("resolve_default_branch()"));
-        assert!(before_run
-            .contains("git fetch --quiet origin \"+refs/heads/*:refs/remotes/origin/*\" || true"));
+        assert!(before_run.contains("fetch_origin_branch()"));
+        assert!(before_run.contains("git fetch --quiet --unshallow origin \\"));
         assert!(before_run.contains("ensure_default_branch_baseline"));
     }
 }

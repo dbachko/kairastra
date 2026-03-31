@@ -837,7 +837,7 @@ fn strip_ansi_sequences(input: &str) -> String {
         if ch == '\u{1b}' {
             if matches!(chars.peek(), Some('[')) {
                 chars.next();
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     if next.is_ascii_alphabetic() {
                         break;
                     }

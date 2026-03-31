@@ -94,10 +94,16 @@ EOF
 }
 
 sync_codex_seed_skills() {
-  local seed_skills_dir="${KAIRASTRA_SEED_REPO:-}/.codex/skills"
+  local seed_repo="${KAIRASTRA_SEED_REPO:-}"
+  local seed_skills_dir="$seed_repo/.codex/skills"
   local target_skills_dir="$codex_auth_dir/skills"
 
+  if [[ -z "$seed_repo" ]]; then
+    return 0
+  fi
+
   if [[ ! -d "$seed_skills_dir" ]]; then
+    rm -rf "$target_skills_dir"
     return 0
   fi
 

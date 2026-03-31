@@ -243,7 +243,7 @@ sync_seed_volume() {
   docker_compose run --rm --entrypoint bash \
     -v "$repo_dir:/seed-src:ro" \
     -v "${compose_project}_kairastra_seed:/seed-dest" \
-    kairastra -lc 'set -euo pipefail; mkdir -p /seed-dest; rsync -a --delete /seed-src/ /seed-dest/; chmod -R a+rX /seed-dest'
+    kairastra -lc 'set -euo pipefail; mkdir -p /seed-dest; rsync -a --delete --chmod=a+rX /seed-src/ /seed-dest/'
 }
 
 setup_required=false

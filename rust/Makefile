@@ -32,7 +32,7 @@ docker-setup: docker-build docker-clean-oneoff
 	$(DOCKER_COMPOSE) run --rm --remove-orphans -v $(ENV_FILE_DIR):/config-state $(SERVICE) setup --mode docker --workflow /config/WORKFLOW.md --env-file /config-state/$(ENV_FILE_BASENAME)
 
 docker-sync-seed: docker-build docker-clean-oneoff
-	$(DOCKER_COMPOSE) run --rm --remove-orphans --entrypoint bash -v $(HOST_REPO_ROOT):/seed-src:ro -v $(SEED_VOLUME):/seed-dest $(SERVICE) -lc 'set -euo pipefail; mkdir -p /seed-dest; rsync -a --delete /seed-src/ /seed-dest/; chmod -R a+rX /seed-dest'
+	$(DOCKER_COMPOSE) run --rm --remove-orphans --entrypoint bash -v $(HOST_REPO_ROOT):/seed-src:ro -v $(SEED_VOLUME):/seed-dest $(SERVICE) -lc 'set -euo pipefail; mkdir -p /seed-dest; rsync -a --delete --chmod=a+rX /seed-src/ /seed-dest/'
 
 docker-config-export: docker-build docker-clean-oneoff
 	@if [ -z "$(DEST)" ]; then \
