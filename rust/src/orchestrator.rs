@@ -1215,16 +1215,7 @@ fn log_codex_notification(issue_identifier: &str, payload: &serde_json::Value) {
 
             match item_type {
                 "commandExecution" => {
-                    let command = item
-                        .get("command")
-                        .and_then(serde_json::Value::as_array)
-                        .map(|argv| {
-                            argv.iter()
-                                .filter_map(serde_json::Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .unwrap_or_default();
+                    let command = extract_codex_command(item);
                     info!(
                         issue_identifier = %issue_identifier,
                         command,
@@ -1285,18 +1276,64 @@ fn log_codex_notification(issue_identifier: &str, payload: &serde_json::Value) {
                 .get("type")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
-            warn!(
-                issue_identifier = %issue_identifier,
-                item_type,
-                status,
-                payload = %payload,
-                "codex item completed unsuccessfully"
-            );
+            let command = extract_codex_command(item);
+            let tool = item
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let server = item
+                .get("server")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let exit_code = json_i64(
+                item.get("exitCode")
+                    .or_else(|| item.get("exit_code"))
+                    .unwrap_or(&JsonValue::Null),
+            )
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+            let detail = codex_item_failure_excerpt(item);
+            if codex_item_failure_is_expected_probe(&command, &exit_code, &detail) {
+                debug!(
+                    issue_identifier = %issue_identifier,
+                    item_type,
+                    status,
+                    command,
+                    tool,
+                    server,
+                    exit_code,
+                    "codex probe completed without a match"
+                );
+            } else {
+                warn!(
+                    issue_identifier = %issue_identifier,
+                    item_type,
+                    status,
+                    command,
+                    tool,
+                    server,
+                    exit_code,
+                    detail,
+                    "codex item completed unsuccessfully"
+                );
+            }
         }
         "error" => {
+            let error_type = payload
+                .get("params")
+                .and_then(|params| params.get("error"))
+                .and_then(|error| error.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let detail = payload
+                .get("params")
+                .and_then(|params| params.get("error"))
+                .and_then(json_value_excerpt)
+                .unwrap_or_else(|| truncate_summary(&payload.to_string(), 240));
             warn!(
                 issue_identifier = %issue_identifier,
-                payload = %payload,
+                error_type,
+                detail,
                 "codex error notification"
             );
         }
@@ -1350,12 +1387,103 @@ fn summarize_agent_event(event: &AgentEvent) -> String {
 }
 
 fn truncate_summary(value: &str, limit: usize) -> String {
-    let mut truncated = value.trim().to_string();
-    if truncated.len() > limit {
-        truncated.truncate(limit.saturating_sub(3));
-        truncated.push_str("...");
+    truncate_utf8(value.trim(), limit)
+}
+
+fn truncate_utf8(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
     }
+
+    if limit <= 3 {
+        return utf8_prefix(value, limit).to_string();
+    }
+
+    let mut truncated = utf8_prefix(value, limit.saturating_sub(3)).to_string();
+    truncated.push_str("...");
     truncated
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = 0;
+    for (index, ch) in value.char_indices() {
+        let next = index + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+
+    &value[..end]
+}
+
+fn extract_codex_command(item: &JsonValue) -> String {
+    if let Some(command) = item.get("command").and_then(serde_json::Value::as_str) {
+        return truncate_summary(command, 240);
+    }
+
+    if let Some(command) = item
+        .get("params")
+        .and_then(|params| params.get("command"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return truncate_summary(command, 240);
+    }
+
+    if let Some(argv) = item.get("command").and_then(serde_json::Value::as_array) {
+        let command = argv
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        return truncate_summary(&command, 240);
+    }
+
+    String::new()
+}
+
+fn codex_item_failure_excerpt(item: &JsonValue) -> String {
+    item.get("aggregatedOutput")
+        .or_else(|| item.get("aggregated_output"))
+        .or_else(|| item.get("output"))
+        .or_else(|| item.get("stderr"))
+        .or_else(|| item.get("error"))
+        .or_else(|| item.get("message"))
+        .and_then(json_value_excerpt)
+        .unwrap_or_default()
+}
+
+fn codex_item_failure_is_expected_probe(command: &str, exit_code: &str, detail: &str) -> bool {
+    if exit_code != "1" || !detail.is_empty() {
+        return false;
+    }
+
+    let lower = command.to_ascii_lowercase();
+    lower.contains("test -e ")
+        || lower.contains("test -d ")
+        || lower.contains("test -f ")
+        || lower.contains("rg ")
+        || lower.contains("grep -q ")
+}
+
+fn json_value_excerpt(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::Null => None,
+        JsonValue::String(text) => Some(truncate_summary(text, 240)),
+        other => Some(truncate_summary(&other.to_string(), 240)),
+    }
+}
+
+fn json_i64(value: &JsonValue) -> Option<i64> {
+    match value {
+        JsonValue::Number(number) => number.as_i64(),
+        JsonValue::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
 }
 
 fn apply_token_usage(running: &mut RunningEntry, current: TokenUsage) -> TokenUsage {
@@ -1718,10 +1846,7 @@ fn render_blocker_section(
 
 fn summarize_worker_error(error: &str) -> String {
     let mut summary = error.split_whitespace().collect::<Vec<_>>().join(" ");
-    if summary.len() > 400 {
-        summary.truncate(397);
-        summary.push_str("...");
-    }
+    summary = truncate_utf8(&summary, 400);
     summary
 }
 
@@ -1730,11 +1855,7 @@ fn render_worker_error_details(error: &str) -> String {
     if details.is_empty() {
         details = "No additional error details were captured.".to_string();
     }
-    if details.len() > 4_000 {
-        details.truncate(3_997);
-        details.push_str("...");
-    }
-    details
+    truncate_utf8(&details, 4_000)
 }
 
 fn merge_blocker_section(existing_body: &str, blocker_section: &str) -> String {
@@ -1953,15 +2074,18 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::agent::events::{AgentEvent, AgentEventKind};
     use crate::config::Settings;
     use crate::model::{BlockerRef, Issue, WorkflowDefinition};
 
     use super::{
-        classify_blocked_worker_failure, classify_provider_selection_block, extract_rate_limits,
+        classify_blocked_worker_failure, classify_provider_selection_block,
+        codex_item_failure_is_expected_probe, extract_codex_command, extract_rate_limits,
         extract_token_usage, hold_blocked_claim, issue_eligible, issue_provider, issue_sort_key,
         merge_blocker_section, render_blocked_failure_workpad, select_dispatchable,
-        should_release_blocked_claim, tool_log_fields, usage_delta, IssueProviderSelection,
-        RuntimeState, TokenUsage, BLOCKER_SECTION_END, BLOCKER_SECTION_START,
+        should_release_blocked_claim, summarize_agent_event, summarize_worker_error,
+        tool_log_fields, truncate_summary, usage_delta, IssueProviderSelection, RuntimeState,
+        TokenUsage, BLOCKER_SECTION_END, BLOCKER_SECTION_START,
     };
     use crate::workflow::WorkflowSnapshot;
 
@@ -2297,6 +2421,84 @@ providers:
         .expect("Claude auth failures should block");
 
         assert!(blocked.operator_action.contains("Configure Claude auth"));
+    }
+
+    #[test]
+    fn truncate_summary_keeps_valid_utf8() {
+        let summary = truncate_summary("hello café こんにちは", 11);
+        assert!(summary.starts_with("hello "));
+        assert!(summary.ends_with("..."));
+        assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn summarize_agent_event_handles_multibyte_payloads() {
+        let event = AgentEvent {
+            event: AgentEventKind::Notification,
+            timestamp: chrono::Utc::now(),
+            payload: json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "aggregatedOutput": "こんにちは".repeat(40)
+                    }
+                }
+            }),
+            session_id: None,
+            agent_process_pid: None,
+        };
+
+        let summary = summarize_agent_event(&event);
+        assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
+        assert!(summary.contains("notification (item/completed)"));
+    }
+
+    #[test]
+    fn summarize_worker_error_handles_multibyte_text() {
+        let error = "mañana ".repeat(200);
+        let summary = summarize_worker_error(&error);
+        assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
+        assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn extracts_codex_command_from_string_or_array_payloads() {
+        assert_eq!(
+            extract_codex_command(&json!({"command": "/bin/bash -lc 'rg todo'"})),
+            "/bin/bash -lc 'rg todo'"
+        );
+        assert_eq!(
+            extract_codex_command(&json!({"command": ["rg", "--files"]})),
+            "rg --files"
+        );
+        assert_eq!(
+            extract_codex_command(&json!({"params": {"command": "gh pr view"}})),
+            "gh pr view"
+        );
+    }
+
+    #[test]
+    fn downgrades_expected_probe_failures() {
+        assert!(codex_item_failure_is_expected_probe(
+            "/bin/bash -lc \"test -e packages/libs/database/dist && find packages/libs/database/dist -maxdepth 2 -type f | sed -n '1,40p'\"",
+            "1",
+            ""
+        ));
+        assert!(codex_item_failure_is_expected_probe(
+            "/bin/bash -lc \"rg -n 'needle' packages/apps\"",
+            "1",
+            ""
+        ));
+        assert!(!codex_item_failure_is_expected_probe(
+            "/bin/bash -lc 'ls packages/libs/database/dist'",
+            "1",
+            ""
+        ));
+        assert!(!codex_item_failure_is_expected_probe(
+            "/bin/bash -lc \"rg -n 'needle' packages/apps\"",
+            "2",
+            ""
+        ));
     }
 
     #[test]

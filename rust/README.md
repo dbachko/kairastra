@@ -256,13 +256,18 @@ Notes:
 - To test this bootstrap flow from a local checkout before merging, run `make docker-bootstrap-local`
   from `rust/`. That wrapper uses your local `scripts/install-remote-docker.sh`, points `--repo` at the
   local checkout, and defaults `--ref` to the current branch or detached `HEAD`.
+- In that local bootstrap path, `--repo` is only the Kairastra control-plane source. The setup prompt
+  `GitHub repo to manage` still decides which repository issue workspaces should clone and edit.
+- Use `make docker-bootstrap-local-logs` to follow logs from that local bootstrap install.
 - Override `LOCAL_BOOTSTRAP_INSTALL_DIR`, `LOCAL_BOOTSTRAP_REF`, `RECONFIGURE=1`, or `SKIP_AUTH=1` as
   needed, for example:
 
 ```bash
 make docker-bootstrap-local RECONFIGURE=1
+make docker-bootstrap-local-logs
 make docker-bootstrap-local SKIP_AUTH=1
 make docker-bootstrap-local LOCAL_BOOTSTRAP_INSTALL_DIR=~/kairastra-test
+make docker-bootstrap-local-logs LOCAL_BOOTSTRAP_INSTALL_DIR=~/kairastra-test
 ```
 
 - The local bootstrap wrapper still clones the repo, so uncommitted working-tree changes are not included
@@ -415,7 +420,7 @@ What setup asks for:
 - provider auth path to optimize for
 - optional Codex model override
 - optional Codex thinking effort override: `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`
-- whether to force Codex fast mode on
+- optional Codex fast-mode override via `KAIRASTRA_CODEX_FAST`
 - optional Claude model override
 - optional Claude thinking effort override: `low`, `medium`, or `high`
 - optional Gemini model override
@@ -639,8 +644,8 @@ Provider runtime controls:
 - `providers.codex.model` sets the model Kairastra requests for the thread and subsequent turns.
 - `providers.codex.reasoning_effort` controls thinking depth. Valid values are `none`, `minimal`, `low`,
   `medium`, `high`, and `xhigh`.
-- `providers.codex.fast` is a boolean. `true` maps to Codex `serviceTier=fast`; `false` maps to
-  `serviceTier=flex`.
+- `providers.codex.fast` is optional. Leave it unset to omit Codex `serviceTier`; set `true` for
+  `serviceTier=fast`; set `false` only when you intentionally want `serviceTier=flex`.
 - `providers.claude.model` and `providers.claude.reasoning_effort` control Claude Code selection and depth.
 - `providers.gemini.model` sets the Gemini model override.
 - `providers.gemini.approval_mode` controls Gemini CLI approval handling. Valid values are `default`, `auto_edit`, `yolo`, and `plan`.

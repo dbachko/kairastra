@@ -416,13 +416,7 @@ async fn collect_values(
     } else {
         "/seed-repo".to_string()
     };
-    let default_git_clone_url =
-        default_target_clone_url(&env_git_clone_url, &github_owner, &github_repo);
-    let git_clone_url = if env_git_clone_url.trim().is_empty() {
-        default_git_clone_url
-    } else {
-        env_git_clone_url
-    };
+    let git_clone_url = default_target_clone_url(&env_git_clone_url, &github_owner, &github_repo);
     let assignee_login = std::env::var("KAIRASTRA_AGENT_ASSIGNEE").unwrap_or_default();
     let max_concurrent_agents = "4".to_string();
     let max_turns = "20".to_string();
@@ -803,7 +797,7 @@ fn project_status_help_lines(topic: ProjectStatusHelpTopic) -> Vec<&'static str>
         ],
         ProjectStatusHelpTopic::ActiveStates => vec![
             "- Pick the Project statuses Kairastra should treat as still in the working queue.",
-            "- Issues in these statuses remain eligible for dispatch until they move to a terminal state.",
+            "- Only items in these active states are polled and dispatched until they move to a terminal state.",
         ],
         ProjectStatusHelpTopic::TerminalStates => vec![
             "- Pick the statuses Kairastra should treat as final or no longer dispatchable.",
@@ -1614,7 +1608,8 @@ Docker deployment config.
 
 Workspace prompts and repo-local hooks come from `<repo>/WORKFLOW.md` inside each workspace when
 present. When a repo does not define that file, Kairastra uses its built-in default workspace
-workflow.
+workflow. Provider-specific Codex skills are synced into the agent home and do not live in the
+managed repo checkout.
 "#,
             tracker_block = tracker_block,
             provider = values.provider,
@@ -1762,6 +1757,30 @@ hooks:
       fi
     }}
 
+    exclude_workspace_support_dir() {{
+      support_dir="$1"
+      exclude_path="$(git rev-parse --git-path info/exclude 2>/dev/null || true)"
+      if [ -z "$exclude_path" ]; then
+        return 0
+      fi
+      mkdir -p "$(dirname "$exclude_path")"
+      touch "$exclude_path"
+      entry="$support_dir/"
+      if ! grep -Fqx "$entry" "$exclude_path" 2>/dev/null; then
+        printf '%s\n' "$entry" >> "$exclude_path"
+      fi
+    }}
+
+    prune_legacy_codex_workspace_support() {{
+      if [ ! -e ".codex" ]; then
+        return 0
+      fi
+      if git ls-files -- .codex 2>/dev/null | grep -q .; then
+        return 0
+      fi
+      rm -rf .codex
+    }}
+
     require_workspace_support_dirs() {{
       for support_dir in {support_dirs}; do
         restore_support_dir_from_seed "$support_dir"
@@ -1769,6 +1788,7 @@ hooks:
           echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
           exit 1
         fi
+        exclude_workspace_support_dir "$support_dir"
       done
     }}
 
@@ -1780,6 +1800,57 @@ hooks:
       current_remote="$(git config --get remote.origin.url || true)"
       if [ -n "$source_remote" ] && {{ [ "$current_remote" = "$KAIRASTRA_SEED_REPO" ] || [ -z "$current_remote" ]; }}; then
         git remote set-url origin "$source_remote"
+      fi
+    }}
+
+    resolve_default_branch() {{
+      if [ -n "${{KAIRASTRA_GIT_DEFAULT_BRANCH:-}}" ]; then
+        printf '%s\n' "${{KAIRASTRA_GIT_DEFAULT_BRANCH}}"
+        return 0
+      fi
+
+      remote_head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+      if [ -n "$remote_head" ]; then
+        printf '%s\n' "${{remote_head#origin/}}"
+        return 0
+      fi
+
+      remote_head="$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | head -n 1)"
+      if [ -n "$remote_head" ]; then
+        printf '%s\n' "$remote_head"
+        return 0
+      fi
+
+      printf 'main\n'
+    }}
+
+    ensure_default_branch_baseline() {{
+      git fetch --quiet origin "+refs/heads/*:refs/remotes/origin/*" || true
+
+      is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+      if [ "$is_shallow" = "true" ]; then
+        git fetch --quiet --unshallow origin || true
+      fi
+
+      default_branch="$(resolve_default_branch)"
+      if [ -z "$default_branch" ]; then
+        return 0
+      fi
+
+      git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
+
+      if git merge-base "origin/$default_branch" HEAD >/dev/null 2>&1; then
+        return 0
+      fi
+
+      current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+      if [ -n "$current_branch" ] && [ "$current_branch" != "HEAD" ]; then
+        git fetch --quiet origin \
+          "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+          "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+          || true
+      else
+        git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
       fi
     }}
 
@@ -1800,8 +1871,10 @@ hooks:
       git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
     fi
 
+    prune_legacy_codex_workspace_support
     require_workspace_support_dirs
     configure_github_auth
+    ensure_default_branch_baseline
 
     git config user.name "${{KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}}"
     git config user.email "${{KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}}"
@@ -1820,6 +1893,30 @@ hooks:
       fi
     }}
 
+    exclude_workspace_support_dir() {{
+      support_dir="$1"
+      exclude_path="$(git rev-parse --git-path info/exclude 2>/dev/null || true)"
+      if [ -z "$exclude_path" ]; then
+        return 0
+      fi
+      mkdir -p "$(dirname "$exclude_path")"
+      touch "$exclude_path"
+      entry="$support_dir/"
+      if ! grep -Fqx "$entry" "$exclude_path" 2>/dev/null; then
+        printf '%s\n' "$entry" >> "$exclude_path"
+      fi
+    }}
+
+    prune_legacy_codex_workspace_support() {{
+      if [ ! -e ".codex" ]; then
+        return 0
+      fi
+      if git ls-files -- .codex 2>/dev/null | grep -q .; then
+        return 0
+      fi
+      rm -rf .codex
+    }}
+
     require_workspace_support_dirs() {{
       for support_dir in {support_dirs}; do
         restore_support_dir_from_seed "$support_dir"
@@ -1827,6 +1924,7 @@ hooks:
           echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
           exit 1
         fi
+        exclude_workspace_support_dir "$support_dir"
       done
     }}
 
@@ -1877,6 +1975,58 @@ hooks:
       fi
     }}
 
+    resolve_default_branch() {{
+      if [ -n "${{KAIRASTRA_GIT_DEFAULT_BRANCH:-}}" ]; then
+        printf '%s\n' "${{KAIRASTRA_GIT_DEFAULT_BRANCH}}"
+        return 0
+      fi
+
+      remote_head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+      if [ -n "$remote_head" ]; then
+        printf '%s\n' "${{remote_head#origin/}}"
+        return 0
+      fi
+
+      remote_head="$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | head -n 1)"
+      if [ -n "$remote_head" ]; then
+        printf '%s\n' "$remote_head"
+        return 0
+      fi
+
+      printf 'main\n'
+    }}
+
+    ensure_default_branch_baseline() {{
+      git fetch --quiet origin "+refs/heads/*:refs/remotes/origin/*" || true
+
+      is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+      if [ "$is_shallow" = "true" ]; then
+        git fetch --quiet --unshallow origin || true
+      fi
+
+      default_branch="$(resolve_default_branch)"
+      if [ -z "$default_branch" ]; then
+        return 0
+      fi
+
+      git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
+
+      if git merge-base "origin/$default_branch" HEAD >/dev/null 2>&1; then
+        return 0
+      fi
+
+      current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+      if [ -n "$current_branch" ] && [ "$current_branch" != "HEAD" ]; then
+        git fetch --quiet origin \
+          "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+          "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+          || true
+      else
+        git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
+      fi
+    }}
+
+    prune_legacy_codex_workspace_support
     require_workspace_support_dirs
     adopt_seed_repo_origin
 
@@ -1885,6 +2035,7 @@ hooks:
     fi
 
     configure_github_auth
+    ensure_default_branch_baseline
 
     git config user.name "${{KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}}"
     git config user.email "${{KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}}"
@@ -2069,7 +2220,7 @@ mod tests {
                     auth_mode: crate::auth::AuthMode::Subscription,
                     model: "gpt-5.4".to_string(),
                     reasoning_effort: "high".to_string(),
-                    fast: true,
+                    fast: Some(true),
                 }),
                 ProviderSetupConfig::Claude(ClaudeSetupConfig {
                     auth_mode: crate::auth::AuthMode::ApiKey,
@@ -2120,7 +2271,12 @@ mod tests {
         assert!(rendered.contains("reasoning_effort: $KAIRASTRA_CLAUDE_REASONING_EFFORT"));
         assert!(rendered.contains("approval_mode: $KAIRASTRA_GEMINI_APPROVAL_MODE"));
         assert!(rendered.contains("fast: $KAIRASTRA_CODEX_FAST"));
-        assert!(rendered.contains("for support_dir in .codex .github; do"));
+        assert!(rendered.contains("for support_dir in .github; do"));
+        assert!(!rendered.contains("for support_dir in .codex .github; do"));
+        assert!(rendered.contains("git rev-parse --git-path info/exclude"));
+        assert!(rendered.contains("entry=\"$support_dir/\""));
+        assert!(rendered.contains("prune_legacy_codex_workspace_support"));
+        assert!(rendered.contains("git ls-files -- .codex"));
         assert!(
             rendered.contains("Workspace bootstrap missing required repository support directory")
         );
@@ -2129,6 +2285,11 @@ mod tests {
         assert!(rendered.contains("git remote set-url --push origin \"$KAIRASTRA_GIT_PUSH_URL\""));
         assert!(rendered.contains("git config --get remote.origin.pushurl || true"));
         assert!(rendered.contains("http.https://github.com/.extraheader"));
+        assert!(rendered.contains("resolve_default_branch()"));
+        assert!(rendered
+            .contains("git fetch --quiet origin \"+refs/heads/*:refs/remotes/origin/*\" || true"));
+        assert!(rendered.contains("ensure_default_branch_baseline()"));
+        assert!(rendered.contains("git fetch --quiet --unshallow origin || true"));
         assert!(rendered.contains("before_run: |"));
         assert!(
             rendered.contains("current_remote=\"$(git config --get remote.origin.url || true)\"")
@@ -2145,7 +2306,7 @@ mod tests {
 
         let rendered = render_workflow(DeployMode::Native, &values);
         assert!(rendered.contains("provider: claude"));
-        assert!(rendered.contains("for support_dir in .codex .github; do"));
+        assert!(rendered.contains("for support_dir in .github; do"));
         assert!(rendered.contains("  codex:"));
         assert!(rendered.contains("  claude:"));
         assert!(rendered.contains("  gemini:"));
@@ -2157,6 +2318,7 @@ mod tests {
     fn docker_workflow_describes_repo_owned_workspace_behavior() {
         let rendered = render_workflow(DeployMode::Docker, &sample_values());
         assert!(rendered.contains("Workspace prompts and repo-local hooks come from"));
+        assert!(rendered.contains("Codex skills are synced into the agent home"));
         assert!(!rendered.contains("before_run: |"));
     }
 
@@ -2225,24 +2387,28 @@ mod tests {
     #[test]
     fn default_clone_url_prefers_selected_target_repo() {
         assert_eq!(
-            super::default_target_clone_url("", "dbachko", "postolio"),
-            "https://github.com/dbachko/postolio.git"
+            super::default_target_clone_url("", "acme", "target-repo"),
+            "https://github.com/acme/target-repo.git"
+        );
+        assert_eq!(
+            super::default_target_clone_url("/tmp/bootstrap-source-repo", "acme", "target-repo"),
+            "https://github.com/acme/target-repo.git"
         );
         assert_eq!(
             super::default_target_clone_url(
-                "https://github.com/dbachko/kairastra.git",
-                "dbachko",
-                "postolio"
+                "https://github.com/acme/bootstrap-source.git",
+                "acme",
+                "target-repo"
             ),
-            "https://github.com/dbachko/postolio.git"
+            "https://github.com/acme/target-repo.git"
         );
         assert_eq!(
             super::default_target_clone_url(
-                "git@github.com:dbachko/postolio.git",
-                "dbachko",
-                "postolio"
+                "git@github.com:acme/target-repo.git",
+                "acme",
+                "target-repo"
             ),
-            "git@github.com:dbachko/postolio.git"
+            "git@github.com:acme/target-repo.git"
         );
     }
 
@@ -2427,7 +2593,7 @@ mod tests {
             .join("\n");
 
         assert!(lines.contains("working queue"));
-        assert!(lines.contains("eligible for dispatch"));
+        assert!(lines.contains("Only items in these active states are polled and dispatched"));
         assert!(lines.contains("terminal state"));
     }
 

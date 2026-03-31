@@ -176,7 +176,7 @@ pub fn render_env_provider_section(mode: DeployMode, config: &ProviderSetupConfi
 pub fn repo_support_dirs(provider: &str) -> Result<&'static [&'static str]> {
     match provider {
         "claude" => Ok(&[".github"]),
-        "codex" => Ok(&[".codex", ".github"]),
+        "codex" => Ok(&[".github"]),
         "gemini" => Ok(&[".github"]),
         other => Err(anyhow!("unsupported_agent_provider: {other}")),
     }
@@ -192,8 +192,9 @@ pub enum ProviderSetupConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_workpad_comment, setup_provider_id, workpad_header, ProviderSetupConfig,
-        AGENT_WORKPAD_HEADER, CLAUDE_WORKPAD_HEADER, CODEX_WORKPAD_HEADER, GEMINI_WORKPAD_HEADER,
+        is_workpad_comment, repo_support_dirs, setup_provider_id, workpad_header,
+        ProviderSetupConfig, AGENT_WORKPAD_HEADER, CLAUDE_WORKPAD_HEADER, CODEX_WORKPAD_HEADER,
+        GEMINI_WORKPAD_HEADER,
     };
 
     #[test]
@@ -219,7 +220,7 @@ mod tests {
             auth_mode: crate::auth::AuthMode::Auto,
             model: String::new(),
             reasoning_effort: String::new(),
-            fast: false,
+            fast: None,
         });
         let claude =
             ProviderSetupConfig::Claude(crate::providers::claude::setup::ClaudeSetupConfig {
@@ -237,5 +238,10 @@ mod tests {
         assert_eq!(setup_provider_id(&codex), "codex");
         assert_eq!(setup_provider_id(&claude), "claude");
         assert_eq!(setup_provider_id(&gemini), "gemini");
+    }
+
+    #[test]
+    fn codex_repo_support_dirs_only_require_repo_owned_files() {
+        assert_eq!(repo_support_dirs("codex").unwrap(), &[".github"]);
     }
 }

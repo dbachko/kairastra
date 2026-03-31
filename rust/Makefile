@@ -8,12 +8,16 @@ ENV_FILE_BASENAME := $(notdir $(ENV_FILE))
 HOST_REPO_ROOT := $(abspath ..)
 LOCAL_BOOTSTRAP_REF ?= $(shell git -C "$(HOST_REPO_ROOT)" symbolic-ref --quiet --short HEAD 2>/dev/null || git -C "$(HOST_REPO_ROOT)" rev-parse HEAD 2>/dev/null || echo HEAD)
 LOCAL_BOOTSTRAP_INSTALL_DIR ?= $(HOME)/kairastra-local-bootstrap
+LOCAL_BOOTSTRAP_INSTALL_DIR_RESOLVED := $(if $(filter ~%,$(LOCAL_BOOTSTRAP_INSTALL_DIR)),$(HOME)$(patsubst ~%,%,$(LOCAL_BOOTSTRAP_INSTALL_DIR)),$(LOCAL_BOOTSTRAP_INSTALL_DIR))
+LOCAL_BOOTSTRAP_COMPOSE_PROJECT_BASENAME := $(notdir $(LOCAL_BOOTSTRAP_INSTALL_DIR_RESOLVED))
+LOCAL_BOOTSTRAP_COMPOSE_PROJECT ?= $(shell printf '%s' '$(LOCAL_BOOTSTRAP_COMPOSE_PROJECT_BASENAME)' | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed -e 's/^-*//' -e 's/-*$$//' -e 's/^$$/kairastra/')
 CONFIG_VOLUME := $(COMPOSE_PROJECT)_kairastra_config
 SEED_VOLUME := $(COMPOSE_PROJECT)_kairastra_seed
 
 DOCKER_COMPOSE := docker compose -p $(COMPOSE_PROJECT) -f $(COMPOSE_FILE) --env-file $(ENV_FILE)
+LOCAL_BOOTSTRAP_DOCKER_COMPOSE := docker compose -p $(LOCAL_BOOTSTRAP_COMPOSE_PROJECT) -f $(LOCAL_BOOTSTRAP_INSTALL_DIR_RESOLVED)/repo/rust/compose.yml --env-file $(LOCAL_BOOTSTRAP_INSTALL_DIR_RESOLVED)/config/docker.env
 
-.PHONY: docker-build docker-up docker-down docker-logs docker-login docker-login-codex docker-login-claude docker-login-gemini docker-clean-oneoff docker-doctor docker-setup docker-sync-seed docker-config-export docker-config-import docker-bootstrap-local
+.PHONY: docker-build docker-up docker-down docker-logs docker-login docker-login-codex docker-login-claude docker-login-gemini docker-clean-oneoff docker-doctor docker-setup docker-sync-seed docker-config-export docker-config-import docker-bootstrap-local docker-bootstrap-local-logs
 
 docker-clean-oneoff:
 	@ids="$$(docker ps -aq --filter label=com.docker.compose.project=$(COMPOSE_PROJECT) --filter label=com.docker.compose.oneoff=True)"; \
@@ -28,7 +32,7 @@ docker-setup: docker-build docker-clean-oneoff
 	$(DOCKER_COMPOSE) run --rm --remove-orphans -v $(ENV_FILE_DIR):/config-state $(SERVICE) setup --mode docker --workflow /config/WORKFLOW.md --env-file /config-state/$(ENV_FILE_BASENAME)
 
 docker-sync-seed: docker-build docker-clean-oneoff
-	$(DOCKER_COMPOSE) run --rm --remove-orphans --entrypoint bash -v $(HOST_REPO_ROOT):/seed-src:ro -v $(SEED_VOLUME):/seed-dest $(SERVICE) -lc 'set -euo pipefail; mkdir -p /seed-dest; rsync -a --delete /seed-src/ /seed-dest/'
+	$(DOCKER_COMPOSE) run --rm --remove-orphans --entrypoint bash -v $(HOST_REPO_ROOT):/seed-src:ro -v $(SEED_VOLUME):/seed-dest $(SERVICE) -lc 'set -euo pipefail; mkdir -p /seed-dest; rsync -a --delete /seed-src/ /seed-dest/; chmod -R a+rX /seed-dest'
 
 docker-config-export: docker-build docker-clean-oneoff
 	@if [ -z "$(DEST)" ]; then \
@@ -83,7 +87,7 @@ docker-bootstrap-local:
 	  extra_args="$$extra_args --skip-auth"; \
 	fi; \
 	echo "Running local bootstrap test from $(HOST_REPO_ROOT)"; \
-	echo "  install dir: $(LOCAL_BOOTSTRAP_INSTALL_DIR)"; \
+	echo "  install dir: $(LOCAL_BOOTSTRAP_INSTALL_DIR_RESOLVED)"; \
 	echo "  ref: $(LOCAL_BOOTSTRAP_REF)"; \
 	echo "  extra args: $${extra_args:-<none>}"; \
 	if ! git -C "$(HOST_REPO_ROOT)" diff --quiet --ignore-submodules --; then \
@@ -92,5 +96,18 @@ docker-bootstrap-local:
 	bash "$(HOST_REPO_ROOT)/scripts/install-remote-docker.sh" \
 	  --repo "$(HOST_REPO_ROOT)" \
 	  --ref "$(LOCAL_BOOTSTRAP_REF)" \
-	  --install-dir "$(LOCAL_BOOTSTRAP_INSTALL_DIR)" \
+	  --install-dir "$(LOCAL_BOOTSTRAP_INSTALL_DIR_RESOLVED)" \
 	  $$extra_args
+
+docker-bootstrap-local-logs:
+	@if [ ! -f "$(LOCAL_BOOTSTRAP_INSTALL_DIR_RESOLVED)/repo/rust/compose.yml" ]; then \
+	  echo "local bootstrap compose file not found at $(LOCAL_BOOTSTRAP_INSTALL_DIR_RESOLVED)/repo/rust/compose.yml" >&2; \
+	  echo "run 'make docker-bootstrap-local' first or override LOCAL_BOOTSTRAP_INSTALL_DIR" >&2; \
+	  exit 1; \
+	fi
+	@if [ ! -f "$(LOCAL_BOOTSTRAP_INSTALL_DIR_RESOLVED)/config/docker.env" ]; then \
+	  echo "local bootstrap env file not found at $(LOCAL_BOOTSTRAP_INSTALL_DIR_RESOLVED)/config/docker.env" >&2; \
+	  echo "run 'make docker-bootstrap-local' first or override LOCAL_BOOTSTRAP_INSTALL_DIR" >&2; \
+	  exit 1; \
+	fi
+	$(LOCAL_BOOTSTRAP_DOCKER_COMPOSE) logs -f $(SERVICE)

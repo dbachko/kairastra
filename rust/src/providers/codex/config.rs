@@ -162,11 +162,14 @@ fn default_approval_policy() -> JsonValue {
 mod tests {
     use std::env;
     use std::path::Path;
+    use std::sync::Mutex;
 
     use crate::config::Settings;
     use crate::model::WorkflowDefinition;
 
     use super::load;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn settings(provider_extra: &str) -> Settings {
         env::set_var("GITHUB_TOKEN", "token-123");
@@ -197,26 +200,51 @@ providers:
 
     #[test]
     fn resolves_env_backed_model() {
+        let _guard = ENV_LOCK.lock().unwrap();
         env::set_var("KAIRASTRA_CODEX_MODEL", "gpt-5.4");
         let settings = settings("    model: $KAIRASTRA_CODEX_MODEL");
         let config = load(&settings).unwrap();
         assert_eq!(config.model.as_deref(), Some("gpt-5.4"));
+        env::remove_var("KAIRASTRA_CODEX_MODEL");
     }
 
     #[test]
     fn resolves_env_backed_reasoning_effort() {
+        let _guard = ENV_LOCK.lock().unwrap();
         env::set_var("KAIRASTRA_CODEX_REASONING_EFFORT", "high");
         let settings = settings("    reasoning_effort: $KAIRASTRA_CODEX_REASONING_EFFORT");
         let config = load(&settings).unwrap();
         assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
+        env::remove_var("KAIRASTRA_CODEX_REASONING_EFFORT");
     }
 
     #[test]
     fn resolves_env_backed_fast_flag() {
+        let _guard = ENV_LOCK.lock().unwrap();
         env::set_var("KAIRASTRA_CODEX_FAST", "true");
         let settings = settings("    fast: $KAIRASTRA_CODEX_FAST");
         let config = load(&settings).unwrap();
         assert_eq!(config.fast, Some(true));
+        env::remove_var("KAIRASTRA_CODEX_FAST");
+    }
+
+    #[test]
+    fn blank_env_backed_fast_flag_is_omitted() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("KAIRASTRA_CODEX_FAST", "");
+        let settings = settings("    fast: $KAIRASTRA_CODEX_FAST");
+        let config = load(&settings).unwrap();
+        assert_eq!(config.fast, None);
+        assert_eq!(config.service_tier(), None);
+        env::remove_var("KAIRASTRA_CODEX_FAST");
+    }
+
+    #[test]
+    fn explicit_false_fast_flag_maps_to_flex() {
+        let settings = settings("    fast: false");
+        let config = load(&settings).unwrap();
+        assert_eq!(config.fast, Some(false));
+        assert_eq!(config.service_tier(), Some("flex"));
     }
 
     #[test]

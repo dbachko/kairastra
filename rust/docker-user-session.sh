@@ -2,7 +2,18 @@
 set -euo pipefail
 
 runtime_dir="${XDG_RUNTIME_DIR:-$HOME/.runtime}"
-mkdir -p "$runtime_dir" "$HOME/.cache" "$HOME/.local/share/keyrings"
+tool_cache_root="${KAIRASTRA_TOOL_CACHE_ROOT:-/tmp/kairastra}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$tool_cache_root/xdg-cache}"
+export COREPACK_HOME="${COREPACK_HOME:-$tool_cache_root/corepack}"
+export PNPM_HOME="${PNPM_HOME:-$tool_cache_root/pnpm}"
+export NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-$tool_cache_root/npm-cache}"
+mkdir -p \
+  "$runtime_dir" \
+  "$HOME/.local/share/keyrings" \
+  "$XDG_CACHE_HOME" \
+  "$COREPACK_HOME" \
+  "$PNPM_HOME" \
+  "$NPM_CONFIG_CACHE"
 chmod 700 "$runtime_dir"
 export XDG_RUNTIME_DIR="$runtime_dir"
 
@@ -20,7 +31,18 @@ if [[ "$should_preserve_terminal" == "true" ]]; then
 set -euo pipefail
 
 runtime_dir="${XDG_RUNTIME_DIR:-$HOME/.runtime}"
-mkdir -p "$runtime_dir" "$HOME/.cache" "$HOME/.local/share/keyrings"
+tool_cache_root="${KAIRASTRA_TOOL_CACHE_ROOT:-/tmp/kairastra}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$tool_cache_root/xdg-cache}"
+export COREPACK_HOME="${COREPACK_HOME:-$tool_cache_root/corepack}"
+export PNPM_HOME="${PNPM_HOME:-$tool_cache_root/pnpm}"
+export NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-$tool_cache_root/npm-cache}"
+mkdir -p \
+  "$runtime_dir" \
+  "$HOME/.local/share/keyrings" \
+  "$XDG_CACHE_HOME" \
+  "$COREPACK_HOME" \
+  "$PNPM_HOME" \
+  "$NPM_CONFIG_CACHE"
 chmod 700 "$runtime_dir"
 export XDG_RUNTIME_DIR="$runtime_dir"
 
@@ -41,7 +63,18 @@ dbus-run-session -- bash -lc '"'"'
 set -euo pipefail
 
 runtime_dir="${XDG_RUNTIME_DIR:-$HOME/.runtime}"
-mkdir -p "$runtime_dir" "$HOME/.cache" "$HOME/.local/share/keyrings"
+tool_cache_root="${KAIRASTRA_TOOL_CACHE_ROOT:-/tmp/kairastra}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$tool_cache_root/xdg-cache}"
+export COREPACK_HOME="${COREPACK_HOME:-$tool_cache_root/corepack}"
+export PNPM_HOME="${PNPM_HOME:-$tool_cache_root/pnpm}"
+export NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-$tool_cache_root/npm-cache}"
+mkdir -p \
+  "$runtime_dir" \
+  "$HOME/.local/share/keyrings" \
+  "$XDG_CACHE_HOME" \
+  "$COREPACK_HOME" \
+  "$PNPM_HOME" \
+  "$NPM_CONFIG_CACHE"
 chmod 700 "$runtime_dir"
 export XDG_RUNTIME_DIR="$runtime_dir"
 

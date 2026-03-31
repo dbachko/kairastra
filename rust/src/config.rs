@@ -410,7 +410,7 @@ impl Settings {
 
     pub fn workflow_prompt(&self, workflow: &WorkflowDefinition) -> String {
         if workflow.prompt_template.trim().is_empty() {
-            "You are working on a GitHub issue.\n\n{% if tracker.dashboard_url %}GitHub dashboard: {{ tracker.dashboard_url }}\n\n{% endif %}Identifier: {{ issue.identifier }}\nTitle: {{ issue.title }}\n\nBody:\n{% if issue.description %}\n{{ issue.description }}\n{% else %}\nNo description provided.\n{% endif %}\n".to_string()
+            "You are working on a GitHub issue.\n\n{% if tracker.dashboard_url %}GitHub dashboard: {{ tracker.dashboard_url }}\n\n{% endif %}Identifier: {{ issue.identifier }}\nTitle: {{ issue.title }}\n\nRepository guidance:\n- Discover the repository layout before assuming directories or file paths.\n- Verify a file or directory exists before reading, editing, or passing it to shell commands.\n- Prefer repository discovery commands such as `rg --files .` or `test -e <path>` when a path is uncertain.\n- When using `rg`, `sed`, `cat`, `git diff`, or similar commands, only pass paths you have already confirmed exist.\n- Quote any confirmed path that contains shell metacharacters such as parentheses, spaces, brackets, `*`, or `?` before passing it to `bash`.\n- Prefer finding exact filenames first, then open those exact paths instead of mixing real and guessed directories in one command.\n- Before running a package script, inspect the relevant `package.json` and confirm the script exists for that package.\n- Do not treat skill names, labels, or issue text as filesystem paths.\n- If an expected path does not exist, inspect the workspace and adapt to the actual repo structure.\n\nBody:\n{% if issue.description %}\n{{ issue.description }}\n{% else %}\nNo description provided.\n{% endif %}\n".to_string()
         } else {
             workflow.prompt_template.clone()
         }
@@ -769,6 +769,42 @@ providers:
         let settings = Settings::from_workflow(&definition).unwrap();
         assert_eq!(settings.tracker.owner, "openai");
         assert_eq!(settings.tracker.repo.as_deref(), Some("kairastra"));
+    }
+
+    #[test]
+    fn default_prompt_includes_repo_layout_guidance() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        let prompt = settings.workflow_prompt(&definition);
+
+        assert!(prompt
+            .contains("Discover the repository layout before assuming directories or file paths."));
+        assert!(prompt.contains("rg --files ."));
+        assert!(prompt.contains("only pass paths you have already confirmed exist"));
+        assert!(prompt.contains("Quote any confirmed path that contains shell metacharacters"));
+        assert!(
+            prompt.contains("Before running a package script, inspect the relevant `package.json`")
+        );
+        assert!(
+            prompt.contains("Do not treat skill names, labels, or issue text as filesystem paths.")
+        );
     }
 
     #[test]

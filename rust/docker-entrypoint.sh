@@ -7,6 +7,11 @@ gemini_auth_mode="${GEMINI_AUTH_MODE:-auto}"
 kairastra_user="${KAIRASTRA_USER:-kairastra}"
 kairastra_home="${KAIRASTRA_HOME:-/home/kairastra}"
 workspace_root="${KAIRASTRA_WORKSPACE_ROOT:-/workspaces}"
+tool_cache_root="${KAIRASTRA_TOOL_CACHE_ROOT:-/tmp/kairastra}"
+xdg_cache_home="${XDG_CACHE_HOME:-$tool_cache_root/xdg-cache}"
+corepack_home="${COREPACK_HOME:-$tool_cache_root/corepack}"
+pnpm_home="${PNPM_HOME:-$tool_cache_root/pnpm}"
+npm_config_cache="${NPM_CONFIG_CACHE:-$tool_cache_root/npm-cache}"
 config_root="/config"
 codex_auth_dir="/var/lib/kairastra-auth/codex"
 claude_auth_dir="/var/lib/kairastra-auth/claude"
@@ -88,8 +93,37 @@ EOF
   chmod 600 "$gemini_settings_file" "$gemini_trusted_folders_file" 2>/dev/null || true
 }
 
+sync_codex_seed_skills() {
+  local seed_skills_dir="${KAIRASTRA_SEED_REPO:-}/.codex/skills"
+  local target_skills_dir="$codex_auth_dir/skills"
+
+  if [[ ! -d "$seed_skills_dir" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$target_skills_dir"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete "$seed_skills_dir/" "$target_skills_dir/"
+  else
+    rm -rf "$target_skills_dir"
+    mkdir -p "$target_skills_dir"
+    cp -R "$seed_skills_dir/." "$target_skills_dir/"
+  fi
+}
+
 ensure_runtime_home() {
-  mkdir -p "$kairastra_home" "$workspace_root" "$config_root" "$codex_auth_dir" "$claude_auth_dir" "$gemini_auth_dir"
+  mkdir -p \
+    "$kairastra_home" \
+    "$workspace_root" \
+    "$config_root" \
+    "$codex_auth_dir" \
+    "$claude_auth_dir" \
+    "$gemini_auth_dir" \
+    "$tool_cache_root" \
+    "$xdg_cache_home" \
+    "$corepack_home" \
+    "$pnpm_home" \
+    "$npm_config_cache"
   mkdir -p "$kairastra_home/.local/bin"
 
   if [[ ! -e "$kairastra_home/.codex" ]]; then
@@ -112,11 +146,13 @@ ensure_runtime_home() {
   fi
 
   seed_gemini_cli_defaults
+  sync_codex_seed_skills
 
   chown -R "$kairastra_user:$kairastra_user" \
     "$workspace_root" \
     "$config_root" \
     "$kairastra_home" \
+    "$tool_cache_root" \
     "$codex_auth_dir" \
     "$claude_auth_dir" \
     "$gemini_auth_dir"
@@ -164,6 +200,10 @@ export USER="$kairastra_user"
 export LOGNAME="$kairastra_user"
 export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$kairastra_home/.claude}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$kairastra_home/.runtime}"
+export XDG_CACHE_HOME="$xdg_cache_home"
+export COREPACK_HOME="$corepack_home"
+export PNPM_HOME="$pnpm_home"
+export NPM_CONFIG_CACHE="$npm_config_cache"
 export PATH="/home/${kairastra_user}/.local/bin:${PATH}"
 
 mkdir -p "$XDG_RUNTIME_DIR"
