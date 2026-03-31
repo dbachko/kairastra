@@ -44,6 +44,10 @@ require_command() {
   command -v "$name" >/dev/null 2>&1 || die "required command not found: $name"
 }
 
+require_docker_ready() {
+  docker info >/dev/null 2>&1 || die "docker is installed but not ready; start Docker Desktop or the Docker daemon, or ensure this user can access Docker, then re-run this command"
+}
+
 maybe_resolve_github_token() {
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     printf '%s' "${GITHUB_TOKEN}"
@@ -211,6 +215,7 @@ done
 require_command git
 require_command docker
 docker compose version >/dev/null 2>&1 || die "docker compose is required"
+require_docker_ready
 validate_repo_url "$repo_url"
 validate_git_ref "$git_ref"
 

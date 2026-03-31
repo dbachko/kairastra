@@ -48,6 +48,8 @@ pub enum DoctorStatus {
     Fail,
 }
 
+pub(crate) const REMOVED_DOCKER_ENV_KEYS: [&str; 2] = ["WORKFLOW_FILE", "SEED_REPO_PATH"];
+
 impl DoctorReport {
     pub fn has_failures(&self) -> bool {
         self.checks
@@ -71,7 +73,7 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
 
     if mode == DeployMode::Docker {
         if let Some(values) = env_values.as_ref() {
-            let removed_keys = ["WORKFLOW_FILE", "SEED_REPO_PATH"]
+            let removed_keys = REMOVED_DOCKER_ENV_KEYS
                 .into_iter()
                 .filter(|key| values.contains_key(*key))
                 .collect::<Vec<_>>();

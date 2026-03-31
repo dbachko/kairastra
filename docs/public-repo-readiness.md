@@ -81,6 +81,9 @@ Latest supported build from `main` (run on the host):
 curl -fsSL -o /tmp/install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/main/scripts/install-remote-docker.sh && bash /tmp/install-remote-docker.sh --ref main
 ```
 
+Make sure Docker Desktop or the Docker daemon is already running first. The bootstrap script now
+fails immediately if Docker is installed but not ready.
+
 Pinned ref example (run on the host):
 
 ```bash
