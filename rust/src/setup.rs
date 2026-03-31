@@ -92,16 +92,16 @@ pub async fn run(options: SetupOptions) -> Result<()> {
         normalize_project_statuses(&layout, &values)?;
     }
 
-    write_text_file(
-        &workflow_path,
-        &render_workflow(mode, &values),
-        options.non_interactive,
-    )?;
-    write_text_file(
-        &env_file_path,
-        &render_env_file(mode, &values, &workflow_path),
-        options.non_interactive,
-    )?;
+    let workflow_content = render_workflow(mode, &values);
+    let env_file_content = render_env_file(mode, &values, &workflow_path);
+
+    if mode == DeployMode::Docker {
+        write_docker_env_file(&env_file_path, &env_file_content, options.non_interactive)?;
+        write_text_file(&workflow_path, &workflow_content, options.non_interactive)?;
+    } else {
+        write_text_file(&workflow_path, &workflow_content, options.non_interactive)?;
+        write_text_file(&env_file_path, &env_file_content, options.non_interactive)?;
+    }
 
     if let Some(path) = service_unit_path.as_ref() {
         let unit = render_systemd_unit(&values, &workflow_path, &env_file_path);
@@ -1496,6 +1496,94 @@ fn write_text_file(path: &Path, content: &str, non_interactive: bool) -> Result<
     Ok(())
 }
 
+fn write_docker_env_file(path: &Path, content: &str, non_interactive: bool) -> Result<()> {
+    let removed_keys = existing_removed_docker_env_keys(path)?;
+    if removed_keys.is_empty() {
+        return write_text_file(path, content, non_interactive);
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+
+    let removed_keys_display = removed_keys.join(", ");
+    if non_interactive {
+        return Err(anyhow!(
+            "existing Docker env file {} contains removed keys: {}. Remove it or rerun setup interactively so Kairastra can migrate it",
+            path.display(),
+            removed_keys_display
+        ));
+    }
+
+    println!();
+    println!(
+        "Existing Docker env file {} contains removed keys: {}.",
+        path.display(),
+        removed_keys_display
+    );
+    println!("Setup can migrate it by regenerating the file in the current Docker format.");
+
+    let should_migrate = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!(
+            "Migrate {} to the current Docker env format?",
+            path.display()
+        ))
+        .default(true)
+        .interact()?;
+    ensure_legacy_docker_env_migration_confirmed(path, &removed_keys, should_migrate)?;
+
+    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn existing_removed_docker_env_keys(path: &Path) -> Result<Vec<&'static str>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let existing = fs::read_to_string(path)
+        .with_context(|| format!("failed to read existing {}", path.display()))?;
+    Ok(removed_docker_env_keys_in_content(&existing))
+}
+
+fn removed_docker_env_keys_in_content(content: &str) -> Vec<&'static str> {
+    doctor::REMOVED_DOCKER_ENV_KEYS
+        .iter()
+        .copied()
+        .filter(|target| {
+            content.lines().any(|raw_line| {
+                let line = raw_line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return false;
+                }
+                let Some((raw_key, _)) = line.split_once('=') else {
+                    return false;
+                };
+                raw_key.trim() == *target
+            })
+        })
+        .collect()
+}
+
+fn ensure_legacy_docker_env_migration_confirmed(
+    path: &Path,
+    removed_keys: &[&str],
+    should_migrate: bool,
+) -> Result<()> {
+    if should_migrate {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "existing Docker env file {} contains removed keys: {}. Setup cannot continue until the file is migrated or cleaned",
+        path.display(),
+        removed_keys.join(", ")
+    ))
+}
+
 fn is_replaceable_bootstrap_file(path: &Path) -> Result<bool> {
     let existing = fs::read_to_string(path)
         .with_context(|| format!("failed to read existing {}", path.display()))?;
@@ -2229,6 +2317,7 @@ fn absolute_display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
+        ensure_legacy_docker_env_migration_confirmed, removed_docker_env_keys_in_content,
         render_env_file, render_systemd_unit, render_workflow, write_text_file, SetupValues,
         REMOTE_DOCKER_ENV_BOOTSTRAP_PREFIX, REMOTE_DOCKER_WORKFLOW_PLACEHOLDER,
     };
@@ -2379,6 +2468,27 @@ mod tests {
         assert!(rendered.contains("GEMINI_AUTH_MODE=subscription"));
         assert!(rendered.contains("KAIRASTRA_GEMINI_MODEL=gemini-2.5-pro"));
         assert!(rendered.contains("KAIRASTRA_GEMINI_APPROVAL_MODE=yolo"));
+    }
+
+    #[test]
+    fn detects_removed_docker_env_keys_in_existing_content() {
+        let removed_keys = removed_docker_env_keys_in_content(
+            "KAIRASTRA_DEPLOY_MODE=docker\nWORKFLOW_FILE=../WORKFLOW.md\nSEED_REPO_PATH=../repo\n",
+        );
+        assert_eq!(removed_keys, vec!["WORKFLOW_FILE", "SEED_REPO_PATH"]);
+    }
+
+    #[test]
+    fn declining_legacy_docker_env_migration_returns_targeted_error() {
+        let error = ensure_legacy_docker_env_migration_confirmed(
+            Path::new("/config-state/docker.env"),
+            &["WORKFLOW_FILE"],
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Setup cannot continue"));
+        assert!(error.contains("WORKFLOW_FILE"));
     }
 
     #[test]

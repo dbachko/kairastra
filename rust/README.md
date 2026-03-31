@@ -224,6 +224,8 @@ make docker-login
 
 If Docker is already installed on the remote machine, use the bootstrap script instead of manually
 copying the repo around. This is the supported path for a remote Mac mini or other Docker host.
+Start Docker Desktop or the Docker daemon before running the bootstrap command. The script now
+fails immediately if Docker is installed but not running.
 
 Latest supported build from `main` (run on the host):
 
@@ -291,6 +293,7 @@ What it does:
 - creates a managed install root under `~/kairastra` by default
 - clones the repo into `~/kairastra/repo`
 - keeps the host Docker env file in `~/kairastra/config`
+- fails early if the Docker daemon/Desktop is not ready on the host
 - builds the Docker image from that managed checkout
 - opens the interactive `kairastra setup --mode docker` wizard in your SSH terminal and writes deployment config into the Docker `/config` volume
 - runs `doctor`
@@ -566,6 +569,7 @@ Available make targets:
 - `make docker-login PROVIDER=gemini` goes straight to the Gemini login flow
 - the Claude Docker login helper prints a browser authorize URL directly and never drops you into Claude's raw terminal TUI
 - after you paste the browser auth code, Kairastra exchanges it directly and either saves the token or returns the exact HTTP error body from Anthropic instead of hanging
+- if an older Docker env file still contains removed keys like `WORKFLOW_FILE` or `SEED_REPO_PATH`, setup now offers to migrate that file before running doctor
 
 ## Native VPS deployment details
 

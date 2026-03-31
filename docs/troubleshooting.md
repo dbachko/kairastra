@@ -89,6 +89,7 @@ Fix:
 
 - rerun `make docker-setup`
 - or rerun the remote bootstrap script with `--reconfigure`
+- if setup offers to migrate the Docker env file, accept that prompt so it can rewrite the file in the current format
 - or remove the stale keys and import/write the deployment config into Docker-managed volumes again
 
 ### Repo `WORKFLOW.md` changes do not show up in Docker workspaces
