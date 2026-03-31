@@ -177,6 +177,10 @@ ensure_runtime_home() {
     "$config_root" \
     "$kairastra_home" \
     "$tool_cache_root" \
+    "$xdg_cache_home" \
+    "$corepack_home" \
+    "$pnpm_home" \
+    "$npm_config_cache" \
     "$codex_auth_dir" \
     "$claude_auth_dir" \
     "$gemini_auth_dir"
