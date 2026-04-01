@@ -32,6 +32,10 @@ kairastra auth menu
 kairastra doctor
 ```
 
+Codex is the default and best-tested provider path today. Kairastra can run workers with
+`agent.provider: codex`, `claude`, or `gemini`, but if you want the supported default path,
+install `codex` first and start there.
+
 By default, `kairastra setup` writes local operator state under `.kairastra/`, adds that directory
 to local Git ignore rules, copies the required Kairastra workflow skills into `.agents/skills/`
 after confirmation, scaffolds repo support dirs when needed for workspace bootstrap, and inspects
@@ -54,9 +58,9 @@ kairastra run
 | `kairastra setup --reconfigure` | Re-run setup and overwrite the generated local Kairastra files for the current repo. |
 | `kairastra doctor` | Validate workflow, GitHub connectivity, local commands, and auth state. |
 | `kairastra auth status` | Show provider auth status. |
-| `kairastra auth login --mode subscription` | Run subscription or browser login for the default provider. |
-| `kairastra auth login --mode api-key` | Configure API-key auth for the default provider. |
-| `kairastra auth menu` | Open the provider auth menu. |
+| `kairastra auth menu` | Recommended default auth flow. Inspect providers and run the right login interactively. |
+| `kairastra auth login --mode subscription` | Run browser, device, or account login for the default provider. Prefer `kairastra auth menu` unless you need to force this path. |
+| `kairastra auth login --mode api-key` | Configure API-key auth for the default provider. Prefer `kairastra auth menu` unless you need to force this path. |
 
 ## What Setup Produces
 

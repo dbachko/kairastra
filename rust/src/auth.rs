@@ -113,7 +113,7 @@ fn handle_login_action(status: &AuthStatus, display_name: &str) -> Result<()> {
         LoginAction::AlreadyLoggedIn => {
             let rerun = Confirm::with_theme(&ColorfulTheme::default())
                 .with_prompt(format!(
-                    "{display_name} already has a saved login. Run login again?"
+                    "{display_name} already appears logged in. Run login again?"
                 ))
                 .default(false)
                 .interact()?;
@@ -251,7 +251,7 @@ fn login_action(status: &AuthStatus) -> LoginAction {
         return LoginAction::ApiKeyReady;
     }
 
-    if status.auth_file_present && status.credentials_usable {
+    if status.credentials_usable && matches!(status.inferred_mode, AuthMode::Subscription) {
         return LoginAction::AlreadyLoggedIn;
     }
 
@@ -334,7 +334,6 @@ mod tests {
     #[test]
     fn provider_menu_label_marks_logged_in_status() {
         let mut status = status("claude");
-        status.auth_file_present = true;
         status.credentials_present = true;
         status.credentials_usable = true;
         status.auth_problem = Some("subscription_ready".to_string());
@@ -350,6 +349,19 @@ mod tests {
         let status = status("codex");
 
         assert_eq!(provider_menu_label("Codex", &status), "Log in to Codex");
+    }
+
+    #[test]
+    fn provider_menu_label_marks_session_only_subscription_auth_as_logged_in() {
+        let mut status = status("claude");
+        status.credentials_present = true;
+        status.credentials_usable = true;
+        status.auth_problem = Some("subscription_session_ready".to_string());
+
+        assert_eq!(
+            provider_menu_label("Claude Code", &status),
+            "✓ Claude Code (logged in)"
+        );
     }
 
     #[test]

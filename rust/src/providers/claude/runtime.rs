@@ -652,7 +652,6 @@ fn validate_workspace_cwd(root: &Path, workspace: &Path) -> Result<()> {
 mod tests {
     use std::ffi::OsString;
     use std::fs;
-    use std::sync::Mutex;
 
     use tempfile::tempdir;
     use tokio::sync::mpsc::unbounded_channel;
@@ -662,8 +661,6 @@ mod tests {
     use crate::model::{Issue, WorkflowDefinition};
 
     use super::{AgentEventKind, ClaudeSession};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvVarGuard {
         key: &'static str,
@@ -923,7 +920,7 @@ cat >/dev/null
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn injects_saved_oauth_token_into_claude_process() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::auth::crate_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         let home_dir = dir.path().join("home");
         let claude_dir = home_dir.join(".claude");
@@ -981,7 +978,7 @@ cat >/dev/null
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn does_not_inject_oauth_token_as_anthropic_auth_token() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::auth::crate_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         let home_dir = dir.path().join("home");
         let claude_dir = home_dir.join(".claude");

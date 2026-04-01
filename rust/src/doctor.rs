@@ -1150,6 +1150,30 @@ providers:
             .as_millis() as u64
     }
 
+    fn write_claude_status_script(dir: &Path, logged_in: bool) {
+        let script_path = dir.join("claude");
+        let logged_in_json = if logged_in { "true" } else { "false" };
+        fs::write(
+            &script_path,
+            format!("#!/bin/sh\nprintf '%s\\n' '{{\"loggedIn\":{logged_in_json}}}'\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_path, perms).unwrap();
+        }
+    }
+
+    fn path_with_fake_claude(bin_dir: &Path) -> OsString {
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin_dir.to_path_buf()];
+        paths.extend(std::env::split_paths(&original_path));
+        std::env::join_paths(paths).unwrap()
+    }
+
     fn write_claude_workflow(dir: &Path) -> std::path::PathBuf {
         let workflow_path = dir.join("WORKFLOW.md");
         fs::write(
@@ -1316,8 +1340,11 @@ providers:
         let _guard = crate_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         let home_dir = dir.path().join("home");
+        let bin_dir = dir.path().join("bin");
         let claude_dir = home_dir.join(".claude");
+        fs::create_dir_all(&bin_dir).unwrap();
         fs::create_dir_all(&claude_dir).unwrap();
+        write_claude_status_script(&bin_dir, false);
         fs::write(
             claude_dir.join(".credentials.json"),
             format!(
@@ -1328,6 +1355,7 @@ providers:
         .unwrap();
 
         let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let _path = EnvVarGuard::set("PATH", path_with_fake_claude(&bin_dir));
         let _mode = EnvVarGuard::set("CLAUDE_AUTH_MODE", OsString::from("auto"));
         let _api_key = EnvVarGuard::unset("ANTHROPIC_API_KEY");
         let _oauth_token = EnvVarGuard::unset("CLAUDE_CODE_OAUTH_TOKEN");

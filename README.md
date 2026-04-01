@@ -26,7 +26,8 @@ one-repository-per-deployment operating model and multi-provider agent execution
 
 - Watches GitHub Issues or Projects v2 for claimable work.
 - Creates isolated per-issue workspaces on the host filesystem.
-- Supports multiple agent providers: `codex`, `claude`, and `gemini`.
+- Runs one selected worker provider per workflow via `agent.provider`; built-ins are `codex`,
+  `claude`, and `gemini`.
 - Keeps issue workpad comments, PR discovery, and review handoff in sync with execution.
 
 ## Quick Start
@@ -45,6 +46,11 @@ Requirements:
 - Rust and Cargo on the host
 - `git` and `gh`
 - the provider CLI you plan to use: `codex`, `claude`, or `gemini`
+
+> [!IMPORTANT]
+> Codex is the default and best-tested provider path today. Kairastra can run issue workers with
+> `agent.provider: codex`, `claude`, or `gemini`, but if you want the supported default path,
+> install `codex` first and start there.
 
 Then generate the native config:
 
@@ -94,9 +100,9 @@ You are set up correctly when all of these are true:
 | `krstr setup --reconfigure` | Re-run setup and overwrite the generated local Kairastra files for the current repo. |
 | `krstr doctor` | Validate workflow, GitHub connectivity, local commands, auth state, and GitHub metadata readiness. |
 | `krstr auth status` | Show provider auth status. |
-| `krstr auth login --mode subscription` | Run subscription or browser login for the default provider. |
-| `krstr auth login --mode api-key` | Configure API-key auth for the default provider. |
-| `krstr auth menu` | Open the provider auth menu. |
+| `krstr auth menu` | Recommended default auth flow. Inspect providers and run the right login interactively. |
+| `krstr auth login --mode subscription` | Run browser, device, or account login for the default provider. Prefer `krstr auth menu` unless you need to force this path. |
+| `krstr auth login --mode api-key` | Configure API-key auth for the default provider. Prefer `krstr auth menu` unless you need to force this path. |
 
 `krstr` is a thin wrapper installed alongside `kairastra`, so both command names work.
 

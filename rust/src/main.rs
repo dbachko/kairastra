@@ -102,13 +102,22 @@ struct AuthArgs {
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
     Status,
+    #[command(
+        about = "Run a provider login flow directly",
+        long_about = "Run a provider login flow directly.\n\nAvailable modes:\n  subscription  Browser, device, or account login.\n  api-key       Validate API-key auth using the provider API key environment variable.\n\nIf you are not sure which path to use, run `kairastra auth menu` (or `krstr auth menu`) instead."
+    )]
     Login(AuthLoginArgs),
     Menu,
 }
 
 #[derive(Debug, Args)]
 struct AuthLoginArgs {
-    #[arg(long, value_enum)]
+    #[arg(
+        long,
+        value_enum,
+        help = "Auth flow to run",
+        long_help = "Auth flow to run.\n\nsubscription  Browser, device, or account login.\napi-key       Validate API-key auth using the provider API key environment variable.\n\nIf you are not sure which path to use, run `kairastra auth menu` (or `krstr auth menu`) instead."
+    )]
     mode: AuthModeArg,
 }
 
