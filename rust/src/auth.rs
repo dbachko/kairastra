@@ -255,6 +255,13 @@ fn login_action(status: &AuthStatus) -> LoginAction {
         return LoginAction::AlreadyLoggedIn;
     }
 
+    if matches!(
+        status.auth_problem.as_deref(),
+        Some("subscription_login_detected")
+    ) {
+        return LoginAction::AlreadyLoggedIn;
+    }
+
     match status.configured_mode {
         AuthMode::ApiKey => LoginAction::NeedsApiKey,
         AuthMode::Auto | AuthMode::Subscription => LoginAction::Subscription,
@@ -355,8 +362,7 @@ mod tests {
     fn provider_menu_label_marks_session_only_subscription_auth_as_logged_in() {
         let mut status = status("claude");
         status.credentials_present = true;
-        status.credentials_usable = true;
-        status.auth_problem = Some("subscription_session_ready".to_string());
+        status.auth_problem = Some("subscription_login_detected".to_string());
 
         assert_eq!(
             provider_menu_label("Claude Code", &status),

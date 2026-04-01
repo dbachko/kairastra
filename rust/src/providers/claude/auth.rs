@@ -54,7 +54,6 @@ pub fn inspect_status() -> AuthStatus {
     let logged_in = read_logged_in_status().unwrap_or(false);
     let subscription_token_ready =
         credentials_file_valid || oauth_token_env_present || oauth_token_file_present;
-    let subscription_ready = subscription_token_ready || logged_in;
     let effective_auth_path = effective_auth_path(
         credentials_file_valid,
         oauth_token_env_present,
@@ -69,7 +68,7 @@ pub fn inspect_status() -> AuthStatus {
         AuthMode::Auto => {
             if api_key_present {
                 AuthMode::ApiKey
-            } else if subscription_ready || credentials_file_present {
+            } else if subscription_token_ready || credentials_file_present || logged_in {
                 AuthMode::Subscription
             } else {
                 AuthMode::Auto
@@ -88,8 +87,8 @@ pub fn inspect_status() -> AuthStatus {
         credentials_present: api_key_present || auth_file_present || logged_in,
         credentials_usable: match configured_mode {
             AuthMode::ApiKey => api_key_present,
-            AuthMode::Subscription => subscription_ready,
-            AuthMode::Auto => api_key_present || subscription_ready,
+            AuthMode::Subscription => subscription_token_ready,
+            AuthMode::Auto => api_key_present || subscription_token_ready,
         },
         auth_problem: Some(
             match configured_mode {
@@ -104,7 +103,7 @@ pub fn inspect_status() -> AuthStatus {
                     if subscription_token_ready {
                         "subscription_ready"
                     } else if logged_in {
-                        "subscription_session_ready"
+                        "subscription_login_detected"
                     } else if credentials_file_expired {
                         "expired_oauth_token"
                     } else {
@@ -117,7 +116,7 @@ pub fn inspect_status() -> AuthStatus {
                     } else if subscription_token_ready {
                         "subscription_ready"
                     } else if logged_in {
-                        "subscription_session_ready"
+                        "subscription_login_detected"
                     } else if credentials_file_expired {
                         "expired_oauth_token"
                     } else {
@@ -474,11 +473,11 @@ mod tests {
         let status = inspect_status();
         assert_eq!(status.inferred_mode, AuthMode::Subscription);
         assert!(status.credentials_present);
-        assert!(status.credentials_usable);
+        assert!(!status.credentials_usable);
         assert!(!status.auth_file_present);
         assert_eq!(
             status.auth_problem.as_deref(),
-            Some("subscription_session_ready")
+            Some("subscription_login_detected")
         );
     }
 
@@ -501,11 +500,11 @@ mod tests {
         let status = inspect_status();
         assert_eq!(status.inferred_mode, AuthMode::Subscription);
         assert!(status.credentials_present);
-        assert!(status.credentials_usable);
+        assert!(!status.credentials_usable);
         assert!(!status.auth_file_present);
         assert_eq!(
             status.auth_problem.as_deref(),
-            Some("subscription_session_ready")
+            Some("subscription_login_detected")
         );
     }
 
