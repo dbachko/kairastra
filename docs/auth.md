@@ -55,6 +55,14 @@ The matching API key env vars are:
 
 ## Status And Login Commands
 
+Default recommendation:
+
+```bash
+kairastra auth menu
+```
+
+Use direct `auth login --mode ...` commands only when you want to force a specific auth path.
+
 Status:
 
 ```bash
@@ -66,13 +74,13 @@ kairastra auth --provider gemini status
 Login:
 
 ```bash
+kairastra auth menu
 kairastra auth login --mode subscription
 kairastra auth login --mode api-key
 kairastra auth --provider claude login --mode subscription
 kairastra auth --provider claude login --mode api-key
 kairastra auth --provider gemini login --mode subscription
 kairastra auth --provider gemini login --mode api-key
-kairastra auth menu
 ```
 
 ## References
