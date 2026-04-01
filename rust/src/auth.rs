@@ -54,7 +54,6 @@ pub struct AuthStatus {
     pub auth_file_present: bool,
     pub api_key_present: bool,
     pub credentials_present: bool,
-    pub docker_volume_hint: &'static str,
 }
 
 pub fn inspect_status(provider: &str) -> Result<AuthStatus> {
@@ -301,7 +300,6 @@ mod tests {
             auth_file_present: false,
             api_key_present: false,
             credentials_present: false,
-            docker_volume_hint: "hint",
         }
     }
 

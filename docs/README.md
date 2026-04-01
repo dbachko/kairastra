@@ -1,14 +1,15 @@
 # Kairastra Docs
 
-Operator docs, implementation references, planning notes, and specs for the Kairastra runtime live
-here.
+Operator docs, implementation references, planning notes, and specs for the Kairastra runtime live here.
 
 Current deployment model: one Kairastra deployment manages one repository. If you want to automate
-multiple repositories, run multiple Kairastra services or containers.
+multiple repositories, run multiple Kairastra services.
 
+- [auth.md](auth.md): GitHub token requirements, provider auth modes, and login flows
+- [deployment.md](deployment.md): native installation and service setup
+- [operations.md](operations.md): doctor checks, day-2 operations, and current limitations
 - [architecture.md](architecture.md): how Kairastra is structured and where orchestration logic lives
-- [workflow-reference.md](workflow-reference.md): `WORKFLOW.md` structure, key fields, defaults,
-  and the Docker split between deployment config and repo-owned workspace workflows
+- [workflow-reference.md](workflow-reference.md): `WORKFLOW.md` structure, key fields, and defaults
 - [troubleshooting.md](troubleshooting.md): common setup and runtime failures
 - [public-repo-readiness.md](public-repo-readiness.md): pre-publication secret-risk checklist and audit flow
 - `plans/`: proposed or historical design notes, including some documents written before the

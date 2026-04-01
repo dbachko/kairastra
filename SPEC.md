@@ -1,3 +1,10 @@
+<!--
+Derived from OpenAI Symphony and modified for Kairastra.
+Copyright 2025 OpenAI
+Copyright 2026 Dzmitry Bachko and contributors
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Kairastra Service Specification
 
 Status: Draft v1 (language-agnostic)

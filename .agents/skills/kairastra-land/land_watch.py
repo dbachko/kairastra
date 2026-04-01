@@ -576,7 +576,7 @@ async def watch_pr() -> None:
     pr = await get_pr_info()
     if is_merge_conflicting(pr):
         print(
-            "PR has merge conflicts. Resolve/rebase against main and push before "
+            "PR has merge conflicts. Resolve/rebase against the default branch and push before "
             "running land_watch again.",
         )
         raise SystemExit(5)
@@ -590,7 +590,7 @@ async def watch_pr() -> None:
             current = await get_pr_info()
             if is_merge_conflicting(current):
                 print(
-                    "PR has merge conflicts. Resolve/rebase against main and push "
+                    "PR has merge conflicts. Resolve/rebase against the default branch and push "
                     "before running land_watch again.",
                 )
                 raise SystemExit(5)

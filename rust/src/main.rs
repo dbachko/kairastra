@@ -9,11 +9,12 @@ use tracing_subscriber::EnvFilter;
 use kairastra::auth::{inspect_status, run_login, run_login_menu, AuthMode};
 use kairastra::deploy::DeployMode;
 use kairastra::doctor::{run as run_doctor, DoctorFormat, DoctorOptions};
+use kairastra::envfile::{apply_env_if_missing, load_env_file};
 use kairastra::github::GitHubTracker;
 use kairastra::github_mcp;
 use kairastra::orchestrator::Orchestrator;
 use kairastra::setup::{run as run_setup, SetupOptions};
-use kairastra::workflow::{default_workflow_path, WorkflowStore};
+use kairastra::workflow::{default_env_file_path, default_workflow_path, WorkflowStore};
 
 #[derive(Debug, Parser)]
 #[command(name = "kairastra")]
@@ -57,6 +58,18 @@ struct SetupArgs {
 
     #[arg(long = "binary-path", value_name = "PATH")]
     binary_path: Option<PathBuf>,
+
+    #[arg(long)]
+    bootstrap_github: bool,
+
+    #[arg(long)]
+    skip_labels: bool,
+
+    #[arg(long)]
+    skip_priority_field: bool,
+
+    #[arg(long)]
+    reconfigure: bool,
 
     #[arg(long)]
     non_interactive: bool,
@@ -132,6 +145,10 @@ async fn main() -> Result<()> {
                 env_file: args.env_file,
                 service_unit: args.service_unit,
                 binary_path: args.binary_path,
+                bootstrap_github: args.bootstrap_github,
+                skip_labels: args.skip_labels,
+                skip_priority_field: args.skip_priority_field,
+                reconfigure: args.reconfigure,
                 non_interactive: args.non_interactive,
             })
             .await
@@ -169,6 +186,11 @@ async fn main() -> Result<()> {
 }
 
 async fn run_orchestrator(workflow: Option<PathBuf>, once: bool) -> Result<()> {
+    if let Some(path) = default_env_file_path()? {
+        let env_values = load_env_file(&path)?;
+        apply_env_if_missing(&env_values);
+    }
+
     let workflow_path = match workflow {
         Some(path) => path,
         None => match std::env::var_os("WORKFLOW_PATH") {

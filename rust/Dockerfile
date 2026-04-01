@@ -8,7 +8,7 @@ COPY rust/README.md ./README.md
 
 RUN cargo build --locked --release
 
-FROM node:24-bookworm-slim AS runtime
+FROM node:24-bookworm-slim
 
 ARG CODEX_CLI_VERSION=0.114.0
 ARG CLAUDE_CODE_VERSION=2.1.81
@@ -17,7 +17,7 @@ ARG GEMINI_CLI_VERSION=0.35.0
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates curl dbus dbus-user-session docker-compose docker.io gcc gh git gnome-keyring gosu jq libc6-dev libsecret-1-0 libsecret-tools make openssh-client pkg-config ripgrep rsync \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl gcc gh git jq libc6-dev libsecret-1-0 libsecret-tools openssh-client pkg-config ripgrep rsync \
     && corepack enable pnpm \
     && npm install -g "@openai/codex@${CODEX_CLI_VERSION}" \
     && npm install -g "@google/gemini-cli@${GEMINI_CLI_VERSION}" \
@@ -27,45 +27,31 @@ RUN apt-get update \
         arm64) claude_arch="arm64" ;; \
         *) echo "Unsupported architecture for Claude Code" >&2; exit 1 ;; \
       esac \
-    && if ldd /bin/ls 2>&1 | grep -q musl; then \
-         claude_platform="linux-${claude_arch}-musl"; \
-       else \
-         claude_platform="linux-${claude_arch}"; \
-       fi \
     && if [[ -z "${CLAUDE_CODE_VERSION}" || "${CLAUDE_CODE_VERSION}" == "latest" || "${CLAUDE_CODE_VERSION}" == "stable" ]]; then \
          claude_version="$(curl -fsSL "${claude_bucket}/latest")"; \
        else \
          claude_version="${CLAUDE_CODE_VERSION}"; \
        fi \
     && claude_manifest="$(curl -fsSL "${claude_bucket}/${claude_version}/manifest.json")" \
-    && claude_checksum="$(jq -r --arg platform "${claude_platform}" '.platforms[$platform].checksum // empty' <<<"${claude_manifest}")" \
+    && claude_checksum="$(jq -r --arg platform "linux-${claude_arch}" '.platforms[$platform].checksum // empty' <<<"${claude_manifest}")" \
     && [[ -n "${claude_checksum}" ]] \
-    && curl -fsSL -o /tmp/claude "${claude_bucket}/${claude_version}/${claude_platform}/claude" \
+    && curl -fsSL -o /tmp/claude "${claude_bucket}/${claude_version}/linux-${claude_arch}/claude" \
     && echo "${claude_checksum}  /tmp/claude" | sha256sum -c - \
     && install -m 0755 /tmp/claude /usr/local/bin/claude \
     && useradd --create-home --shell /bin/bash kairastra \
-    && mkdir -p /home/kairastra /var/lib/kairastra-auth/codex /var/lib/kairastra-auth/claude /var/lib/kairastra-auth/gemini /workspaces \
-    && chown -R kairastra:kairastra /home/kairastra /var/lib/kairastra-auth /workspaces \
+    && mkdir -p /workspace /var/lib/kairastra-auth \
+    && chown -R kairastra:kairastra /workspace /var/lib/kairastra-auth \
     && rm -f /tmp/claude \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/cargo /usr/local/cargo
-COPY --from=builder /usr/local/rustup /usr/local/rustup
-COPY --from=builder /usr/local/cargo/bin/ /usr/local/bin/
 COPY --from=builder /src/rust/target/release/kairastra /usr/local/bin/kairastra
-COPY rust/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-COPY rust/docker-user-session.sh /usr/local/bin/docker-user-session.sh
-COPY rust/docker-compose-shim /usr/local/bin/docker
-RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh /usr/local/bin/docker-user-session.sh /usr/local/bin/docker
 
-WORKDIR /app
+USER kairastra
+WORKDIR /workspace
 
-ENV RUSTUP_HOME=/usr/local/rustup
-ENV KAIRASTRA_USER=kairastra
-ENV KAIRASTRA_HOME=/home/kairastra
-ENV PATH=/usr/local/cargo/bin:${PATH}
+ENV HOME=/home/kairastra
+ENV KAIRASTRA_WORKSPACE_ROOT=/workspace/.kairastra-workspaces
 ENV RUST_LOG=info
-ENV KAIRASTRA_WORKSPACE_ROOT=/workspaces
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["run"]
+ENTRYPOINT ["kairastra"]
+CMD ["--help"]

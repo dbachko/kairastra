@@ -41,8 +41,9 @@ pub fn render_workflow_section(config: &CodexSetupConfig) -> String {
 }
 
 pub fn render_env_section(mode: DeployMode, config: &CodexSetupConfig) -> String {
+    let _ = mode;
     let fast = config.fast.map(bool_to_env).unwrap_or_default();
-    let mut lines = vec![
+    let lines = vec![
         format!("CODEX_AUTH_MODE={}", config.auth_mode),
         format!("KAIRASTRA_CODEX_MODEL={}", config.model),
         format!(
@@ -51,10 +52,6 @@ pub fn render_env_section(mode: DeployMode, config: &CodexSetupConfig) -> String
         ),
         format!("KAIRASTRA_CODEX_FAST={fast}"),
     ];
-
-    if mode == DeployMode::Docker {
-        lines.insert(1, "CODEX_CLI_VERSION=0.114.0".to_string());
-    }
 
     lines.join("\n")
 }
@@ -92,15 +89,15 @@ mod tests {
     }
 
     #[test]
-    fn docker_env_leaves_fast_blank_when_not_set() {
-        let rendered = render_env_section(DeployMode::Docker, &config(None));
+    fn native_env_leaves_fast_blank_when_not_set() {
+        let rendered = render_env_section(DeployMode::Native, &config(None));
         assert!(rendered.contains("KAIRASTRA_CODEX_FAST="));
         assert!(!rendered.contains("KAIRASTRA_CODEX_FAST=false"));
     }
 
     #[test]
-    fn docker_env_renders_explicit_fast_override() {
-        let rendered = render_env_section(DeployMode::Docker, &config(Some(true)));
+    fn native_env_renders_explicit_fast_override() {
+        let rendered = render_env_section(DeployMode::Native, &config(Some(true)));
         assert!(rendered.contains("KAIRASTRA_CODEX_FAST=true"));
         assert_eq!(bool_to_env(false), "false");
     }

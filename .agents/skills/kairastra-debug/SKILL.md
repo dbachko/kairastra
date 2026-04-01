@@ -1,7 +1,7 @@
 ---
-name: debug
+name: kairastra-debug
 description:
-  Investigate stuck runs and execution failures by tracing Symphony and Codex
+  Investigate stuck runs and execution failures by tracing Kairastra and agent
   logs with issue/session identifiers; use when runs stall, retry repeatedly, or
   fail unexpectedly.
 ---
@@ -16,7 +16,7 @@ description:
 
 ## Runtime output sources
 
-Symphony Rust logs to stdout/stderr through `tracing`; there is no repo-local
+Kairastra Rust logs to stdout/stderr through `tracing`; there is no repo-local
 file logger by default.
 
 Use one of these sources:

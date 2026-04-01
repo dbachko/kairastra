@@ -65,7 +65,7 @@ Secret scanning API check example:
 gh api repos/dbachko/kairastra/secret-scanning/alerts --paginate
 ```
 
-## Remote bootstrap URL guidance
+## Install URL guidance
 
 For a public repository, `raw.githubusercontent.com` URLs should use:
 
@@ -75,26 +75,21 @@ For a public repository, `raw.githubusercontent.com` URLs should use:
 
 Use `sed`/`cat` for non-interactive review instead of `less` in scripted host commands.
 
-Latest supported build from `main` (run on the host):
+Latest supported native install from `main`:
 
 ```bash
-curl -fsSL -o /tmp/install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/main/scripts/install-remote-docker.sh && bash /tmp/install-remote-docker.sh --ref main
+curl -fsSL https://raw.githubusercontent.com/dbachko/kairastra/main/install.sh | bash
 ```
 
-Make sure Docker Desktop or the Docker daemon is already running first. The bootstrap script now
-fails immediately if Docker is installed but not ready.
-
-Pinned ref example (run on the host):
+Pinned ref example:
 
 ```bash
-curl -fsSL -o /tmp/install-remote-docker.sh https://raw.githubusercontent.com/dbachko/kairastra/v0.1.0-alpha.1/scripts/install-remote-docker.sh && bash /tmp/install-remote-docker.sh --ref v0.1.0-alpha.1
+curl -fsSL https://raw.githubusercontent.com/dbachko/kairastra/v0.1.0-alpha.1/install.sh | bash -s -- --ref v0.1.0-alpha.1
 ```
 
-Upgrade an existing remote install to the latest `main` and re-run setup:
+After install, generate native config and verify it:
 
 ```bash
-~/kairastra/repo/scripts/install-remote-docker.sh --ref main --reconfigure
+kairastra setup
+kairastra doctor
 ```
-
-If setup still shows the old prompt text `GitHub Project URL (optional, can auto-fill owner and number)`,
-the host is still running an older ref or image. Re-run one of the `main` commands above.

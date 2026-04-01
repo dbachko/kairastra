@@ -19,8 +19,6 @@ const SUBSCRIPTION_AUTH_TYPES: &[&str] = &["oauth-personal", "google", "login_wi
 const API_KEY_AUTH_TYPE: &str = "gemini-api-key";
 const GEMINI_LOGIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const GEMINI_LOGIN_SETTLE_DELAY: Duration = Duration::from_millis(750);
-const DOCKER_VOLUME_HINT: &str =
-    "Docker mode persists Gemini auth through the kairastra_home and kairastra_gemini volumes mounted for the non-root runtime user.";
 
 #[derive(Debug, Deserialize)]
 struct GeminiSettingsFile {
@@ -76,7 +74,6 @@ pub fn inspect_status() -> AuthStatus {
         auth_file_present,
         api_key_present,
         credentials_present: auth_file_present || api_key_present,
-        docker_volume_hint: DOCKER_VOLUME_HINT,
     }
 }
 

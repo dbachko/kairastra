@@ -18,17 +18,21 @@ use crate::config::Settings;
 use crate::github::GitHubTracker;
 use crate::github_tools::{
     execute_github_graphql as execute_shared_github_graphql,
-    execute_github_rest as execute_shared_github_rest, tool_schemas,
+    execute_github_rest as execute_shared_github_rest,
 };
 use crate::model::Issue;
 
 use super::config::CodexConfig;
 
+// Source of truth for the Codex app-server handshake and request flow:
+// https://github.com/openai/codex-plugin-cc
 const INITIALIZE_ID: u64 = 1;
 const THREAD_START_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;
 const NON_INTERACTIVE_TOOL_INPUT_ANSWER: &str =
     "This is a non-interactive session. Operator input is unavailable.";
+const CODEX_ENV_ALLOWLIST: &[&str] = &["CODEX_AUTH_MODE"];
+const CODEX_SERVICE_NAME: &str = "kairastra";
 
 #[derive(Debug, Clone)]
 pub struct CodexBackend;
@@ -90,25 +94,13 @@ impl CodexSession {
         let config = super::config::load(settings)?;
 
         let cargo_home = workspace.join(".cargo-home");
-        tokio::fs::create_dir_all(&cargo_home)
-            .await
-            .context("failed to create workspace cargo home")?;
-
-        let mut command = Command::new("bash");
-        command.arg("-lc").arg(&config.command);
-        command.current_dir(workspace);
-        crate::workspace::apply_runtime_tool_env(&mut command);
-        command.env("CARGO_HOME", &cargo_home);
-        command.env("GITHUB_TOKEN", tracker.settings().api_key.as_str());
-        command.env("GH_TOKEN", tracker.settings().api_key.as_str());
-        command.stdin(Stdio::piped());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        command.kill_on_drop(true);
-
-        let mut child = command
-            .spawn()
-            .context("failed to launch codex app-server")?;
+        let mut child = spawn_codex_app_server(
+            &config.command,
+            workspace,
+            &cargo_home,
+            Some(tracker.settings().api_key.as_str()),
+        )
+        .await?;
         let stdin = child
             .stdin
             .take()
@@ -140,8 +132,14 @@ impl CodexSession {
             tracker,
         };
 
-        session.send_initialize().await?;
-        session.thread_id = session.start_thread().await?;
+        session
+            .send_initialize()
+            .await
+            .context("codex_app_server_initialize_failed")?;
+        session.thread_id = session
+            .start_thread()
+            .await
+            .context("codex_app_server_thread_start_failed")?;
         Ok(session)
     }
 
@@ -208,9 +206,7 @@ impl CodexSession {
             "method": "initialize",
             "id": INITIALIZE_ID,
             "params": {
-                "capabilities": {
-                    "experimentalApi": true
-                },
+                "capabilities": initialize_capabilities(),
                 "clientInfo": {
                     "name": "kairastra",
                     "title": "Kairastra Rust",
@@ -239,8 +235,10 @@ impl CodexSession {
                 "approvalPolicy": self.approval_policy,
                 "sandbox": self.config.thread_sandbox,
                 "cwd": self.workspace.to_string_lossy(),
-                "dynamicTools": dynamic_tool_specs(),
                 "model": self.config.model,
+                "serviceName": CODEX_SERVICE_NAME,
+                "ephemeral": true,
+                "experimentalRawEvents": false,
                 "serviceTier": self.config.service_tier(),
             }
         }))
@@ -266,7 +264,8 @@ impl CodexSession {
                 "input": [
                     {
                         "type": "text",
-                        "text": prompt
+                        "text": prompt,
+                        "text_elements": []
                     }
                 ],
                 "cwd": self.workspace.to_string_lossy(),
@@ -713,6 +712,267 @@ impl CodexSession {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CodexStartupProbe {
+    pub thread_id: String,
+}
+
+pub async fn probe_startup(settings: &Settings) -> Result<CodexStartupProbe> {
+    let config = super::config::load(settings)?;
+    let probe_workspace = make_probe_workspace(&settings.workspace.root)?;
+    let cargo_home = probe_workspace.join(".cargo-home");
+    let mut child = spawn_codex_app_server(
+        &config.command,
+        &probe_workspace,
+        &cargo_home,
+        Some(settings.tracker.api_key.as_str()),
+    )
+    .await?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("missing app-server stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("missing app-server stdout"))?;
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(log_stderr(stderr));
+    }
+
+    let mut client = ProbeClient {
+        config,
+        child,
+        stdin,
+        stdout: BufReader::new(stdout).lines(),
+        workspace: probe_workspace.clone(),
+    };
+
+    let startup = async {
+        client
+            .send_initialize()
+            .await
+            .context("codex_app_server_initialize_failed")?;
+        let thread_id = client
+            .start_thread()
+            .await
+            .context("codex_app_server_thread_start_failed")?;
+        client.stop().await?;
+        Ok::<CodexStartupProbe, anyhow::Error>(CodexStartupProbe { thread_id })
+    }
+    .await;
+
+    let _ = tokio::fs::remove_dir_all(&probe_workspace).await;
+    startup
+}
+
+struct ProbeClient {
+    config: CodexConfig,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+    workspace: PathBuf,
+}
+
+impl ProbeClient {
+    async fn send_initialize(&mut self) -> Result<()> {
+        write_jsonl_message(
+            &mut self.stdin,
+            json!({
+                "method": "initialize",
+                "id": INITIALIZE_ID,
+                "params": {
+                    "capabilities": initialize_capabilities(),
+                    "clientInfo": {
+                        "name": "kairastra",
+                        "title": "Kairastra Rust",
+                        "version": "0.1.0"
+                    }
+                }
+            }),
+        )
+        .await?;
+
+        let _ =
+            await_response(&mut self.stdout, INITIALIZE_ID, self.config.read_timeout_ms).await?;
+        write_jsonl_message(
+            &mut self.stdin,
+            json!({
+                "method": "initialized",
+                "params": {}
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn start_thread(&mut self) -> Result<String> {
+        write_jsonl_message(
+            &mut self.stdin,
+            json!({
+                "method": "thread/start",
+                "id": THREAD_START_ID,
+                "params": {
+                    "approvalPolicy": self.config.approval_policy,
+                    "sandbox": self.config.thread_sandbox,
+                    "cwd": self.workspace.to_string_lossy(),
+                    "model": self.config.model,
+                    "serviceName": CODEX_SERVICE_NAME,
+                    "ephemeral": true,
+                    "experimentalRawEvents": false,
+                    "serviceTier": self.config.service_tier(),
+                }
+            }),
+        )
+        .await?;
+
+        let payload = await_response(
+            &mut self.stdout,
+            THREAD_START_ID,
+            self.config.read_timeout_ms,
+        )
+        .await?;
+        payload
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(JsonValue::as_str)
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow!("invalid_thread_payload"))
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        if self.child.try_wait()?.is_none() {
+            self.child
+                .kill()
+                .await
+                .context("failed to stop app-server probe")?;
+        }
+        Ok(())
+    }
+}
+
+async fn spawn_codex_app_server(
+    command_line: &str,
+    workspace: &Path,
+    cargo_home: &Path,
+    github_token: Option<&str>,
+) -> Result<Child> {
+    tokio::fs::create_dir_all(cargo_home)
+        .await
+        .context("failed to create workspace cargo home")?;
+
+    let mut command = if let Some((program, args)) = parse_direct_command(command_line) {
+        let mut command = Command::new(program);
+        command.args(args);
+        command
+    } else {
+        let mut command = Command::new("bash");
+        command.arg("-lc").arg(command_line);
+        command
+    };
+    command.current_dir(workspace);
+    crate::workspace::apply_runtime_tool_env(&mut command);
+    sanitize_codex_child_env(&mut command);
+    command.env("CARGO_HOME", cargo_home);
+    if let Some(token) = github_token {
+        command.env("GITHUB_TOKEN", token);
+        command.env("GH_TOKEN", token);
+    }
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.kill_on_drop(true);
+
+    command.spawn().context("failed to launch codex app-server")
+}
+
+fn sanitize_codex_child_env(command: &mut Command) {
+    for (name, _) in std::env::vars() {
+        if name.starts_with("CODEX_") && !CODEX_ENV_ALLOWLIST.contains(&name.as_str()) {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn parse_direct_command(command_line: &str) -> Option<(String, Vec<String>)> {
+    let trimmed = command_line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains(|ch: char| matches!(ch, '|' | '&' | ';' | '<' | '>' | '$' | '`' | '\n'))
+        || trimmed.contains('"')
+        || trimmed.contains('\'')
+    {
+        return None;
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let program = parts.next()?.to_string();
+    let args = parts.map(ToString::to_string).collect::<Vec<_>>();
+    Some((program, args))
+}
+
+fn make_probe_workspace(base_root: &Path) -> Result<PathBuf> {
+    let suffix = Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000);
+    std::fs::create_dir_all(base_root)
+        .with_context(|| format!("failed to create {}", base_root.display()))?;
+    let path = base_root.join(format!(
+        ".doctor-codex-probe-{}-{suffix}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    Ok(path)
+}
+
+async fn write_jsonl_message(stdin: &mut ChildStdin, payload: JsonValue) -> Result<()> {
+    let encoded = serde_json::to_vec(&payload).context("failed to encode JSON-RPC payload")?;
+    stdin.write_all(&encoded).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+async fn await_response(
+    stdout: &mut Lines<BufReader<ChildStdout>>,
+    expected_id: u64,
+    timeout_ms: u64,
+) -> Result<JsonValue> {
+    loop {
+        let line = timeout(Duration::from_millis(timeout_ms), stdout.next_line())
+            .await
+            .map_err(|_| anyhow!("response_timeout"))?
+            .context("failed to read app-server response")?;
+
+        let Some(line) = line else {
+            return Err(anyhow!("app_server_exited_during_response"));
+        };
+
+        let payload: JsonValue = match serde_json::from_str(&line) {
+            Ok(payload) => payload,
+            Err(_) => {
+                debug!(
+                    line,
+                    "ignoring non-json response while awaiting app-server response"
+                );
+                continue;
+            }
+        };
+
+        if payload.get("id").and_then(JsonValue::as_u64) == Some(expected_id) {
+            if let Some(result) = payload.get("result") {
+                return Ok(result.clone());
+            }
+            if let Some(error) = payload.get("error") {
+                return Err(anyhow!("app_server_error_response: {error}"));
+            }
+            return Ok(payload);
+        }
+    }
+}
+
 fn validate_workspace_cwd(root: &Path, workspace: &Path) -> Result<()> {
     let canonical_root = root
         .canonicalize()
@@ -894,8 +1154,16 @@ fn needs_input(method: &str, payload: &JsonValue) -> bool {
             .unwrap_or(false)
 }
 
-fn dynamic_tool_specs() -> JsonValue {
-    JsonValue::Array(tool_schemas())
+fn initialize_capabilities() -> JsonValue {
+    json!({
+        "experimentalApi": false,
+        "optOutNotificationMethods": [
+            "item/agentMessage/delta",
+            "item/reasoning/summaryTextDelta",
+            "item/reasoning/summaryPartAdded",
+            "item/reasoning/textDelta"
+        ]
+    })
 }
 
 async fn execute_github_graphql(tracker: &GitHubTracker, arguments: JsonValue) -> JsonValue {
@@ -937,7 +1205,7 @@ fn dynamic_tool_failure(payload: JsonValue) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use tempfile::tempdir;
     use tokio::sync::mpsc::unbounded_channel;
@@ -948,7 +1216,12 @@ mod tests {
     use crate::github::GitHubTracker;
     use crate::model::{Issue, WorkflowDefinition};
 
-    use super::{AgentEventKind, CodexSession};
+    use super::{probe_startup, AgentEventKind, CodexSession};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn issue(identifier: &str) -> Issue {
         Issue {
@@ -994,6 +1267,7 @@ agent:
 providers:
   codex:
     command: "{}"
+    read_timeout_ms: 15000
 {}
 "#,
                 workspace_root.display(),
@@ -1291,6 +1565,64 @@ done
         assert!(trace.contains(r#""model":"gpt-5.4""#));
         assert!(trace.contains(r#""effort":"high""#));
         assert!(trace.contains(r#""serviceTier":"fast""#));
+    }
+
+    #[tokio::test]
+    async fn probe_startup_does_not_inherit_parent_codex_session_env() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("CODEX_THREAD_ID", "parent-thread");
+
+        let dir = tempdir().unwrap();
+        let workspace_root = dir.path().join("workspaces");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let trace_file = dir.path().join("probe.trace");
+        let env_file = dir.path().join("probe.env");
+        let script = dir.path().join("probe-codex.sh");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+trace_file='{}'
+env_file='{}'
+count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  printf '%s\n' "$line" >> "$trace_file"
+  case "$count" in
+    1)
+      printf '%s\n' "${{CODEX_THREAD_ID:-}}" > "$env_file"
+      printf '%s\n' '{{"id":1,"result":{{}}}}'
+      ;;
+    3)
+      printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"probe-thread"}}}}}}'
+      ;;
+  esac
+done
+"#,
+                trace_file.display(),
+                env_file.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let settings =
+            settings_with_command(&workspace_root, &script.display().to_string(), "", "");
+        let probe = probe_startup(&settings).await.unwrap();
+
+        assert_eq!(probe.thread_id, "probe-thread");
+        let trace = fs::read_to_string(trace_file).unwrap();
+        assert!(trace.contains(r#""method":"thread/start""#));
+        let inherited = fs::read_to_string(env_file).unwrap();
+        assert!(inherited.trim().is_empty());
+
+        std::env::remove_var("CODEX_THREAD_ID");
     }
 
     #[test]

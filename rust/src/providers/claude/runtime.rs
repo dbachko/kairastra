@@ -91,9 +91,8 @@ impl ClaudeSession {
         self.turn_counter += 1;
         let turn_id = format!("turn-{}", self.turn_counter);
 
-        // Invoke claude directly without a shell wrapper.  Using bash -lc re-sources login
-        // profile scripts (already done by the outer docker-user-session.sh wrapper) and can
-        // cause 5-30 second startup delays.  The binary is on PATH via the parent process env.
+        // Invoke Claude directly without a shell wrapper so startup stays predictable and the
+        // parent process PATH/auth environment remains the single source of truth.
         let argv = self.cli_argv();
         let mut command = Command::new(&argv[0]);
         command
