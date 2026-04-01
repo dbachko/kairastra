@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
@@ -101,7 +103,7 @@ pub fn load(settings: &Settings) -> Result<CodexConfig> {
 
 impl CodexConfig {
     pub fn turn_sandbox_policy(&self, workspace: &Path) -> JsonValue {
-        let workspace_root = workspace.to_string_lossy().to_string();
+        let required_writable_roots = sandbox_writable_roots(workspace);
 
         match self.turn_sandbox_policy.clone() {
             Some(mut policy) => {
@@ -111,13 +113,12 @@ impl CodexConfig {
                         .and_then(JsonValue::as_str)
                         .map(|value| value == "workspaceWrite")
                         .unwrap_or(false);
-                    let missing_writable_roots = object
-                        .get("writableRoots")
-                        .map(|value| value.is_null())
-                        .unwrap_or(true);
-
-                    if is_workspace_write && missing_writable_roots {
-                        object.insert("writableRoots".to_string(), json!([workspace_root]));
+                    if is_workspace_write {
+                        let writable_roots = merge_writable_roots(
+                            object.get("writableRoots"),
+                            &required_writable_roots,
+                        );
+                        object.insert("writableRoots".to_string(), json!(writable_roots));
                     }
                 }
 
@@ -125,7 +126,7 @@ impl CodexConfig {
             }
             None => json!({
                 "type": "workspaceWrite",
-                "writableRoots": [workspace_root]
+                "writableRoots": required_writable_roots
             }),
         }
     }
@@ -137,6 +138,81 @@ impl CodexConfig {
             None => None,
         }
     }
+}
+
+fn sandbox_writable_roots(workspace: &Path) -> Vec<String> {
+    let mut roots = BTreeSet::new();
+    roots.insert(workspace.to_string_lossy().to_string());
+
+    for path in workspace_git_admin_roots(workspace) {
+        roots.insert(path.to_string_lossy().to_string());
+    }
+
+    roots.into_iter().collect()
+}
+
+fn merge_writable_roots(existing: Option<&JsonValue>, required_roots: &[String]) -> Vec<String> {
+    let mut roots = BTreeSet::new();
+
+    if let Some(values) = existing.and_then(JsonValue::as_array) {
+        for value in values {
+            if let Some(path) = value.as_str() {
+                roots.insert(path.to_string());
+            }
+        }
+    }
+
+    for path in required_roots {
+        roots.insert(path.clone());
+    }
+
+    roots.into_iter().collect()
+}
+
+fn workspace_git_admin_roots(workspace: &Path) -> Vec<PathBuf> {
+    let git_path = workspace.join(".git");
+    if !git_path.is_file() {
+        return Vec::new();
+    }
+
+    let Some(gitdir) = resolve_worktree_gitdir(&git_path) else {
+        return Vec::new();
+    };
+
+    let mut roots = BTreeSet::new();
+    roots.insert(gitdir.clone());
+
+    if let Some(common_dir) = resolve_common_dir(&gitdir) {
+        roots.insert(common_dir);
+    }
+
+    roots.into_iter().collect()
+}
+
+fn resolve_worktree_gitdir(git_file: &Path) -> Option<PathBuf> {
+    let contents = fs::read_to_string(git_file).ok()?;
+    let raw_path = contents.strip_prefix("gitdir:")?.trim();
+    let gitdir = if Path::new(raw_path).is_absolute() {
+        PathBuf::from(raw_path)
+    } else {
+        git_file.parent()?.join(raw_path)
+    };
+    gitdir.canonicalize().ok().or(Some(gitdir))
+}
+
+fn resolve_common_dir(gitdir: &Path) -> Option<PathBuf> {
+    let commondir_file = gitdir.join("commondir");
+    let contents = fs::read_to_string(commondir_file).ok()?;
+    let raw_path = contents.trim();
+    if raw_path.is_empty() {
+        return None;
+    }
+    let common_dir = if Path::new(raw_path).is_absolute() {
+        PathBuf::from(raw_path)
+    } else {
+        gitdir.join(raw_path)
+    };
+    common_dir.canonicalize().ok().or(Some(common_dir))
 }
 
 fn validate_reasoning_effort(value: &str) -> Result<()> {
@@ -161,8 +237,11 @@ fn default_approval_policy() -> JsonValue {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::fs;
     use std::path::Path;
     use std::sync::Mutex;
+
+    use tempfile::tempdir;
 
     use crate::config::Settings;
     use crate::model::WorkflowDefinition;
@@ -295,8 +374,40 @@ providers:
 
         assert_eq!(
             policy["writableRoots"],
-            serde_json::json!(["relative/path"])
+            serde_json::json!(["/tmp/workspace", "relative/path"])
         );
         assert_eq!(policy["networkAccess"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn worktree_git_admin_dirs_are_added_to_writable_roots() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let gitdir = dir.path().join("seed/.git/worktrees/issue-1");
+        let common_dir = dir.path().join("seed/.git");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::create_dir_all(&common_dir).unwrap();
+        fs::write(
+            workspace.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        fs::write(gitdir.join("commondir"), "../../\n").unwrap();
+
+        let settings = settings("");
+        let policy = load(&settings).unwrap().turn_sandbox_policy(&workspace);
+        let expected_common_dir = common_dir.canonicalize().unwrap();
+        let expected_gitdir = gitdir.canonicalize().unwrap();
+
+        assert_eq!(policy["type"], "workspaceWrite");
+        assert_eq!(
+            policy["writableRoots"],
+            serde_json::json!([
+                expected_common_dir.display().to_string(),
+                expected_gitdir.display().to_string(),
+                workspace.display().to_string()
+            ])
+        );
     }
 }

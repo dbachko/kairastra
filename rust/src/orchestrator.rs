@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -41,6 +41,7 @@ struct RuntimeState {
     claimed: HashSet<String>,
     blocked_claims: HashMap<String, String>,
     retry_attempts: HashMap<String, RetryEntry>,
+    last_idle_summary: Option<String>,
     agent_totals: AgentTotals,
     agent_rate_limits: Option<JsonValue>,
 }
@@ -242,6 +243,24 @@ impl Orchestrator {
             available_slots,
             "dispatch candidates"
         );
+        if dispatchable.is_empty() {
+            if let Some(summary) = summarize_idle_dispatch(snapshot, &issues, state) {
+                if state.last_idle_summary.as_deref() != Some(summary.as_str()) {
+                    let has_unknown_states = issues.iter().any(|issue| {
+                        !snapshot.settings.active_state(&issue.state)
+                            && !snapshot.settings.terminal_state(&issue.state)
+                    });
+                    if has_unknown_states {
+                        warn!(available_slots, summary = %summary, "no dispatchable issues");
+                    } else {
+                        info!(available_slots, summary = %summary, "no dispatchable issues");
+                    }
+                    state.last_idle_summary = Some(summary);
+                }
+            }
+        } else {
+            state.last_idle_summary = None;
+        }
         let mut dispatched = 0_usize;
         for issue in dispatchable {
             if dispatched >= available_slots {
@@ -911,6 +930,7 @@ impl Orchestrator {
             provider = context.provider,
             action = %context.blocked.operator_action,
             state = %issue.state,
+            workpad_comment = issue.workpad_comment_url.as_deref().unwrap_or("unavailable"),
             "issue blocked; recorded blocker details on the issue"
         );
         Ok(issue.clone())
@@ -1631,7 +1651,18 @@ fn classify_blocked_worker_failure(
     let normalized = error.to_ascii_lowercase();
     let move_back_action = move_issue_back_instruction(settings);
 
-    let operator_action = if normalized.contains("approval_required")
+    let operator_action = if normalized.contains("oauth token has expired")
+        || normalized.contains("authentication_error")
+        || normalized.contains("failed to authenticate")
+        || normalized.contains("please obtain a new token")
+    {
+        format!(
+            "Refresh {} auth with `kairastra auth --provider {} login --mode subscription`, then {}.",
+            provider_display_name(provider),
+            provider,
+            move_back_action
+        )
+    } else if normalized.contains("approval_required")
         || normalized.contains("requested permissions")
     {
         format!(
@@ -1873,6 +1904,59 @@ fn merge_blocker_section(existing_body: &str, blocker_section: &str) -> String {
     }
 }
 
+fn summarize_idle_dispatch(
+    snapshot: &WorkflowSnapshot,
+    issues: &[Issue],
+    state: &RuntimeState,
+) -> Option<String> {
+    if issues.is_empty() {
+        return Some("no tracked issues matched the configured workflow".to_string());
+    }
+
+    let mut state_counts = BTreeMap::<String, usize>::new();
+    let mut unknown_states = Vec::new();
+    let mut blocked_claims = Vec::new();
+
+    for issue in issues {
+        *state_counts.entry(issue.state.clone()).or_default() += 1;
+
+        if !snapshot.settings.active_state(&issue.state)
+            && !snapshot.settings.terminal_state(&issue.state)
+        {
+            unknown_states.push(format!("{} ({})", issue.identifier, issue.state));
+        }
+
+        if state.blocked_claims.contains_key(&issue.id) {
+            blocked_claims.push(issue.identifier.clone());
+        }
+    }
+
+    let mut parts = vec![
+        format!(
+            "states={}",
+            state_counts
+                .into_iter()
+                .map(|(state, count)| format!("{state}:{count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        format!(
+            "claimable_states={}",
+            snapshot.settings.tracker.claimable_states.join(", ")
+        ),
+    ];
+
+    if !unknown_states.is_empty() {
+        parts.push(format!("unknown_states={}", unknown_states.join(", ")));
+    }
+
+    if !blocked_claims.is_empty() {
+        parts.push(format!("blocked_claims={}", blocked_claims.join(", ")));
+    }
+
+    Some(parts.join(" | "))
+}
+
 fn select_dispatchable(
     snapshot: &WorkflowSnapshot,
     issues: &[Issue],
@@ -2079,9 +2163,10 @@ mod tests {
         codex_item_failure_is_expected_probe, extract_codex_command, extract_rate_limits,
         extract_token_usage, hold_blocked_claim, issue_eligible, issue_provider, issue_sort_key,
         merge_blocker_section, render_blocked_failure_workpad, select_dispatchable,
-        should_release_blocked_claim, summarize_agent_event, summarize_worker_error,
-        tool_log_fields, truncate_summary, usage_delta, IssueProviderSelection, RuntimeState,
-        TokenUsage, BLOCKER_SECTION_END, BLOCKER_SECTION_START,
+        should_release_blocked_claim, summarize_agent_event, summarize_idle_dispatch,
+        summarize_worker_error, tool_log_fields, truncate_summary, usage_delta,
+        IssueProviderSelection, RuntimeState, TokenUsage, BLOCKER_SECTION_END,
+        BLOCKER_SECTION_START,
     };
     use crate::workflow::WorkflowSnapshot;
 
@@ -2420,6 +2505,21 @@ providers:
     }
 
     #[test]
+    fn classifies_expired_claude_oauth_as_blocked() {
+        let snapshot = snapshot();
+        let blocked = classify_blocked_worker_failure(
+            &snapshot.settings,
+            "claude",
+            r#"Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired. Please obtain a new token or refresh your existing token."}}"#,
+        )
+        .expect("expired Claude OAuth should block");
+
+        assert!(blocked
+            .operator_action
+            .contains("kairastra auth --provider claude login"));
+    }
+
+    #[test]
     fn truncate_summary_keeps_valid_utf8() {
         let summary = truncate_summary("hello café こんにちは", 11);
         assert!(summary.starts_with("hello "));
@@ -2656,6 +2756,19 @@ providers:
         assert!(body.contains("unknown-host:repo#55@unknown"));
         assert!(!body.contains("/workspaces/openai_repo_55"));
         assert!(body.contains("issues/55"));
+    }
+
+    #[test]
+    fn idle_dispatch_summary_surfaces_unknown_issue_states() {
+        let snapshot = snapshot();
+        let issue = issue("3", "Open", Some(1));
+        let state = RuntimeState::default();
+
+        let summary = summarize_idle_dispatch(&snapshot, &[issue], &state).expect("summary");
+
+        assert!(summary.contains("states=Open:1"));
+        assert!(summary.contains("claimable_states=Todo"));
+        assert!(summary.contains("unknown_states=openai/repo#3 (Open)"));
     }
 
     #[test]

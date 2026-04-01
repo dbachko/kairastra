@@ -45,7 +45,8 @@ Useful optional fields:
 Practical model:
 
 - One workflow should target one repository.
-- `issues_only` is the repo-first mode. Kairastra polls `owner/repo` issues directly.
+- `issues_only` is the repo-first mode. Kairastra polls `owner/repo` issues directly and uses
+  label-backed workflow states for routing and handoff.
 - `projects_v2` is still repo-scoped. Kairastra reads items from the configured project, then only dispatches issues that belong to the configured repository.
 
 ### `polling`

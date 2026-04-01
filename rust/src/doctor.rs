@@ -273,19 +273,26 @@ fn check_auth_status(settings: &Settings) -> DoctorCheck {
     };
     DoctorCheck {
         name: "agent_provider_auth",
-        status: if auth_status.credentials_present {
+        status: if auth_status.credentials_usable {
             DoctorStatus::Pass
+        } else if auth_status.credentials_present {
+            DoctorStatus::Fail
         } else {
             DoctorStatus::Warn
         },
         detail: format!(
-            "provider={} configured={} inferred={} auth_file={} api_key_present={} credentials_present={} local_auth_path={}",
+            "provider={} configured={} inferred={} auth_file={} api_key_present={} credentials_present={} credentials_usable={} auth_problem={} local_auth_path={}",
             auth_status.provider,
             auth_status.configured_mode,
             auth_status.inferred_mode,
             auth_status.auth_file_present,
             auth_status.api_key_present,
             auth_status.credentials_present,
+            auth_status.credentials_usable,
+            auth_status
+                .auth_problem
+                .as_deref()
+                .unwrap_or("unknown"),
             auth_status.auth_file_path.display(),
         ),
     }
@@ -973,14 +980,17 @@ fn print_text_report(report: &DoctorReport) {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_seed_repo_git, check_seed_repo_skills, check_seed_repo_support_dirs,
-        check_workspace_root, infer_mode, DoctorStatus,
+        check_auth_status, check_seed_repo_git, check_seed_repo_skills,
+        check_seed_repo_support_dirs, check_workspace_root, infer_mode, DoctorStatus,
     };
+    use crate::config::Settings;
     use crate::deploy::DeployMode;
     use crate::workflow::load_definition;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -1000,11 +1010,23 @@ tracker:
   owner: example-owner
   repo: example-repo
   status_source:
-    type: git_hub_state
+    type: label
   active_states:
-    - Open
+    - Todo
+    - In Progress
+    - Merging
+    - Rework
   terminal_states:
     - Closed
+    - Cancelled
+    - Canceled
+    - Duplicate
+    - Done
+  claimable_states:
+    - Todo
+  in_progress_state: In Progress
+  human_review_state: Human Review
+  done_state: Done
 workspace:
   root: /tmp/kairastra-workspaces
 agent:
@@ -1064,6 +1086,75 @@ providers:
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: OsString) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.original.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn unix_time_ms(offset: Duration) -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .saturating_add(offset)
+            .as_millis() as u64
+    }
+
+    fn write_claude_workflow(dir: &Path) -> std::path::PathBuf {
+        let workflow_path = dir.join("WORKFLOW.md");
+        fs::write(
+            &workflow_path,
+            r#"---
+tracker:
+  kind: github
+  mode: issues_only
+  api_key: ghp_test
+  owner: example-owner
+  repo: example-repo
+  status_source:
+    type: label
+  active_states:
+    - Todo
+  terminal_states:
+    - Done
+  claimable_states:
+    - Todo
+workspace:
+  root: /tmp/kairastra-workspaces
+agent:
+  provider: claude
+providers:
+  claude: {}
+---
+"#,
+        )
+        .unwrap();
+        workflow_path
     }
 
     #[test]
@@ -1181,5 +1272,36 @@ providers:
         let check = check_workspace_root(&dir.path().join("custom-root/workspaces"));
         assert_eq!(check.status, DoctorStatus::Warn);
         assert!(check.detail.contains("does not exist yet"));
+    }
+
+    #[test]
+    fn doctor_fails_when_claude_oauth_is_expired() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+        let claude_dir = home_dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join(".credentials.json"),
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"token","refreshToken":"refresh","expiresAt":{},"scopes":["user:inference"]}}}}"#,
+                unix_time_ms(Duration::from_secs(0)).saturating_sub(60_000)
+            ),
+        )
+        .unwrap();
+
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let _mode = EnvVarGuard::set("CLAUDE_AUTH_MODE", OsString::from("auto"));
+        let _api_key = EnvVarGuard::unset("ANTHROPIC_API_KEY");
+        let _oauth_token = EnvVarGuard::unset("CLAUDE_CODE_OAUTH_TOKEN");
+
+        let workflow_path = write_claude_workflow(dir.path());
+        let definition = load_definition(&workflow_path).unwrap();
+        let settings = Settings::from_workflow(&definition).unwrap();
+
+        let check = check_auth_status(&settings);
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(check.detail.contains("auth_problem=expired_oauth_token"));
+        assert!(check.detail.contains("credentials_usable=false"));
     }
 }

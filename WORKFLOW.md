@@ -475,6 +475,7 @@ The agent should be able to talk to GitHub through the injected `github_graphql`
 - Treat any issue-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
 - When meaningful out-of-scope improvements are discovered during execution, file a separate follow-up issue instead of expanding scope. The follow-up issue must include a clear title, description, and acceptance criteria, be placed in `Todo` or `Backlog`, be assigned to the same GitHub Project when possible, link the current issue as related, and use issue dependencies when the follow-up depends on the current issue.
 - Move status only when the matching quality bar is met.
+- Never land or merge from `Human Review`; only land from `Merging`.
 - Operate autonomously end to end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers after exhausting documented fallbacks.
 

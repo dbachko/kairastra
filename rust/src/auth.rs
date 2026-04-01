@@ -54,6 +54,8 @@ pub struct AuthStatus {
     pub auth_file_present: bool,
     pub api_key_present: bool,
     pub credentials_present: bool,
+    pub credentials_usable: bool,
+    pub auth_problem: Option<String>,
 }
 
 pub fn inspect_status(provider: &str) -> Result<AuthStatus> {
@@ -87,7 +89,7 @@ pub fn run_login_menu(provider: Option<&str>) -> Result<()> {
         .collect::<Vec<_>>();
     let default_index = entries
         .iter()
-        .position(|entry| !entry.status.credentials_present)
+        .position(|entry| !entry.status.credentials_usable)
         .unwrap_or(0);
 
     let selection = Select::with_theme(&ColorfulTheme::default())
@@ -241,7 +243,7 @@ fn login_action(status: &AuthStatus) -> LoginAction {
         return LoginAction::ApiKeyReady;
     }
 
-    if status.auth_file_present {
+    if status.auth_file_present && status.credentials_usable {
         return LoginAction::AlreadyLoggedIn;
     }
 
@@ -300,6 +302,8 @@ mod tests {
             auth_file_present: false,
             api_key_present: false,
             credentials_present: false,
+            credentials_usable: false,
+            auth_problem: Some("missing_credentials".to_string()),
         }
     }
 
@@ -309,6 +313,8 @@ mod tests {
         status.inferred_mode = AuthMode::ApiKey;
         status.api_key_present = true;
         status.credentials_present = true;
+        status.credentials_usable = true;
+        status.auth_problem = Some("api_key_ready".to_string());
 
         assert_eq!(login_action(&status), LoginAction::ApiKeyReady);
     }
@@ -326,6 +332,8 @@ mod tests {
         let mut status = status("claude");
         status.auth_file_present = true;
         status.credentials_present = true;
+        status.credentials_usable = true;
+        status.auth_problem = Some("subscription_ready".to_string());
 
         assert_eq!(
             provider_menu_label("Claude Code", &status),
@@ -347,6 +355,8 @@ mod tests {
         status.api_key_present = true;
         status.auth_file_present = true;
         status.credentials_present = true;
+        status.credentials_usable = true;
+        status.auth_problem = Some("api_key_ready".to_string());
 
         assert_eq!(
             provider_menu_label("Codex", &status),

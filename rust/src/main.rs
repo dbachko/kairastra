@@ -201,6 +201,16 @@ async fn run_orchestrator(workflow: Option<PathBuf>, once: bool) -> Result<()> {
 
     let workflow_store = Arc::new(WorkflowStore::new(workflow_path));
     let snapshot = workflow_store.current()?;
+    if let Ok(auth_status) = inspect_status(snapshot.settings.agent.provider.as_str()) {
+        if !auth_status.credentials_usable {
+            warn!(
+                provider = snapshot.settings.agent.provider.as_str(),
+                auth_problem = auth_status.auth_problem.as_deref().unwrap_or("unknown"),
+                auth_path = %auth_status.auth_file_path.display(),
+                "default provider auth is not usable; affected issues will be blocked until auth is refreshed"
+            );
+        }
+    }
     if let Some(dashboard_url) = snapshot.settings.tracker_dashboard_url() {
         info!(dashboard_url = %dashboard_url, "using GitHub dashboard for Kairastra");
     } else {

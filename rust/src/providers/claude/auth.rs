@@ -42,17 +42,24 @@ pub fn inspect_status() -> AuthStatus {
     let api_key_present = std::env::var(API_KEY_ENV)
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false);
-    let oauth_token_env_present = read_non_empty_env(OAUTH_TOKEN_ENV).is_some();
-    let oauth_token_file_present = oauth_token_file_path().is_file();
-    let credentials_file_valid = read_credentials_file()
+    let credentials_file = read_credentials_file();
+    let credentials_file_present = auth_file_path().is_file();
+    let credentials_file_valid = credentials_file
+        .as_ref()
         .map(|c| !is_expired(c.claude_ai_oauth.expires_at))
         .unwrap_or(false);
+    let credentials_file_expired = credentials_file.is_some() && !credentials_file_valid;
+    let oauth_token_env_present = read_non_empty_env(OAUTH_TOKEN_ENV).is_some();
+    let oauth_token_file_present = oauth_token_file_path().is_file();
     let oauth_token_present =
         oauth_token_env_present || oauth_token_file_present || credentials_file_valid;
     let effective_auth_path =
         effective_auth_path(oauth_token_env_present, oauth_token_file_present);
-    let logged_in = read_logged_in_status().unwrap_or(false) || credentials_file_valid;
-    let auth_file_present = auth_file_path().is_file() || oauth_token_present || logged_in;
+    let logged_in = read_logged_in_status().unwrap_or(false);
+    let auth_file_present = credentials_file_present
+        || oauth_token_env_present
+        || oauth_token_file_present
+        || logged_in;
 
     let inferred_mode = match configured_mode {
         AuthMode::ApiKey => AuthMode::ApiKey,
@@ -60,7 +67,7 @@ pub fn inspect_status() -> AuthStatus {
         AuthMode::Auto => {
             if api_key_present {
                 AuthMode::ApiKey
-            } else if oauth_token_present || logged_in {
+            } else if oauth_token_present || credentials_file_present || logged_in {
                 AuthMode::Subscription
             } else {
                 AuthMode::Auto
@@ -76,7 +83,23 @@ pub fn inspect_status() -> AuthStatus {
         auth_file_path: effective_auth_path,
         auth_file_present,
         api_key_present,
-        credentials_present: api_key_present || auth_file_present || logged_in,
+        credentials_present: api_key_present || auth_file_present,
+        credentials_usable: if api_key_present {
+            true
+        } else {
+            credentials_file_valid || oauth_token_env_present || oauth_token_file_present
+        },
+        auth_problem: if api_key_present {
+            Some("api_key_ready".to_string())
+        } else if credentials_file_valid || oauth_token_env_present || oauth_token_file_present {
+            Some("subscription_ready".to_string())
+        } else if credentials_file_expired {
+            Some("expired_oauth_token".to_string())
+        } else if logged_in {
+            Some("subscription_login_detected".to_string())
+        } else {
+            Some("missing_credentials".to_string())
+        },
     }
 }
 
@@ -197,4 +220,123 @@ fn read_credentials_file() -> Option<ClaudeCredentialsFile> {
     let path = credentials_file_path();
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str::<ClaudeCredentialsFile>(&data).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::sync::Mutex;
+    use std::time::{Duration, SystemTime};
+
+    use super::{inspect_status, API_KEY_ENV, AUTH_MODE_ENV, OAUTH_TOKEN_ENV};
+    use crate::auth::AuthMode;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: OsString) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.original.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn write_credentials(home_dir: &std::path::Path, expires_at_ms: u64) {
+        let claude_dir = home_dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join(".credentials.json"),
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"token","refreshToken":"refresh","expiresAt":{},"scopes":["user:inference"]}}}}"#,
+                expires_at_ms
+            ),
+        )
+        .unwrap();
+    }
+
+    fn unix_time_ms(offset: Duration) -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .saturating_add(offset)
+            .as_millis() as u64
+    }
+
+    #[test]
+    fn expired_credentials_are_present_but_not_usable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+        write_credentials(
+            &home_dir,
+            unix_time_ms(Duration::from_secs(0)).saturating_sub(60_000),
+        );
+
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let _mode = EnvVarGuard::set(AUTH_MODE_ENV, OsString::from("auto"));
+        let _api_key = EnvVarGuard::unset(API_KEY_ENV);
+        let _oauth_token = EnvVarGuard::unset(OAUTH_TOKEN_ENV);
+
+        let status = inspect_status();
+        assert_eq!(status.inferred_mode, AuthMode::Subscription);
+        assert!(status.credentials_present);
+        assert!(!status.credentials_usable);
+        assert_eq!(status.auth_problem.as_deref(), Some("expired_oauth_token"));
+    }
+
+    #[test]
+    fn valid_credentials_are_usable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+        write_credentials(&home_dir, unix_time_ms(Duration::from_secs(3600)));
+
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let _mode = EnvVarGuard::set(AUTH_MODE_ENV, OsString::from("auto"));
+        let _api_key = EnvVarGuard::unset(API_KEY_ENV);
+        let _oauth_token = EnvVarGuard::unset(OAUTH_TOKEN_ENV);
+
+        let status = inspect_status();
+        assert_eq!(status.inferred_mode, AuthMode::Subscription);
+        assert!(status.credentials_present);
+        assert!(status.credentials_usable);
+        assert_eq!(status.auth_problem.as_deref(), Some("subscription_ready"));
+    }
+
+    #[test]
+    fn api_key_auth_is_usable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _mode = EnvVarGuard::set(AUTH_MODE_ENV, OsString::from("api_key"));
+        let _api_key = EnvVarGuard::set(API_KEY_ENV, OsString::from("test-key"));
+        let _oauth_token = EnvVarGuard::unset(OAUTH_TOKEN_ENV);
+
+        let status = inspect_status();
+        assert_eq!(status.inferred_mode, AuthMode::ApiKey);
+        assert!(status.api_key_present);
+        assert!(status.credentials_present);
+        assert!(status.credentials_usable);
+        assert_eq!(status.auth_problem.as_deref(), Some("api_key_ready"));
+    }
 }

@@ -12,6 +12,7 @@ use serde_json::{json, Value as JsonValue};
 use tracing::{debug, warn};
 
 use crate::config::{normalize_issue_state, FieldSourceType, GitHubMode, TrackerSettings};
+use crate::github_bootstrap::derive_status_option_names;
 use crate::model::{BlockerRef, Issue};
 use crate::providers::is_workpad_comment;
 
@@ -478,26 +479,28 @@ query KairastraProjectStatusField($owner: String!, $projectNumber: Int!) {
         issue: &Issue,
         target_status: &str,
     ) -> Result<Issue> {
-        if self.settings.mode != GitHubMode::ProjectsV2
-            || issue.state.trim().eq_ignore_ascii_case(target_status)
-        {
+        if issue.state.trim().eq_ignore_ascii_case(target_status) {
             return Ok(issue.clone());
         }
 
-        let Some(project_item_id) = issue.project_item_id.as_ref() else {
-            return Ok(issue.clone());
-        };
+        match self.settings.mode {
+            GitHubMode::ProjectsV2 => {
+                let Some(project_item_id) = issue.project_item_id.as_ref() else {
+                    return Ok(issue.clone());
+                };
 
-        let metadata = self.load_project_status_field_metadata().await?;
-        let option_id = metadata
-            .options
-            .iter()
-            .find(|option| option.name.eq_ignore_ascii_case(target_status))
-            .map(|option| option.id.clone())
-            .ok_or_else(|| anyhow!("github_project_status_option_not_found: {target_status}"))?;
+                let metadata = self.load_project_status_field_metadata().await?;
+                let option_id = metadata
+                    .options
+                    .iter()
+                    .find(|option| option.name.eq_ignore_ascii_case(target_status))
+                    .map(|option| option.id.clone())
+                    .ok_or_else(|| {
+                        anyhow!("github_project_status_option_not_found: {target_status}")
+                    })?;
 
-        self.graphql_raw(
-            r#"
+                self.graphql_raw(
+                    r#"
 mutation KairastraUpdateProjectItemStatus(
   $projectId: ID!,
   $itemId: ID!,
@@ -517,14 +520,20 @@ mutation KairastraUpdateProjectItemStatus(
     }
   }
 }"#,
-            json!({
-                "projectId": metadata.project_id,
-                "itemId": project_item_id,
-                "fieldId": metadata.field_id,
-                "optionId": option_id,
-            }),
-        )
-        .await?;
+                    json!({
+                        "projectId": metadata.project_id,
+                        "itemId": project_item_id,
+                        "fieldId": metadata.field_id,
+                        "optionId": option_id,
+                    }),
+                )
+                .await?;
+            }
+            GitHubMode::IssuesOnly => {
+                self.transition_issue_label_status(issue, target_status)
+                    .await?;
+            }
+        }
 
         let refreshed = self
             .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
@@ -534,6 +543,42 @@ mutation KairastraUpdateProjectItemStatus(
             updated.state = target_status.to_string();
             updated
         }))
+    }
+
+    async fn transition_issue_label_status(
+        &self,
+        issue: &Issue,
+        target_status: &str,
+    ) -> Result<()> {
+        let (owner, repo, issue_number) = issue_locator(issue)?;
+        let issue_path = format!("/repos/{owner}/{repo}/issues/{issue_number}");
+        let response = self
+            .rest_json(reqwest::Method::GET, &issue_path, None)
+            .await?;
+        let rest_issue: RestIssue =
+            serde_json::from_value(response).context("invalid GitHub issue payload")?;
+
+        let existing_labels = rest_issue
+            .labels
+            .into_iter()
+            .filter_map(|label| label.name)
+            .collect::<Vec<_>>();
+        let updated_labels =
+            replace_workflow_status_labels(&self.settings, &existing_labels, target_status);
+
+        if updated_labels == existing_labels {
+            return Ok(());
+        }
+
+        let labels_path = format!("/repos/{owner}/{repo}/issues/{issue_number}/labels");
+        self.rest_json(
+            reqwest::Method::PUT,
+            &labels_path,
+            Some(json!({ "labels": updated_labels })),
+        )
+        .await?;
+
+        Ok(())
     }
 
     pub async fn transition_issue_to_in_progress_on_claim(&self, issue: &Issue) -> Result<Issue> {
@@ -662,19 +707,7 @@ mutation KairastraUpdateProjectItemStatus(
             return self.ensure_workpad_comment(issue, body).await;
         };
 
-        let (owner, repo, _) = issue_locator(issue)?;
-        let path = format!("/repos/{owner}/{repo}/issues/comments/{comment_id}");
-        let response = self
-            .rest_json(reqwest::Method::PATCH, &path, Some(json!({ "body": body })))
-            .await?;
-        let comment: RestIssueComment = serde_json::from_value(response)
-            .context("invalid GitHub updated issue comment payload")?;
-
-        let mut updated = issue.clone();
-        updated.workpad_comment_id = Some(comment.id);
-        updated.workpad_comment_url = comment.html_url;
-        updated.workpad_comment_body = Some(comment.body);
-        Ok(updated)
+        self.patch_workpad_comment(issue, comment_id, body).await
     }
 
     pub async fn list_issue_comments(&self, issue: &Issue) -> Result<Vec<RestIssueComment>> {
@@ -702,11 +735,15 @@ mutation KairastraUpdateProjectItemStatus(
             .rev()
             .find(|comment| is_workpad_comment(&comment.body))
         {
-            let mut updated = issue.clone();
-            updated.workpad_comment_id = Some(comment.id);
-            updated.workpad_comment_url = comment.html_url;
-            updated.workpad_comment_body = Some(comment.body);
-            return Ok(updated);
+            if comment.body == body {
+                let mut updated = issue.clone();
+                updated.workpad_comment_id = Some(comment.id);
+                updated.workpad_comment_url = comment.html_url;
+                updated.workpad_comment_body = Some(comment.body);
+                return Ok(updated);
+            }
+
+            return self.patch_workpad_comment(issue, comment.id, body).await;
         }
 
         let path = format!("/repos/{owner}/{repo}/issues/{issue_number}/comments");
@@ -715,6 +752,27 @@ mutation KairastraUpdateProjectItemStatus(
             .await?;
         let comment: RestIssueComment = serde_json::from_value(response)
             .context("invalid GitHub created issue comment payload")?;
+
+        let mut updated = issue.clone();
+        updated.workpad_comment_id = Some(comment.id);
+        updated.workpad_comment_url = comment.html_url;
+        updated.workpad_comment_body = Some(comment.body);
+        Ok(updated)
+    }
+
+    async fn patch_workpad_comment(
+        &self,
+        issue: &Issue,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<Issue> {
+        let (owner, repo, _) = issue_locator(issue)?;
+        let path = format!("/repos/{owner}/{repo}/issues/comments/{comment_id}");
+        let response = self
+            .rest_json(reqwest::Method::PATCH, &path, Some(json!({ "body": body })))
+            .await?;
+        let comment: RestIssueComment = serde_json::from_value(response)
+            .context("invalid GitHub updated issue comment payload")?;
 
         let mut updated = issue.clone();
         updated.workpad_comment_id = Some(comment.id);
@@ -1111,36 +1169,139 @@ fn resolve_issue_state(
     issue: &RestIssue,
     field_values: &HashMap<String, JsonValue>,
 ) -> String {
+    let issue_state = title_case_state(&issue.state);
     match settings
         .status_source
         .as_ref()
         .map(|source| source.source_type)
     {
-        Some(FieldSourceType::IssueField) => settings
-            .status_source
-            .as_ref()
-            .and_then(|source| source.name.as_ref())
-            .and_then(|name| field_values.get(name))
-            .and_then(json_stringish)
-            .as_deref()
-            .map(title_case_state)
-            .unwrap_or_else(|| title_case_state(&issue.state)),
-        Some(FieldSourceType::Label) => settings
-            .status_source
-            .as_ref()
-            .and_then(|source| source.name.as_ref())
-            .and_then(|prefix| {
-                issue
-                    .labels
-                    .iter()
-                    .filter_map(|label| label.name.as_ref())
-                    .find_map(|label| label.strip_prefix(prefix).map(str::trim))
-            })
-            .map(ToString::to_string)
-            .unwrap_or_else(|| title_case_state(&issue.state)),
+        Some(FieldSourceType::IssueField) => finalize_issue_state(
+            settings,
+            &issue_state,
+            settings
+                .status_source
+                .as_ref()
+                .and_then(|source| source.name.as_ref())
+                .and_then(|name| field_values.get(name))
+                .and_then(json_stringish)
+                .as_deref()
+                .map(title_case_state),
+        ),
+        Some(FieldSourceType::Label) => finalize_issue_state(
+            settings,
+            &issue_state,
+            issue
+                .labels
+                .iter()
+                .filter_map(|label| label.name.as_deref())
+                .find_map(|label| resolve_status_label_value(settings, label)),
+        ),
         Some(FieldSourceType::GitHubState) | None | Some(FieldSourceType::ProjectField) => {
-            title_case_state(&issue.state)
+            issue_state
         }
+    }
+}
+
+fn finalize_issue_state(
+    settings: &TrackerSettings,
+    issue_state: &str,
+    resolved_state: Option<String>,
+) -> String {
+    if issue_state.eq_ignore_ascii_case("closed") {
+        if let Some(resolved_state) = resolved_state {
+            if settings
+                .terminal_states
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&resolved_state))
+            {
+                return resolved_state;
+            }
+        }
+        return settings
+            .done_state
+            .clone()
+            .unwrap_or_else(|| issue_state.to_string());
+    }
+
+    resolved_state.unwrap_or_else(|| issue_state.to_string())
+}
+
+fn resolve_status_label_value(settings: &TrackerSettings, label: &str) -> Option<String> {
+    let status_labels = workflow_status_labels(settings);
+    let prefix = settings
+        .status_source
+        .as_ref()
+        .and_then(|source| source.name.as_deref())
+        .filter(|prefix| !prefix.trim().is_empty());
+
+    let candidate = match prefix {
+        Some(prefix) => label.strip_prefix(prefix).map(str::trim)?,
+        None => label,
+    };
+
+    let normalized = normalize_issue_state(candidate);
+    status_labels
+        .into_iter()
+        .find(|status| normalize_issue_state(status) == normalized)
+}
+
+fn workflow_status_labels(settings: &TrackerSettings) -> Vec<String> {
+    derive_status_option_names(
+        &settings.active_states,
+        &settings.terminal_states,
+        &settings.claimable_states,
+        settings.in_progress_state.as_deref(),
+        settings.human_review_state.as_deref(),
+        settings.done_state.as_deref(),
+    )
+}
+
+fn replace_workflow_status_labels(
+    settings: &TrackerSettings,
+    labels: &[String],
+    target_status: &str,
+) -> Vec<String> {
+    let target_label = labels
+        .iter()
+        .find(|label| {
+            resolve_status_label_value(settings, label)
+                .map(|status| {
+                    normalize_issue_state(&status) == normalize_issue_state(target_status)
+                })
+                .unwrap_or(false)
+        })
+        .cloned()
+        .unwrap_or_else(|| render_status_label(settings, target_status));
+
+    let mut updated = labels
+        .iter()
+        .filter(|label| resolve_status_label_value(settings, label).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if !updated
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(&target_label))
+    {
+        updated.push(target_label);
+    }
+
+    updated
+}
+
+fn render_status_label(settings: &TrackerSettings, status: &str) -> String {
+    let prefix = settings
+        .status_source
+        .as_ref()
+        .and_then(|source| source.name.as_deref())
+        .filter(|prefix| !prefix.trim().is_empty());
+
+    match prefix {
+        Some(prefix) if prefix.chars().last().is_some_and(char::is_whitespace) => {
+            format!("{prefix}{status}")
+        }
+        Some(prefix) => format!("{prefix} {status}"),
+        None => status.to_string(),
     }
 }
 
@@ -2098,7 +2259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issues_only_mode_uses_issue_fields_and_blockers() {
+    async fn issues_only_mode_uses_status_labels_and_blockers() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -2115,7 +2276,7 @@ mod tests {
                     "state": "open",
                     "html_url": "https://github.com/openai/kairastra/issues/7",
                     "assignees": [{ "login": "codex-bot" }],
-                    "labels": [{ "name": "p2" }],
+                    "labels": [{ "name": "Todo" }, { "name": "p2" }],
                     "created_at": "2026-03-13T00:00:00Z",
                     "updated_at": "2026-03-13T01:00:00Z"
                 }
@@ -2128,15 +2289,6 @@ mod tests {
             .and(query_param("state", "open"))
             .and(query_param("page", "2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/repos/openai/kairastra/issues/7/issue-field-values"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                { "field": { "name": "Status" }, "value": "Todo" },
-                { "field": { "name": "Priority" }, "value": 2 }
-            ])))
             .mount(&server)
             .await;
 
@@ -2170,11 +2322,7 @@ mod tests {
   rest_endpoint: {0}
   mode: issues_only
   status_source:
-    type: issue_field
-    name: Status
-  priority_source:
-    type: issue_field
-    name: Priority
+    type: label
 "#,
                 server.uri()
             ))
@@ -2193,6 +2341,235 @@ mod tests {
             issues[0].blocked_by[0].identifier.as_deref(),
             Some("openai/kairastra#3")
         );
+    }
+
+    #[tokio::test]
+    async fn issues_only_mode_uses_exact_status_labels_when_no_prefix_is_configured() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("state", "open"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 123,
+                    "node_id": "issue-node-123",
+                    "number": 7,
+                    "title": "Wait for review",
+                    "body": "details",
+                    "state": "open",
+                    "html_url": "https://github.com/openai/kairastra/issues/7",
+                    "assignees": [],
+                    "labels": [{ "name": "Human Review" }, { "name": "bug" }],
+                    "created_at": "2026-03-13T00:00:00Z",
+                    "updated_at": "2026-03-13T01:00:00Z"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("state", "open"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  repo: kairastra
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  mode: issues_only
+  status_source:
+    type: label
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issues = tracker.fetch_candidate_issues().await.unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].state, "Human Review");
+        assert_eq!(issues[0].labels, vec!["human review", "bug"]);
+    }
+
+    #[tokio::test]
+    async fn issues_only_claim_transition_rewrites_status_labels() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42,
+                "node_id": "issue-node-42",
+                "number": 42,
+                "title": "Port tracker",
+                "body": "body",
+                "state": "open",
+                "html_url": "https://github.com/openai/kairastra/issues/42",
+                "assignees": [],
+                "labels": [{ "name": "Todo" }, { "name": "Bug" }],
+                "created_at": "2026-03-13T00:00:00Z",
+                "updated_at": "2026-03-13T01:00:00Z"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/repos/openai/kairastra/issues/42/labels"))
+            .and(body_string_contains(r#""labels":["Bug","In Progress"]"#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "name": "Bug" },
+                { "name": "In Progress" }
+            ])))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("state", "all"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 42,
+                    "node_id": "issue-node-42",
+                    "number": 42,
+                    "title": "Port tracker",
+                    "body": "body",
+                    "state": "open",
+                    "html_url": "https://github.com/openai/kairastra/issues/42",
+                    "assignees": [],
+                    "labels": [{ "name": "Bug" }, { "name": "In Progress" }],
+                    "created_at": "2026-03-13T00:00:00Z",
+                    "updated_at": "2026-03-13T01:00:00Z"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("state", "all"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  repo: kairastra
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  mode: issues_only
+  status_source:
+    type: label
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issue = crate::model::Issue {
+            id: "issue-node-42".to_string(),
+            project_item_id: None,
+            identifier: "openai/kairastra#42".to_string(),
+            title: "Port tracker".to_string(),
+            description: Some("body".to_string()),
+            priority: None,
+            state: "Todo".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/kairastra/issues/42".to_string()),
+            assignees: Vec::new(),
+            labels: vec!["todo".to_string(), "bug".to_string()],
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let updated = tracker
+            .transition_issue_to_in_progress_on_claim(&issue)
+            .await
+            .unwrap();
+        assert_eq!(updated.state, "In Progress");
+        assert_eq!(updated.labels, vec!["bug", "in progress"]);
+    }
+
+    #[tokio::test]
+    async fn closed_issue_with_stale_status_label_resolves_to_done() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("state", "all"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 88,
+                    "node_id": "issue-node-88",
+                    "number": 88,
+                    "title": "Already merged",
+                    "body": "body",
+                    "state": "closed",
+                    "html_url": "https://github.com/openai/kairastra/issues/88",
+                    "assignees": [],
+                    "labels": [{ "name": "Human Review" }],
+                    "created_at": "2026-03-13T00:00:00Z",
+                    "updated_at": "2026-03-13T01:00:00Z"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("state", "all"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  repo: kairastra
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  mode: issues_only
+  status_source:
+    type: label
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issues = tracker
+            .fetch_issues_by_states(&["Done".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].state, "Done");
     }
 
     #[tokio::test]
@@ -2613,6 +2990,8 @@ mod tests {
   endpoint: {0}/graphql
   rest_endpoint: {0}
   mode: issues_only
+  status_source:
+    type: label
 "#,
                 server.uri()
             ))
@@ -2667,6 +3046,8 @@ mod tests {
   endpoint: {0}/graphql
   rest_endpoint: {0}
   mode: issues_only
+  status_source:
+    type: label
 "#,
                 server.uri()
             ))
@@ -2816,7 +3197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_workpad_comment_reuses_existing_comment() {
+    async fn ensure_workpad_comment_updates_existing_comment_body() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -2837,6 +3218,18 @@ mod tests {
             .mount(&server)
             .await;
 
+        Mock::given(method("PATCH"))
+            .and(path("/repos/openai/kairastra/issues/comments/9"))
+            .and(body_string_contains("## Agent Workpad"))
+            .and(body_string_contains("new"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 9,
+                "body": "## Agent Workpad\n\nnew",
+                "html_url": "https://github.com/openai/kairastra/issues/42#issuecomment-9"
+            })))
+            .mount(&server)
+            .await;
+
         let tracker = GitHubTracker::new(
             settings(&format!(
                 r#"tracker:
@@ -2847,6 +3240,8 @@ mod tests {
   rest_endpoint: {0}
   repo: kairastra
   mode: issues_only
+  status_source:
+    type: label
 "#,
                 server.uri()
             ))
@@ -2884,6 +3279,158 @@ mod tests {
             updated.workpad_comment_url.as_deref(),
             Some("https://github.com/openai/kairastra/issues/42#issuecomment-9")
         );
+        assert_eq!(
+            updated.workpad_comment_body.as_deref(),
+            Some("## Agent Workpad\n\nnew")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_workpad_comment_skips_patch_when_existing_body_matches() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues/42/comments"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 9,
+                    "body": "## Agent Workpad\n\nexisting",
+                    "html_url": "https://github.com/openai/kairastra/issues/42#issuecomment-9"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  repo: kairastra
+  mode: issues_only
+  status_source:
+    type: label
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issue = Issue {
+            id: "issue-node-42".to_string(),
+            project_item_id: None,
+            identifier: "openai/kairastra#42".to_string(),
+            title: "Issue".to_string(),
+            description: None,
+            priority: None,
+            state: "Todo".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/kairastra/issues/42".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let updated = tracker
+            .ensure_workpad_comment(&issue, "## Agent Workpad\n\nexisting")
+            .await
+            .unwrap();
+
+        assert_eq!(updated.workpad_comment_id, Some(9));
+        assert_eq!(
+            updated.workpad_comment_body.as_deref(),
+            Some("## Agent Workpad\n\nexisting")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_workpad_comment_patches_discovered_comment_when_id_missing() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues/42/comments"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 9,
+                    "body": "## Agent Workpad\n\nexisting",
+                    "html_url": "https://github.com/openai/kairastra/issues/42#issuecomment-9"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/repos/openai/kairastra/issues/comments/9"))
+            .and(body_string_contains("## Agent Workpad"))
+            .and(body_string_contains("### Blocker"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 9,
+                "body": "## Agent Workpad\n\n### Blocker\n\n- test",
+                "html_url": "https://github.com/openai/kairastra/issues/42#issuecomment-9"
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  repo: kairastra
+  mode: issues_only
+  status_source:
+    type: label
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issue = Issue {
+            id: "issue-node-42".to_string(),
+            project_item_id: None,
+            identifier: "openai/kairastra#42".to_string(),
+            title: "Issue".to_string(),
+            description: None,
+            priority: None,
+            state: "Todo".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/kairastra/issues/42".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let updated = tracker
+            .update_workpad_comment(&issue, "## Agent Workpad\n\n### Blocker\n\n- test")
+            .await
+            .unwrap();
+
+        assert_eq!(updated.workpad_comment_id, Some(9));
+        assert_eq!(
+            updated.workpad_comment_body.as_deref(),
+            Some("## Agent Workpad\n\n### Blocker\n\n- test")
+        );
     }
 
     #[tokio::test]
@@ -2918,6 +3465,8 @@ mod tests {
   rest_endpoint: {0}
   repo: kairastra
   mode: issues_only
+  status_source:
+    type: label
 "#,
                 server.uri()
             ))

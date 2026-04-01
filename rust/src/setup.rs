@@ -151,7 +151,7 @@ pub async fn run(options: SetupOptions) -> Result<()> {
     }
     print_shared_skills_result(&shared_skills);
     let provider_auth_ready = providers::inspect_auth_status(&values.provider)
-        .map(|status| status.credentials_present)
+        .map(|status| status.credentials_usable)
         .unwrap_or(false);
 
     if let Some(path) = service_unit_path.as_ref() {
@@ -445,14 +445,7 @@ fn desired_status_options(config: &ProjectStatusConfig) -> Vec<String> {
 }
 
 fn issues_only_status_config() -> ProjectStatusConfig {
-    ProjectStatusConfig {
-        active_states: vec!["Open".to_string()],
-        terminal_states: vec!["Closed".to_string()],
-        claimable_states: vec!["Open".to_string()],
-        in_progress_state: None,
-        human_review_state: None,
-        done_state: Some("Closed".to_string()),
-    }
+    canonical_project_status_config()
 }
 
 fn effective_status_config(values: &SetupValues) -> ProjectStatusConfig {
@@ -1986,11 +1979,23 @@ fn render_workflow(mode: DeployMode, values: &SetupValues) -> String {
   owner: $KAIRASTRA_GITHUB_OWNER
   repo: $KAIRASTRA_GITHUB_REPO
   status_source:
-    type: git_hub_state
+    type: label
   active_states:
-    - Open
+    - Todo
+    - In Progress
+    - Merging
+    - Rework
   terminal_states:
-    - Closed"#
+    - Closed
+    - Cancelled
+    - Canceled
+    - Duplicate
+    - Done
+  claimable_states:
+    - Todo
+  in_progress_state: In Progress
+  human_review_state: Human Review
+  done_state: Done"#
             .to_string(),
     };
 
@@ -2912,8 +2917,9 @@ mod tests {
 
         let rendered = render_workflow(DeployMode::Native, &values);
         assert!(rendered.contains("mode: issues_only"));
-        assert!(rendered.contains("type: git_hub_state"));
-        assert!(rendered.contains("- Open"));
+        assert!(rendered.contains("type: label"));
+        assert!(rendered.contains("- Todo"));
+        assert!(rendered.contains(r#"  human_review_state: Human Review"#));
         assert!(!rendered.contains("project_v2_number"));
         assert!(!rendered.contains("project_owner"));
         assert!(!rendered.contains("type: project_field"));
@@ -2926,7 +2932,20 @@ mod tests {
 
         let names = super::desired_status_options(&super::effective_status_config(&values));
 
-        assert_eq!(names, vec!["Open".to_string(), "Closed".to_string()]);
+        assert_eq!(
+            names,
+            vec![
+                "Todo".to_string(),
+                "In Progress".to_string(),
+                "Merging".to_string(),
+                "Rework".to_string(),
+                "Closed".to_string(),
+                "Cancelled".to_string(),
+                "Duplicate".to_string(),
+                "Done".to_string(),
+                "Human Review".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2988,6 +3007,7 @@ mod tests {
         assert!(body.contains("## Default posture"));
         assert!(body.contains("## Status map"));
         assert!(body.contains("## Step 0: Determine current issue state and route"));
+        assert!(body.contains("Never land or merge from `Human Review`; only land from `Merging`."));
         assert!(body.contains("## Workpad template"));
     }
 

@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::process::Command;
@@ -58,7 +59,14 @@ pub async fn ensure_workspace(settings: &Settings, issue: &Issue) -> Result<Work
 
     let created_now = if path.exists() {
         if path.is_dir() {
-            false
+            if workspace_requires_recreate(settings, &path)? {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("failed to reset {}", path.display()))?;
+                fs::create_dir_all(&path)?;
+                true
+            } else {
+                false
+            }
         } else {
             fs::remove_file(&path).or_else(|_| fs::remove_dir_all(&path))?;
             fs::create_dir_all(&path)?;
@@ -206,6 +214,24 @@ fn configured_seed_repo() -> Option<PathBuf> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+fn workspace_requires_recreate(settings: &Settings, workspace: &Path) -> Result<bool> {
+    if settings.hooks.after_create.is_none() || configured_seed_repo().is_none() {
+        return Ok(false);
+    }
+
+    if !workspace.join(".git").exists() {
+        return Ok(true);
+    }
+
+    let output = StdCommand::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| format!("failed to validate {}", workspace.display()))?;
+
+    Ok(!output.status.success())
 }
 
 fn managed_issue_branch_name(identifier: &str) -> String {
@@ -453,6 +479,7 @@ workspace:
     async fn removes_target_issue_workspace_only() {
         let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
+        std::env::remove_var("KAIRASTRA_SEED_REPO");
         let dir = tempdir().unwrap();
         let settings = test_settings(dir.path());
         let target = ensure_workspace(&settings, &issue("MT-1")).await.unwrap();
@@ -496,6 +523,46 @@ git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "kairastra/MT-1" "$PWD" HE
         assert!(String::from_utf8_lossy(&branch_output.stdout)
             .trim()
             .is_empty());
+        std::env::remove_var("KAIRASTRA_SEED_REPO");
+    }
+
+    #[tokio::test]
+    async fn recreates_invalid_seed_repo_workspace_before_reusing_it() {
+        let _guard = ENV_LOCK.lock().await;
+        let workspace_root = tempdir().unwrap();
+        let seed_repo = tempdir().unwrap();
+        init_git_repo(seed_repo.path());
+        std::env::set_var("KAIRASTRA_SEED_REPO", seed_repo.path());
+
+        let mut settings = test_settings(workspace_root.path());
+        settings.hooks.after_create = Some(
+            r#"
+set -euo pipefail
+git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "kairastra/MT-3" "$PWD" HEAD
+"#
+            .trim()
+            .to_string(),
+        );
+
+        let existing = workspace_root.path().join("MT-3");
+        fs::create_dir_all(&existing).unwrap();
+        let status = StdCommand::new("git")
+            .args(["init", "-q"])
+            .current_dir(&existing)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let workspace = ensure_workspace(&settings, &issue("MT-3")).await.unwrap();
+        assert!(workspace.created_now);
+
+        let output = StdCommand::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(&workspace.path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
         std::env::remove_var("KAIRASTRA_SEED_REPO");
     }
 
