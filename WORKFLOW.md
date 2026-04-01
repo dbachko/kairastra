@@ -28,6 +28,7 @@ polling:
   interval_ms: 5000
 workspace:
   root: $KAIRASTRA_WORKSPACE_ROOT
+  bootstrap_mode: seed_worktree
 hooks:
   after_create: |
     set -euo pipefail
@@ -73,7 +74,11 @@ hooks:
     }
 
     require_seed_repo() {
-      if [ -z "${KAIRASTRA_SEED_REPO:-}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+      if [ -z "${KAIRASTRA_SEED_REPO:-}" ]; then
+        echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
+        exit 1
+      fi
+      if ! git -C "$KAIRASTRA_SEED_REPO" rev-parse --git-common-dir >/dev/null 2>&1; then
         echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
         exit 1
       fi
@@ -219,7 +224,11 @@ hooks:
     git config --global --add safe.directory "$(pwd)"
 
     require_seed_repo() {
-      if [ -z "${KAIRASTRA_SEED_REPO:-}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+      if [ -z "${KAIRASTRA_SEED_REPO:-}" ]; then
+        echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
+        exit 1
+      fi
+      if ! git -C "$KAIRASTRA_SEED_REPO" rev-parse --git-common-dir >/dev/null 2>&1; then
         echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
         exit 1
       fi
@@ -475,6 +484,7 @@ The agent should be able to talk to GitHub through the injected `github_graphql`
 - Treat any issue-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
 - When meaningful out-of-scope improvements are discovered during execution, file a separate follow-up issue instead of expanding scope. The follow-up issue must include a clear title, description, and acceptance criteria, be placed in `Todo` or `Backlog`, be assigned to the same GitHub Project when possible, link the current issue as related, and use issue dependencies when the follow-up depends on the current issue.
 - Move status only when the matching quality bar is met.
+- Never land or merge from `Human Review`; only land from `Merging`.
 - Operate autonomously end to end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers after exhausting documented fallbacks.
 

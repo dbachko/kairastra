@@ -55,6 +55,15 @@ pub struct PollingSettings {
 #[derive(Debug, Clone)]
 pub struct WorkspaceSettings {
     pub root: PathBuf,
+    pub bootstrap_mode: WorkspaceBootstrapMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceBootstrapMode {
+    #[default]
+    Plain,
+    SeedWorktree,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +187,7 @@ struct RawPolling {
 #[serde(default)]
 struct RawWorkspace {
     root: Option<String>,
+    bootstrap_mode: WorkspaceBootstrapMode,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -340,59 +350,63 @@ impl Settings {
             ));
         }
 
-        Ok(Self {
-            tracker: TrackerSettings {
-                kind: tracker_kind,
-                mode: raw.tracker.mode,
-                api_key,
-                owner,
-                repo,
-                project_owner,
-                project_v2_number,
-                project_url,
-                active_states: if raw.tracker.active_states.is_empty() {
-                    vec!["Todo".to_string(), "In Progress".to_string()]
-                } else {
-                    raw.tracker.active_states
-                },
-                terminal_states: if raw.tracker.terminal_states.is_empty() {
-                    vec![
-                        "Closed".to_string(),
-                        "Cancelled".to_string(),
-                        "Canceled".to_string(),
-                        "Duplicate".to_string(),
-                        "Done".to_string(),
-                    ]
-                } else {
-                    raw.tracker.terminal_states
-                },
-                claimable_states: raw
-                    .tracker
-                    .claimable_states
-                    .unwrap_or_else(|| vec!["Todo".to_string()]),
-                in_progress_state: resolve_nullable_string_or_default(
-                    raw.tracker.in_progress_state,
-                    "In Progress",
-                ),
-                human_review_state: resolve_nullable_string_or_default(
-                    raw.tracker.human_review_state,
-                    "Human Review",
-                ),
-                done_state: resolve_nullable_string_or_default(raw.tracker.done_state, "Done"),
-                status_source: raw.tracker.status_source,
-                priority_source: raw.tracker.priority_source,
-                graphql_endpoint: raw
-                    .tracker
-                    .endpoint
-                    .unwrap_or_else(|| "https://api.github.com/graphql".to_string()),
-                rest_endpoint: raw
-                    .tracker
-                    .rest_endpoint
-                    .unwrap_or_else(|| "https://api.github.com".to_string()),
+        let tracker = TrackerSettings {
+            kind: tracker_kind,
+            mode: raw.tracker.mode,
+            api_key,
+            owner,
+            repo,
+            project_owner,
+            project_v2_number,
+            project_url,
+            active_states: if raw.tracker.active_states.is_empty() {
+                vec!["Todo".to_string(), "In Progress".to_string()]
+            } else {
+                raw.tracker.active_states
             },
+            terminal_states: if raw.tracker.terminal_states.is_empty() {
+                vec![
+                    "Closed".to_string(),
+                    "Cancelled".to_string(),
+                    "Canceled".to_string(),
+                    "Duplicate".to_string(),
+                    "Done".to_string(),
+                ]
+            } else {
+                raw.tracker.terminal_states
+            },
+            claimable_states: raw
+                .tracker
+                .claimable_states
+                .unwrap_or_else(|| vec!["Todo".to_string()]),
+            in_progress_state: resolve_nullable_string_or_default(
+                raw.tracker.in_progress_state,
+                "In Progress",
+            ),
+            human_review_state: resolve_nullable_string_or_default(
+                raw.tracker.human_review_state,
+                "Human Review",
+            ),
+            done_state: resolve_nullable_string_or_default(raw.tracker.done_state, "Done"),
+            status_source: raw.tracker.status_source,
+            priority_source: raw.tracker.priority_source,
+            graphql_endpoint: raw
+                .tracker
+                .endpoint
+                .unwrap_or_else(|| "https://api.github.com/graphql".to_string()),
+            rest_endpoint: raw
+                .tracker
+                .rest_endpoint
+                .unwrap_or_else(|| "https://api.github.com".to_string()),
+        };
+        validate_tracker_settings(&tracker)?;
+
+        Ok(Self {
+            tracker,
             polling,
             workspace: WorkspaceSettings {
                 root: workspace_root,
+                bootstrap_mode: raw.workspace.bootstrap_mode,
             },
             hooks,
             agent: AgentSettings {
@@ -473,6 +487,26 @@ impl Settings {
             .copied()
             .unwrap_or(self.agent.max_concurrent_agents)
     }
+
+    pub fn uses_seed_worktree_bootstrap(&self) -> bool {
+        self.workspace.bootstrap_mode == WorkspaceBootstrapMode::SeedWorktree
+    }
+}
+
+fn validate_tracker_settings(tracker: &TrackerSettings) -> Result<()> {
+    if tracker.kind.eq_ignore_ascii_case("github") && tracker.mode == GitHubMode::IssuesOnly {
+        let source = tracker
+            .status_source
+            .as_ref()
+            .map(|source| source.source_type);
+        if source != Some(FieldSourceType::Label) {
+            return Err(anyhow!(
+                "invalid_workflow_config: tracker.mode issues_only requires status_source.type: label"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn normalize_issue_state(state: &str) -> String {
@@ -639,7 +673,7 @@ mod tests {
 
     use crate::model::WorkflowDefinition;
 
-    use super::{normalize_issue_state, Settings};
+    use super::{normalize_issue_state, Settings, WorkspaceBootstrapMode};
 
     #[test]
     fn resolves_env_backed_github_api_key() {
@@ -963,5 +997,127 @@ providers:
 
         let settings = Settings::from_workflow(&definition).unwrap();
         assert!(settings.tracker.claimable_states.is_empty());
+    }
+
+    #[test]
+    fn rejects_issues_only_workflow_using_github_state_status_source() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  repo: kairastra
+  mode: issues_only
+  status_source:
+    type: git_hub_state
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let error = Settings::from_workflow(&definition)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("issues_only requires status_source.type: label"));
+    }
+
+    #[test]
+    fn accepts_issues_only_workflow_using_label_status_source() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  repo: kairastra
+  mode: issues_only
+  status_source:
+    type: label
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(settings.tracker.mode, super::GitHubMode::IssuesOnly);
+        assert_eq!(
+            settings
+                .tracker
+                .status_source
+                .as_ref()
+                .map(|source| source.source_type),
+            Some(super::FieldSourceType::Label)
+        );
+    }
+
+    #[test]
+    fn workspace_bootstrap_mode_defaults_to_plain() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(
+            settings.workspace.bootstrap_mode,
+            WorkspaceBootstrapMode::Plain
+        );
+        assert!(!settings.uses_seed_worktree_bootstrap());
+    }
+
+    #[test]
+    fn workspace_bootstrap_mode_accepts_seed_worktree() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+workspace:
+  bootstrap_mode: seed_worktree
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(
+            settings.workspace.bootstrap_mode,
+            WorkspaceBootstrapMode::SeedWorktree
+        );
+        assert!(settings.uses_seed_worktree_bootstrap());
     }
 }

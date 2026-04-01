@@ -39,6 +39,14 @@ pub fn inspect_status() -> AuthStatus {
         auth_file_present,
         api_key_present,
         credentials_present: auth_file_present || api_key_present,
+        credentials_usable: auth_file_present || api_key_present,
+        auth_problem: if api_key_present {
+            Some("api_key_ready".to_string())
+        } else if auth_file_present {
+            Some("subscription_ready".to_string())
+        } else {
+            Some("missing_credentials".to_string())
+        },
     }
 }
 

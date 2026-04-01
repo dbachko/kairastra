@@ -19,7 +19,7 @@ Doctor currently checks:
 - required local commands such as the selected provider CLI, `gh`, and `systemctl`
 - selected provider auth state
 - workflow load and validation
-- required seed-repo support directories such as `.github/`
+- for `workspace.bootstrap_mode: seed_worktree`, seed-repo git readiness, shared skills, and required support directories such as `.github/`
 - repo label readiness for the fixed Kairastra labels plus labels derived from the configured statuses
 - required GitHub Project fields when `projects_v2` is configured
 - GitHub tracker connectivity using the configured token

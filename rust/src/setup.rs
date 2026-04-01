@@ -5,7 +5,9 @@ use std::process::Command;
 use anyhow::{anyhow, Context, Result};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
 
-use crate::config::{FieldSource, FieldSourceType, GitHubMode, TrackerSettings};
+use crate::config::{
+    FieldSource, FieldSourceType, GitHubMode, TrackerSettings, WorkspaceBootstrapMode,
+};
 use crate::deploy::DeployMode;
 use crate::doctor::{self, DoctorFormat, DoctorOptions};
 use crate::github::{GitHubTracker, ProjectStatusOverview};
@@ -34,6 +36,7 @@ pub struct SetupOptions {
 #[derive(Debug, Clone)]
 struct SetupValues {
     tracker_mode: GitHubMode,
+    workspace_bootstrap_mode: WorkspaceBootstrapMode,
     project_status: ProjectStatusConfig,
     normalize_project_statuses: bool,
     provider: String,
@@ -151,7 +154,7 @@ pub async fn run(options: SetupOptions) -> Result<()> {
     }
     print_shared_skills_result(&shared_skills);
     let provider_auth_ready = providers::inspect_auth_status(&values.provider)
-        .map(|status| status.credentials_present)
+        .map(|status| status.credentials_usable)
         .unwrap_or(false);
 
     if let Some(path) = service_unit_path.as_ref() {
@@ -445,14 +448,55 @@ fn desired_status_options(config: &ProjectStatusConfig) -> Vec<String> {
 }
 
 fn issues_only_status_config() -> ProjectStatusConfig {
-    ProjectStatusConfig {
-        active_states: vec!["Open".to_string()],
-        terminal_states: vec!["Closed".to_string()],
-        claimable_states: vec!["Open".to_string()],
-        in_progress_state: None,
-        human_review_state: None,
-        done_state: Some("Closed".to_string()),
-    }
+    canonical_project_status_config()
+}
+
+fn render_issues_only_tracker_block() -> String {
+    let config = issues_only_status_config();
+    let active_states = config
+        .active_states
+        .iter()
+        .map(|state| format!("    - {state}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let terminal_states = config
+        .terminal_states
+        .iter()
+        .map(|state| format!("    - {state}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let claimable_states = config
+        .claimable_states
+        .iter()
+        .map(|state| format!("    - {state}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"tracker:
+  kind: github
+  mode: issues_only
+  api_key: $GITHUB_TOKEN
+  owner: $KAIRASTRA_GITHUB_OWNER
+  repo: $KAIRASTRA_GITHUB_REPO
+  status_source:
+    type: label
+  active_states:
+{active_states}
+  terminal_states:
+{terminal_states}
+  claimable_states:
+{claimable_states}
+  in_progress_state: {in_progress_state}
+  human_review_state: {human_review_state}
+  done_state: {done_state}"#,
+        in_progress_state = config.in_progress_state.as_deref().unwrap_or("In Progress"),
+        human_review_state = config
+            .human_review_state
+            .as_deref()
+            .unwrap_or("Human Review"),
+        done_state = config.done_state.as_deref().unwrap_or("Done"),
+    )
 }
 
 fn effective_status_config(values: &SetupValues) -> ProjectStatusConfig {
@@ -781,6 +825,7 @@ async fn collect_values(
 
     Ok(SetupValues {
         tracker_mode,
+        workspace_bootstrap_mode: WorkspaceBootstrapMode::SeedWorktree,
         project_status,
         normalize_project_statuses,
         provider,
@@ -1979,19 +2024,7 @@ fn render_workflow(mode: DeployMode, values: &SetupValues) -> String {
                     render_optional_yaml_value(values.project_status.done_state.as_deref()),
             )
         }
-        GitHubMode::IssuesOnly => r#"tracker:
-  kind: github
-  mode: issues_only
-  api_key: $GITHUB_TOKEN
-  owner: $KAIRASTRA_GITHUB_OWNER
-  repo: $KAIRASTRA_GITHUB_REPO
-  status_source:
-    type: git_hub_state
-  active_states:
-    - Open
-  terminal_states:
-    - Closed"#
-            .to_string(),
+        GitHubMode::IssuesOnly => render_issues_only_tracker_block(),
     };
 
     format!(
@@ -1999,6 +2032,7 @@ fn render_workflow(mode: DeployMode, values: &SetupValues) -> String {
 {tracker_block}
 workspace:
   root: $KAIRASTRA_WORKSPACE_ROOT
+  bootstrap_mode: {workspace_bootstrap_mode}
 hooks:
   after_create: |
     set -euo pipefail
@@ -2008,7 +2042,11 @@ hooks:
     }}
 
     require_seed_repo() {{
-      if [ -z "${{KAIRASTRA_SEED_REPO:-}}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+      if [ -z "${{KAIRASTRA_SEED_REPO:-}}" ]; then
+        echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
+        exit 1
+      fi
+      if ! git -C "$KAIRASTRA_SEED_REPO" rev-parse --git-common-dir >/dev/null 2>&1; then
         echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
         exit 1
       fi
@@ -2216,7 +2254,11 @@ hooks:
     git config --global --add safe.directory "$(pwd)"
 
     require_seed_repo() {{
-      if [ -z "${{KAIRASTRA_SEED_REPO:-}}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+      if [ -z "${{KAIRASTRA_SEED_REPO:-}}" ]; then
+        echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
+        exit 1
+      fi
+      if ! git -C "$KAIRASTRA_SEED_REPO" rev-parse --git-common-dir >/dev/null 2>&1; then
         echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
         exit 1
       fi
@@ -2416,6 +2458,7 @@ agent:
 ---
 {canonical_body}"#,
         tracker_block = tracker_block,
+        workspace_bootstrap_mode = render_workspace_bootstrap_mode(values.workspace_bootstrap_mode),
         provider = values.provider,
         max_concurrent_agents = values.max_concurrent_agents,
         max_turns = values.max_turns,
@@ -2436,6 +2479,13 @@ fn extract_workflow_body(source: &str) -> Option<&str> {
     let rest = source.strip_prefix("---\n")?;
     let (_, body) = rest.split_once("\n---\n")?;
     Some(body)
+}
+
+fn render_workspace_bootstrap_mode(mode: WorkspaceBootstrapMode) -> &'static str {
+    match mode {
+        WorkspaceBootstrapMode::Plain => "plain",
+        WorkspaceBootstrapMode::SeedWorktree => "seed_worktree",
+    }
 }
 
 fn render_project_env_lines(values: &SetupValues) -> String {
@@ -2531,7 +2581,7 @@ mod tests {
         canonical_workflow_body, ensure_repo_support_dirs, render_env_file, render_systemd_unit,
         render_workflow, SetupValues,
     };
-    use crate::config::GitHubMode;
+    use crate::config::{GitHubMode, WorkspaceBootstrapMode};
     use crate::deploy::DeployMode;
     use crate::providers::claude::setup::ClaudeSetupConfig;
     use crate::providers::codex::setup::CodexSetupConfig;
@@ -2545,6 +2595,7 @@ mod tests {
     fn sample_values() -> SetupValues {
         SetupValues {
             tracker_mode: GitHubMode::ProjectsV2,
+            workspace_bootstrap_mode: WorkspaceBootstrapMode::SeedWorktree,
             project_status: super::canonical_project_status_config(),
             normalize_project_statuses: false,
             provider: "codex".to_string(),
@@ -2912,8 +2963,10 @@ mod tests {
 
         let rendered = render_workflow(DeployMode::Native, &values);
         assert!(rendered.contains("mode: issues_only"));
-        assert!(rendered.contains("type: git_hub_state"));
-        assert!(rendered.contains("- Open"));
+        assert!(rendered.contains("type: label"));
+        assert!(rendered.contains("bootstrap_mode: seed_worktree"));
+        assert!(rendered.contains("- Todo"));
+        assert!(rendered.contains(r#"  human_review_state: Human Review"#));
         assert!(!rendered.contains("project_v2_number"));
         assert!(!rendered.contains("project_owner"));
         assert!(!rendered.contains("type: project_field"));
@@ -2926,7 +2979,20 @@ mod tests {
 
         let names = super::desired_status_options(&super::effective_status_config(&values));
 
-        assert_eq!(names, vec!["Open".to_string(), "Closed".to_string()]);
+        assert_eq!(
+            names,
+            vec![
+                "Todo".to_string(),
+                "In Progress".to_string(),
+                "Merging".to_string(),
+                "Rework".to_string(),
+                "Closed".to_string(),
+                "Cancelled".to_string(),
+                "Duplicate".to_string(),
+                "Done".to_string(),
+                "Human Review".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2988,6 +3054,7 @@ mod tests {
         assert!(body.contains("## Default posture"));
         assert!(body.contains("## Status map"));
         assert!(body.contains("## Step 0: Determine current issue state and route"));
+        assert!(body.contains("Never land or merge from `Human Review`; only land from `Merging`."));
         assert!(body.contains("## Workpad template"));
     }
 

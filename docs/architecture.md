@@ -21,7 +21,7 @@ One Kairastra deployment is scoped to one repository checkout and one repository
 
 - `tracker.repo` names the repository Kairastra is expected to work in.
 - Native deployments read one operator-owned workflow file directly.
-- Workspaces are created as isolated git worktrees from one configured seed repository checkout.
+- Workspaces are created according to `workspace.bootstrap_mode`; the generated native workflow uses `seed_worktree`, which creates isolated git worktrees from one configured seed repository checkout.
 - PR lookup, status checks, and workpad writes are all performed against the repository encoded in the issue identifier.
 
 ## Execution Model

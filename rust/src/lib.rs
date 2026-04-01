@@ -4,6 +4,7 @@ pub mod config;
 pub mod deploy;
 pub mod doctor;
 pub mod envfile;
+pub mod git_checkout;
 pub mod github;
 pub mod github_bootstrap;
 pub mod github_mcp;

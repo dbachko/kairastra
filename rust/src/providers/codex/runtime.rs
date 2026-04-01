@@ -115,7 +115,7 @@ impl CodexSession {
 
         let workspace_path = workspace.to_path_buf();
         let approval_policy = config.approval_policy.clone();
-        let turn_sandbox_policy = config.turn_sandbox_policy(workspace);
+        let turn_sandbox_policy = config.turn_sandbox_policy(workspace)?;
         let auto_approve_requests =
             matches!(&approval_policy, JsonValue::String(value) if value == "never");
 

@@ -54,6 +54,8 @@ pub struct AuthStatus {
     pub auth_file_present: bool,
     pub api_key_present: bool,
     pub credentials_present: bool,
+    pub credentials_usable: bool,
+    pub auth_problem: Option<String>,
 }
 
 pub fn inspect_status(provider: &str) -> Result<AuthStatus> {
@@ -87,7 +89,7 @@ pub fn run_login_menu(provider: Option<&str>) -> Result<()> {
         .collect::<Vec<_>>();
     let default_index = entries
         .iter()
-        .position(|entry| !entry.status.credentials_present)
+        .position(|entry| !entry.status.credentials_usable)
         .unwrap_or(0);
 
     let selection = Select::with_theme(&ColorfulTheme::default())
@@ -232,6 +234,14 @@ fn api_key_missing_guidance(status: &AuthStatus, display_name: &str) -> String {
     )
 }
 
+#[cfg(test)]
+pub(crate) fn crate_env_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn login_action(status: &AuthStatus) -> LoginAction {
     if !status.provider_available {
         return LoginAction::ProviderUnavailable;
@@ -241,7 +251,7 @@ fn login_action(status: &AuthStatus) -> LoginAction {
         return LoginAction::ApiKeyReady;
     }
 
-    if status.auth_file_present {
+    if status.auth_file_present && status.credentials_usable {
         return LoginAction::AlreadyLoggedIn;
     }
 
@@ -268,19 +278,15 @@ enum LoginAction {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::Mutex;
-
     use super::{
-        api_key_missing_guidance, api_key_ready_next_steps, inspect_status, login_action,
-        provider_menu_label, AuthMode, AuthStatus, LoginAction,
+        api_key_missing_guidance, api_key_ready_next_steps, crate_env_lock, inspect_status,
+        login_action, provider_menu_label, AuthMode, AuthStatus, LoginAction,
     };
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use std::path::PathBuf;
 
     #[test]
     fn auto_mode_prefers_api_key_when_present() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         std::env::set_var("CODEX_AUTH_MODE", "auto");
         std::env::set_var("OPENAI_API_KEY", "test-key");
         let status = inspect_status("codex").unwrap();
@@ -300,6 +306,8 @@ mod tests {
             auth_file_present: false,
             api_key_present: false,
             credentials_present: false,
+            credentials_usable: false,
+            auth_problem: Some("missing_credentials".to_string()),
         }
     }
 
@@ -309,6 +317,8 @@ mod tests {
         status.inferred_mode = AuthMode::ApiKey;
         status.api_key_present = true;
         status.credentials_present = true;
+        status.credentials_usable = true;
+        status.auth_problem = Some("api_key_ready".to_string());
 
         assert_eq!(login_action(&status), LoginAction::ApiKeyReady);
     }
@@ -326,6 +336,8 @@ mod tests {
         let mut status = status("claude");
         status.auth_file_present = true;
         status.credentials_present = true;
+        status.credentials_usable = true;
+        status.auth_problem = Some("subscription_ready".to_string());
 
         assert_eq!(
             provider_menu_label("Claude Code", &status),
@@ -347,6 +359,8 @@ mod tests {
         status.api_key_present = true;
         status.auth_file_present = true;
         status.credentials_present = true;
+        status.credentials_usable = true;
+        status.auth_problem = Some("api_key_ready".to_string());
 
         assert_eq!(
             provider_menu_label("Codex", &status),
