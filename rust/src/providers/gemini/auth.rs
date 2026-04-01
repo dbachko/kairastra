@@ -210,16 +210,13 @@ fn gemini_api_key_present() -> bool {
 mod tests {
     use std::ffi::OsString;
     use std::fs;
-    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use super::{
         inspect_status, is_subscription_selected_type, login_completed_since, read_login_state,
         run_login,
     };
-    use crate::auth::AuthMode;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::auth::{crate_env_lock, AuthMode};
 
     struct EnvVarGuard {
         key: &'static str,
@@ -252,7 +249,7 @@ mod tests {
 
     #[test]
     fn auto_mode_prefers_api_key_when_present() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let _mode = EnvVarGuard::set("GEMINI_AUTH_MODE", OsString::from("auto"));
         let _key = EnvVarGuard::set("GEMINI_API_KEY", OsString::from("test-key"));
 
@@ -264,7 +261,7 @@ mod tests {
 
     #[test]
     fn oauth_file_counts_as_subscription_credentials() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let home_dir = dir.path().join("home");
         let gemini_dir = home_dir.join(".gemini");
@@ -297,7 +294,7 @@ mod tests {
 
     #[test]
     fn login_completion_requires_changed_subscription_state() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let home_dir = dir.path().join("home");
         let gemini_dir = home_dir.join(".gemini");
@@ -322,7 +319,7 @@ mod tests {
     fn login_returns_after_new_credentials_are_written() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join("bin");
         let home_dir = dir.path().join("home");

@@ -58,8 +58,14 @@ Default: `30000`
 ### `workspace`
 
 - `root`
+- `bootstrap_mode`
 
 Default: OS temp dir plus `kairastra_workspaces` if omitted.
+
+Bootstrap modes:
+
+- `plain`: Kairastra creates and reuses plain directories under `workspace.root`
+- `seed_worktree`: Kairastra expects `KAIRASTRA_SEED_REPO` to point at a local git checkout and uses the generated hooks plus seed-repo validation/worktree lifecycle behavior
 
 ### `hooks`
 

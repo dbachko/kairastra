@@ -11,6 +11,7 @@ use crate::config::{
     resolve_optional_bool, resolve_optional_string, resolve_optional_u64, resolve_u64,
     BoolOrString, IntOrString, Settings,
 };
+use crate::git_checkout::checkout_git_common_dir;
 
 const DEFAULT_CODEX_COMMAND: &str = "codex app-server";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 5_000;
@@ -149,8 +150,7 @@ fn configured_seed_repo_git_dir() -> Option<PathBuf> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .map(|path| path.join(".git"))
-        .and_then(|path| path.canonicalize().ok().or(Some(path)))
+        .and_then(|path| checkout_git_common_dir(&path).ok().flatten())
 }
 
 impl CodexConfig {
@@ -295,6 +295,7 @@ mod tests {
     use std::env;
     use std::fs;
     use std::path::Path;
+    use std::process::Command;
     use std::sync::Mutex;
 
     use tempfile::tempdir;
@@ -331,6 +332,16 @@ providers:
             prompt_template: String::new(),
         };
         Settings::from_workflow(&definition).unwrap()
+    }
+
+    fn init_git_checkout(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
@@ -443,18 +454,19 @@ providers:
         let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
         let workspace = dir.path().join("workspace");
+        let seed_repo = dir.path().join("seed");
         let gitdir = dir.path().join("seed/.git/worktrees/issue-1");
         let common_dir = dir.path().join("seed/.git");
+        init_git_checkout(&seed_repo);
         fs::create_dir_all(&workspace).unwrap();
         fs::create_dir_all(&gitdir).unwrap();
-        fs::create_dir_all(&common_dir).unwrap();
         fs::write(
             workspace.join(".git"),
             format!("gitdir: {}\n", gitdir.display()),
         )
         .unwrap();
         fs::write(gitdir.join("commondir"), "../../\n").unwrap();
-        env::set_var("KAIRASTRA_SEED_REPO", dir.path().join("seed"));
+        env::set_var("KAIRASTRA_SEED_REPO", &seed_repo);
 
         let settings = settings("");
         let policy = load(&settings)

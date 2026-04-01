@@ -51,10 +51,14 @@ pub fn inspect_status() -> AuthStatus {
     let credentials_file_expired = credentials_file.is_some() && !credentials_file_valid;
     let oauth_token_env_present = read_non_empty_env(OAUTH_TOKEN_ENV).is_some();
     let oauth_token_file_present = read_oauth_token_from_file().is_some();
-    let oauth_token_present =
-        oauth_token_env_present || oauth_token_file_present || credentials_file_valid;
-    let effective_auth_path =
-        effective_auth_path(oauth_token_env_present, oauth_token_file_present);
+    let subscription_ready =
+        credentials_file_valid || oauth_token_env_present || oauth_token_file_present;
+    let oauth_token_present = subscription_ready;
+    let effective_auth_path = effective_auth_path(
+        credentials_file_valid,
+        oauth_token_env_present,
+        oauth_token_file_present,
+    );
     let logged_in = read_logged_in_status().unwrap_or(false);
     let auth_file_present = credentials_file_present
         || oauth_token_env_present
@@ -84,22 +88,47 @@ pub fn inspect_status() -> AuthStatus {
         auth_file_present,
         api_key_present,
         credentials_present: api_key_present || auth_file_present,
-        credentials_usable: if api_key_present {
-            true
-        } else {
-            credentials_file_valid || oauth_token_env_present || oauth_token_file_present
+        credentials_usable: match configured_mode {
+            AuthMode::ApiKey => api_key_present,
+            AuthMode::Subscription => subscription_ready,
+            AuthMode::Auto => api_key_present || subscription_ready,
         },
-        auth_problem: if api_key_present {
-            Some("api_key_ready".to_string())
-        } else if credentials_file_valid || oauth_token_env_present || oauth_token_file_present {
-            Some("subscription_ready".to_string())
-        } else if credentials_file_expired {
-            Some("expired_oauth_token".to_string())
-        } else if logged_in {
-            Some("subscription_login_detected".to_string())
-        } else {
-            Some("missing_credentials".to_string())
-        },
+        auth_problem: Some(
+            match configured_mode {
+                AuthMode::ApiKey => {
+                    if api_key_present {
+                        "api_key_ready"
+                    } else {
+                        "missing_credentials"
+                    }
+                }
+                AuthMode::Subscription => {
+                    if subscription_ready {
+                        "subscription_ready"
+                    } else if credentials_file_expired {
+                        "expired_oauth_token"
+                    } else if logged_in {
+                        "subscription_login_detected"
+                    } else {
+                        "missing_credentials"
+                    }
+                }
+                AuthMode::Auto => {
+                    if api_key_present {
+                        "api_key_ready"
+                    } else if subscription_ready {
+                        "subscription_ready"
+                    } else if credentials_file_expired {
+                        "expired_oauth_token"
+                    } else if logged_in {
+                        "subscription_login_detected"
+                    } else {
+                        "missing_credentials"
+                    }
+                }
+            }
+            .to_string(),
+        ),
     }
 }
 
@@ -180,11 +209,17 @@ fn oauth_token_file_path() -> PathBuf {
     PathBuf::from(AUTH_DIR_NAME).join(OAUTH_TOKEN_FILE_NAME)
 }
 
-fn effective_auth_path(oauth_token_env_present: bool, oauth_token_file_present: bool) -> PathBuf {
-    if oauth_token_file_present {
-        oauth_token_file_path()
+fn effective_auth_path(
+    credentials_file_valid: bool,
+    oauth_token_env_present: bool,
+    oauth_token_file_present: bool,
+) -> PathBuf {
+    if credentials_file_valid {
+        auth_file_path()
     } else if oauth_token_env_present {
         PathBuf::from(format!("${OAUTH_TOKEN_ENV}"))
+    } else if oauth_token_file_present {
+        oauth_token_file_path()
     } else {
         auth_file_path()
     }
@@ -335,5 +370,44 @@ mod tests {
         assert!(status.credentials_present);
         assert!(status.credentials_usable);
         assert_eq!(status.auth_problem.as_deref(), Some("api_key_ready"));
+    }
+
+    #[test]
+    fn subscription_mode_ignores_unrelated_api_key() {
+        let _guard = crate_env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let _mode = EnvVarGuard::set(AUTH_MODE_ENV, OsString::from("subscription"));
+        let _api_key = EnvVarGuard::set(API_KEY_ENV, OsString::from("test-key"));
+        let _oauth_token = EnvVarGuard::unset(OAUTH_TOKEN_ENV);
+
+        let status = inspect_status();
+        assert_eq!(status.inferred_mode, AuthMode::Subscription);
+        assert!(!status.credentials_usable);
+        assert_ne!(status.auth_problem.as_deref(), Some("api_key_ready"));
+    }
+
+    #[test]
+    fn credentials_file_wins_reported_auth_path_over_env_and_file_tokens() {
+        let _guard = crate_env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+        write_credentials(&home_dir, unix_time_ms(Duration::from_secs(3600)));
+        let claude_dir = home_dir.join(".claude");
+        fs::write(claude_dir.join("oauth-token"), "file-token\n").unwrap();
+
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let _mode = EnvVarGuard::set(AUTH_MODE_ENV, OsString::from("subscription"));
+        let _api_key = EnvVarGuard::unset(API_KEY_ENV);
+        let _oauth_token = EnvVarGuard::set(OAUTH_TOKEN_ENV, OsString::from("env-token"));
+
+        let status = inspect_status();
+        assert_eq!(
+            status.auth_file_path,
+            home_dir.join(".claude").join(".credentials.json")
+        );
+        assert_eq!(status.auth_problem.as_deref(), Some("subscription_ready"));
     }
 }

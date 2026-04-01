@@ -149,9 +149,9 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
                     );
                     provider_auth_check = check_auth_status(&settings);
                     provider_runtime_check = check_provider_runtime(&settings).await;
-                    seed_repo_git_check = check_seed_repo_git();
+                    seed_repo_git_check = check_seed_repo_git(&settings);
                     checks.push(check_seed_repo_support_dirs(&settings));
-                    shared_skills_check = check_seed_repo_skills();
+                    shared_skills_check = check_seed_repo_skills(&settings);
                     label_check = check_repo_labels(&settings);
                     project_field_check = check_project_fields(&settings);
                     tracker_check = check_github_tracker(&settings).await;
@@ -726,6 +726,14 @@ fn check_project_fields(settings: &Settings) -> DoctorCheck {
 }
 
 fn check_seed_repo_support_dirs(settings: &Settings) -> DoctorCheck {
+    if !settings.uses_seed_worktree_bootstrap() {
+        return DoctorCheck {
+            name: "seed_repo_support_dirs",
+            status: DoctorStatus::Warn,
+            detail: "workspace bootstrap_mode is not seed_worktree; skipping seed repo support directory validation".to_string(),
+        };
+    }
+
     let Some(seed_repo) = std::env::var("KAIRASTRA_SEED_REPO")
         .ok()
         .map(|value| value.trim().to_string())
@@ -796,7 +804,17 @@ fn check_seed_repo_support_dirs(settings: &Settings) -> DoctorCheck {
     }
 }
 
-fn check_seed_repo_git() -> DoctorCheck {
+fn check_seed_repo_git(settings: &Settings) -> DoctorCheck {
+    if !settings.uses_seed_worktree_bootstrap() {
+        return DoctorCheck {
+            name: "seed_repo_git",
+            status: DoctorStatus::Warn,
+            detail:
+                "workspace bootstrap_mode is not seed_worktree; skipping seed repo git validation"
+                    .to_string(),
+        };
+    }
+
     let Some(seed_repo) = std::env::var("KAIRASTRA_SEED_REPO")
         .ok()
         .map(|value| value.trim().to_string())
@@ -909,7 +927,17 @@ fn check_seed_repo_git() -> DoctorCheck {
     }
 }
 
-fn check_seed_repo_skills() -> DoctorCheck {
+fn check_seed_repo_skills(settings: &Settings) -> DoctorCheck {
+    if !settings.uses_seed_worktree_bootstrap() {
+        return DoctorCheck {
+            name: "seed_repo_skills",
+            status: DoctorStatus::Warn,
+            detail:
+                "workspace bootstrap_mode is not seed_worktree; skipping shared skill validation"
+                    .to_string(),
+        };
+    }
+
     let Some(seed_repo) = std::env::var("KAIRASTRA_SEED_REPO")
         .ok()
         .map(|value| value.trim().to_string())
@@ -1025,6 +1053,7 @@ tracker:
   done_state: Done
 workspace:
   root: /tmp/kairastra-workspaces
+  bootstrap_mode: seed_worktree
 agent:
   provider: codex
 providers:
@@ -1181,8 +1210,11 @@ providers:
         let _guard = crate_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         std::env::set_var("KAIRASTRA_SEED_REPO", dir.path());
+        let workflow_path = write_minimal_workflow(dir.path());
+        let definition = load_definition(&workflow_path).unwrap();
+        let settings = crate::config::Settings::from_workflow(&definition).unwrap();
 
-        let check = check_seed_repo_git();
+        let check = check_seed_repo_git(&settings);
         assert_eq!(check.status, DoctorStatus::Fail);
         assert!(check.detail.contains("at least one commit"));
 
@@ -1195,8 +1227,11 @@ providers:
         let dir = tempdir().unwrap();
         init_git_repo(dir.path());
         std::env::set_var("KAIRASTRA_SEED_REPO", dir.path());
+        let workflow_path = write_minimal_workflow(dir.path());
+        let definition = load_definition(&workflow_path).unwrap();
+        let settings = crate::config::Settings::from_workflow(&definition).unwrap();
 
-        let check = check_seed_repo_git();
+        let check = check_seed_repo_git(&settings);
         assert_eq!(check.status, DoctorStatus::Pass);
         assert!(check
             .detail
@@ -1227,8 +1262,11 @@ providers:
         let _guard = crate_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         std::env::set_var("KAIRASTRA_SEED_REPO", dir.path());
+        let workflow_path = write_minimal_workflow(dir.path());
+        let definition = load_definition(&workflow_path).unwrap();
+        let settings = crate::config::Settings::from_workflow(&definition).unwrap();
 
-        let check = check_seed_repo_skills();
+        let check = check_seed_repo_skills(&settings);
         assert_eq!(check.status, DoctorStatus::Fail);
         assert!(check
             .detail
@@ -1243,8 +1281,11 @@ providers:
         let dir = tempdir().unwrap();
         crate::shared_skills::install_shared_skills(dir.path()).unwrap();
         std::env::set_var("KAIRASTRA_SEED_REPO", dir.path());
+        let workflow_path = write_minimal_workflow(dir.path());
+        let definition = load_definition(&workflow_path).unwrap();
+        let settings = crate::config::Settings::from_workflow(&definition).unwrap();
 
-        let check = check_seed_repo_skills();
+        let check = check_seed_repo_skills(&settings);
         assert_eq!(check.status, DoctorStatus::Pass);
 
         std::env::remove_var("KAIRASTRA_SEED_REPO");

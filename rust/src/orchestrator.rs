@@ -246,10 +246,9 @@ impl Orchestrator {
         if dispatchable.is_empty() {
             if let Some(summary) = summarize_idle_dispatch(snapshot, &issues, state) {
                 if state.last_idle_summary.as_deref() != Some(summary.as_str()) {
-                    let has_unknown_states = issues.iter().any(|issue| {
-                        !snapshot.settings.active_state(&issue.state)
-                            && !snapshot.settings.terminal_state(&issue.state)
-                    });
+                    let has_unknown_states = issues
+                        .iter()
+                        .any(|issue| !is_known_issue_state(&snapshot.settings, &issue.state));
                     if has_unknown_states {
                         warn!(available_slots, summary = %summary, "no dispatchable issues");
                     } else {
@@ -1921,9 +1920,7 @@ fn summarize_idle_dispatch(
     for issue in issues {
         *state_counts.entry(issue.state.clone()).or_default() += 1;
 
-        if !snapshot.settings.active_state(&issue.state)
-            && !snapshot.settings.terminal_state(&issue.state)
-        {
+        if !is_known_issue_state(&snapshot.settings, &issue.state) {
             unknown_states.push(format!("{} ({})", issue.identifier, issue.state));
         }
 
@@ -2080,6 +2077,30 @@ fn issue_eligible(
 
 fn should_hold_blocked_claim(settings: &Settings, issue: &Issue) -> bool {
     settings.active_state(&issue.state) && !settings.terminal_state(&issue.state)
+}
+
+fn is_known_issue_state(settings: &Settings, state: &str) -> bool {
+    let normalized = normalize_issue_state(state);
+    settings.active_state(state)
+        || settings.terminal_state(state)
+        || settings
+            .tracker
+            .human_review_state
+            .as_deref()
+            .map(normalize_issue_state)
+            .is_some_and(|configured| configured == normalized)
+        || settings
+            .tracker
+            .in_progress_state
+            .as_deref()
+            .map(normalize_issue_state)
+            .is_some_and(|configured| configured == normalized)
+        || settings
+            .tracker
+            .done_state
+            .as_deref()
+            .map(normalize_issue_state)
+            .is_some_and(|configured| configured == normalized)
 }
 
 fn hold_blocked_claim(state: &mut RuntimeState, issue: &Issue) {
@@ -2788,6 +2809,18 @@ providers:
         assert!(summary.contains("states=Open:1"));
         assert!(summary.contains("claimable_states=Todo"));
         assert!(summary.contains("unknown_states=openai/repo#3 (Open)"));
+    }
+
+    #[test]
+    fn idle_dispatch_summary_does_not_flag_human_review_as_unknown() {
+        let snapshot = snapshot();
+        let issue = issue("3", "Human Review", Some(1));
+        let state = RuntimeState::default();
+
+        let summary = summarize_idle_dispatch(&snapshot, &[issue], &state).expect("summary");
+
+        assert!(summary.contains("states=Human Review:1"));
+        assert!(!summary.contains("unknown_states="));
     }
 
     #[test]

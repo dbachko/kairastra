@@ -55,6 +55,15 @@ pub struct PollingSettings {
 #[derive(Debug, Clone)]
 pub struct WorkspaceSettings {
     pub root: PathBuf,
+    pub bootstrap_mode: WorkspaceBootstrapMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceBootstrapMode {
+    #[default]
+    Plain,
+    SeedWorktree,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +187,7 @@ struct RawPolling {
 #[serde(default)]
 struct RawWorkspace {
     root: Option<String>,
+    bootstrap_mode: WorkspaceBootstrapMode,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -396,6 +406,7 @@ impl Settings {
             polling,
             workspace: WorkspaceSettings {
                 root: workspace_root,
+                bootstrap_mode: raw.workspace.bootstrap_mode,
             },
             hooks,
             agent: AgentSettings {
@@ -475,6 +486,10 @@ impl Settings {
             .get(&normalize_issue_state(state))
             .copied()
             .unwrap_or(self.agent.max_concurrent_agents)
+    }
+
+    pub fn uses_seed_worktree_bootstrap(&self) -> bool {
+        self.workspace.bootstrap_mode == WorkspaceBootstrapMode::SeedWorktree
     }
 }
 
@@ -658,7 +673,7 @@ mod tests {
 
     use crate::model::WorkflowDefinition;
 
-    use super::{normalize_issue_state, Settings};
+    use super::{normalize_issue_state, Settings, WorkspaceBootstrapMode};
 
     #[test]
     fn resolves_env_backed_github_api_key() {
@@ -1046,5 +1061,63 @@ providers:
                 .map(|source| source.source_type),
             Some(super::FieldSourceType::Label)
         );
+    }
+
+    #[test]
+    fn workspace_bootstrap_mode_defaults_to_plain() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(
+            settings.workspace.bootstrap_mode,
+            WorkspaceBootstrapMode::Plain
+        );
+        assert!(!settings.uses_seed_worktree_bootstrap());
+    }
+
+    #[test]
+    fn workspace_bootstrap_mode_accepts_seed_worktree() {
+        env::set_var("GITHUB_TOKEN", "token-123");
+        let definition = WorkflowDefinition {
+            config: serde_yaml::from_str(
+                r#"
+tracker:
+  kind: github
+  owner: openai
+  project_v2_number: 7
+workspace:
+  bootstrap_mode: seed_worktree
+agent:
+  provider: codex
+providers:
+  codex: {}
+"#,
+            )
+            .unwrap(),
+            prompt_template: String::new(),
+        };
+
+        let settings = Settings::from_workflow(&definition).unwrap();
+        assert_eq!(
+            settings.workspace.bootstrap_mode,
+            WorkspaceBootstrapMode::SeedWorktree
+        );
+        assert!(settings.uses_seed_worktree_bootstrap());
     }
 }

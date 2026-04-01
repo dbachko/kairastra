@@ -7,6 +7,7 @@ This page covers the supported way to deploy and operate Kairastra's Rust runtim
 One Kairastra deployment manages one repository.
 
 - The runtime bootstraps each issue workspace from one configured local repository checkout.
+- Generated native workflows set `workspace.bootstrap_mode: seed_worktree`, so `KAIRASTRA_SEED_REPO` must point at the local checkout Kairastra should clone worktrees from.
 - PR discovery, check summaries, and workpad writes all happen against that repository.
 - `projects_v2` can be used as the queue for that repository, but Kairastra still ignores project
   items from other repositories.
@@ -58,6 +59,8 @@ environment variables such as:
 - `KAIRASTRA_WORKSPACE_ROOT`
 - `KAIRASTRA_SEED_REPO`
 - `KAIRASTRA_AGENT_ASSIGNEE`
+
+`KAIRASTRA_SEED_REPO` is required for `workspace.bootstrap_mode: seed_worktree`. The path may be either the primary git checkout or a linked worktree; Kairastra resolves its shared Git common dir internally.
 
 In native mode:
 

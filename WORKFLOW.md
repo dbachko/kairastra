@@ -28,6 +28,7 @@ polling:
   interval_ms: 5000
 workspace:
   root: $KAIRASTRA_WORKSPACE_ROOT
+  bootstrap_mode: seed_worktree
 hooks:
   after_create: |
     set -euo pipefail
@@ -73,7 +74,11 @@ hooks:
     }
 
     require_seed_repo() {
-      if [ -z "${KAIRASTRA_SEED_REPO:-}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+      if [ -z "${KAIRASTRA_SEED_REPO:-}" ]; then
+        echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
+        exit 1
+      fi
+      if ! git -C "$KAIRASTRA_SEED_REPO" rev-parse --git-common-dir >/dev/null 2>&1; then
         echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
         exit 1
       fi
@@ -219,7 +224,11 @@ hooks:
     git config --global --add safe.directory "$(pwd)"
 
     require_seed_repo() {
-      if [ -z "${KAIRASTRA_SEED_REPO:-}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+      if [ -z "${KAIRASTRA_SEED_REPO:-}" ]; then
+        echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
+        exit 1
+      fi
+      if ! git -C "$KAIRASTRA_SEED_REPO" rev-parse --git-common-dir >/dev/null 2>&1; then
         echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
         exit 1
       fi
