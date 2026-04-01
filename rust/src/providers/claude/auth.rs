@@ -50,7 +50,7 @@ pub fn inspect_status() -> AuthStatus {
         .unwrap_or(false);
     let credentials_file_expired = credentials_file.is_some() && !credentials_file_valid;
     let oauth_token_env_present = read_non_empty_env(OAUTH_TOKEN_ENV).is_some();
-    let oauth_token_file_present = oauth_token_file_path().is_file();
+    let oauth_token_file_present = read_oauth_token_from_file().is_some();
     let oauth_token_present =
         oauth_token_env_present || oauth_token_file_present || credentials_file_valid;
     let effective_auth_path =
@@ -226,13 +226,10 @@ fn read_credentials_file() -> Option<ClaudeCredentialsFile> {
 mod tests {
     use std::ffi::OsString;
     use std::fs;
-    use std::sync::Mutex;
     use std::time::{Duration, SystemTime};
 
     use super::{inspect_status, API_KEY_ENV, AUTH_MODE_ENV, OAUTH_TOKEN_ENV};
-    use crate::auth::AuthMode;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::auth::{crate_env_lock, AuthMode};
 
     struct EnvVarGuard {
         key: &'static str,
@@ -286,7 +283,7 @@ mod tests {
 
     #[test]
     fn expired_credentials_are_present_but_not_usable() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let home_dir = dir.path().join("home");
         write_credentials(
@@ -308,7 +305,7 @@ mod tests {
 
     #[test]
     fn valid_credentials_are_usable() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let home_dir = dir.path().join("home");
         write_credentials(&home_dir, unix_time_ms(Duration::from_secs(3600)));
@@ -327,7 +324,7 @@ mod tests {
 
     #[test]
     fn api_key_auth_is_usable() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let _mode = EnvVarGuard::set(AUTH_MODE_ENV, OsString::from("api_key"));
         let _api_key = EnvVarGuard::set(API_KEY_ENV, OsString::from("test-key"));
         let _oauth_token = EnvVarGuard::unset(OAUTH_TOKEN_ENV);

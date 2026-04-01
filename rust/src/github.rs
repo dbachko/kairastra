@@ -479,7 +479,9 @@ query KairastraProjectStatusField($owner: String!, $projectNumber: Int!) {
         issue: &Issue,
         target_status: &str,
     ) -> Result<Issue> {
-        if issue.state.trim().eq_ignore_ascii_case(target_status) {
+        if self.settings.mode == GitHubMode::ProjectsV2
+            && issue.state.trim().eq_ignore_ascii_case(target_status)
+        {
             return Ok(issue.clone());
         }
 
@@ -571,12 +573,26 @@ mutation KairastraUpdateProjectItemStatus(
         }
 
         let labels_path = format!("/repos/{owner}/{repo}/issues/{issue_number}/labels");
-        self.rest_json(
-            reqwest::Method::PUT,
-            &labels_path,
-            Some(json!({ "labels": updated_labels })),
-        )
-        .await?;
+        for label in updated_labels
+            .iter()
+            .filter(|label| !contains_label_ignore_ascii_case(&existing_labels, label))
+        {
+            self.rest_json(
+                reqwest::Method::POST,
+                &labels_path,
+                Some(json!({ "labels": [label] })),
+            )
+            .await?;
+        }
+
+        for label in existing_labels
+            .iter()
+            .filter(|label| !contains_label_ignore_ascii_case(&updated_labels, label))
+        {
+            let remove_path = format!("{labels_path}/{}", url_encode_label_name(label));
+            self.rest_json(reqwest::Method::DELETE, &remove_path, None)
+                .await?;
+        }
 
         Ok(())
     }
@@ -599,12 +615,20 @@ mutation KairastraUpdateProjectItemStatus(
     }
 
     pub async fn transition_closed_issue_to_done(&self, issue: &Issue) -> Result<Issue> {
-        if !issue.state.trim().eq_ignore_ascii_case("closed") {
-            return Ok(issue.clone());
-        }
         let Some(target) = self.settings.done_state.as_deref() else {
             return Ok(issue.clone());
         };
+        if self.settings.mode == GitHubMode::ProjectsV2
+            && !issue.state.trim().eq_ignore_ascii_case("closed")
+        {
+            return Ok(issue.clone());
+        }
+        if self.settings.mode == GitHubMode::IssuesOnly
+            && !issue.state.trim().eq_ignore_ascii_case("closed")
+            && !issue.state.trim().eq_ignore_ascii_case(target)
+        {
+            return Ok(issue.clone());
+        }
         self.transition_issue_project_status(issue, target).await
     }
 
@@ -1287,6 +1311,25 @@ fn replace_workflow_status_labels(
     }
 
     updated
+}
+
+fn contains_label_ignore_ascii_case(labels: &[String], target: &str) -> bool {
+    labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(target))
+}
+
+fn url_encode_label_name(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
 }
 
 fn render_status_label(settings: &TrackerSettings, status: &str) -> String {
@@ -2424,9 +2467,19 @@ mod tests {
             .mount(&server)
             .await;
 
-        Mock::given(method("PUT"))
+        Mock::given(method("POST"))
             .and(path("/repos/openai/kairastra/issues/42/labels"))
-            .and(body_string_contains(r#""labels":["Bug","In Progress"]"#))
+            .and(body_string_contains(r#""labels":["In Progress"]"#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "name": "Bug" },
+                { "name": "Todo" },
+                { "name": "In Progress" }
+            ])))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/repos/openai/kairastra/issues/42/labels/Todo"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 { "name": "Bug" },
                 { "name": "In Progress" }
@@ -2509,6 +2562,125 @@ mod tests {
             .unwrap();
         assert_eq!(updated.state, "In Progress");
         assert_eq!(updated.labels, vec!["bug", "in progress"]);
+    }
+
+    #[tokio::test]
+    async fn issues_only_closed_issue_transition_rewrites_stale_done_label() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues/88"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 88,
+                "node_id": "issue-node-88",
+                "number": 88,
+                "title": "Already merged",
+                "body": "body",
+                "state": "closed",
+                "html_url": "https://github.com/openai/kairastra/issues/88",
+                "assignees": [],
+                "labels": [{ "name": "Human Review" }],
+                "created_at": "2026-03-13T00:00:00Z",
+                "updated_at": "2026-03-13T01:00:00Z"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/repos/openai/kairastra/issues/88/labels"))
+            .and(body_string_contains(r#""labels":["Done"]"#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "name": "Human Review" },
+                { "name": "Done" }
+            ])))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/repos/openai/kairastra/issues/88/labels/Human%20Review",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "name": "Done" }
+            ])))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("state", "all"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 88,
+                    "node_id": "issue-node-88",
+                    "number": 88,
+                    "title": "Already merged",
+                    "body": "body",
+                    "state": "closed",
+                    "html_url": "https://github.com/openai/kairastra/issues/88",
+                    "assignees": [],
+                    "labels": [{ "name": "Done" }],
+                    "created_at": "2026-03-13T00:00:00Z",
+                    "updated_at": "2026-03-13T01:00:00Z"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("state", "all"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  repo: kairastra
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  mode: issues_only
+  status_source:
+    type: label
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issue = crate::model::Issue {
+            id: "issue-node-88".to_string(),
+            project_item_id: None,
+            identifier: "openai/kairastra#88".to_string(),
+            title: "Already merged".to_string(),
+            description: Some("body".to_string()),
+            priority: None,
+            state: "Done".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/kairastra/issues/88".to_string()),
+            assignees: Vec::new(),
+            labels: vec!["human review".to_string()],
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let updated = tracker
+            .transition_closed_issue_to_done(&issue)
+            .await
+            .unwrap();
+        assert_eq!(updated.state, "Done");
+        assert_eq!(updated.labels, vec!["done"]);
     }
 
     #[tokio::test]

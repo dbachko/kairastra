@@ -234,6 +234,14 @@ fn api_key_missing_guidance(status: &AuthStatus, display_name: &str) -> String {
     )
 }
 
+#[cfg(test)]
+pub(crate) fn crate_env_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn login_action(status: &AuthStatus) -> LoginAction {
     if !status.provider_available {
         return LoginAction::ProviderUnavailable;
@@ -270,19 +278,15 @@ enum LoginAction {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::Mutex;
-
     use super::{
-        api_key_missing_guidance, api_key_ready_next_steps, inspect_status, login_action,
-        provider_menu_label, AuthMode, AuthStatus, LoginAction,
+        api_key_missing_guidance, api_key_ready_next_steps, crate_env_lock, inspect_status,
+        login_action, provider_menu_label, AuthMode, AuthStatus, LoginAction,
     };
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use std::path::PathBuf;
 
     #[test]
     fn auto_mode_prefers_api_key_when_present() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         std::env::set_var("CODEX_AUTH_MODE", "auto");
         std::env::set_var("OPENAI_API_KEY", "test-key");
         let status = inspect_status("codex").unwrap();

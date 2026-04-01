@@ -1652,9 +1652,10 @@ fn classify_blocked_worker_failure(
     let move_back_action = move_issue_back_instruction(settings);
 
     let operator_action = if normalized.contains("oauth token has expired")
-        || normalized.contains("authentication_error")
-        || normalized.contains("failed to authenticate")
-        || normalized.contains("please obtain a new token")
+        || normalized.contains("refresh your existing token")
+        || normalized.contains("token_expired")
+        || (normalized.contains("please obtain a new token")
+            && normalized.contains("failed to authenticate"))
     {
         format!(
             "Refresh {} auth with `kairastra auth --provider {} login --mode subscription`, then {}.",
@@ -1946,10 +1947,12 @@ fn summarize_idle_dispatch(
         ),
     ];
 
+    unknown_states.sort();
     if !unknown_states.is_empty() {
         parts.push(format!("unknown_states={}", unknown_states.join(", ")));
     }
 
+    blocked_claims.sort();
     if !blocked_claims.is_empty() {
         parts.push(format!("blocked_claims={}", blocked_claims.join(", ")));
     }
@@ -2515,6 +2518,22 @@ providers:
         .expect("expired Claude OAuth should block");
 
         assert!(blocked
+            .operator_action
+            .contains("kairastra auth --provider claude login"));
+    }
+
+    #[test]
+    fn generic_claude_auth_failures_do_not_use_expired_oauth_guidance() {
+        let snapshot = snapshot();
+        let blocked = classify_blocked_worker_failure(
+            &snapshot.settings,
+            "claude",
+            "Failed to authenticate: invalid api key",
+        )
+        .expect("generic Claude auth failures should block");
+
+        assert!(blocked.operator_action.contains("Configure Claude auth"));
+        assert!(!blocked
             .operator_action
             .contains("kairastra auth --provider claude login"));
     }

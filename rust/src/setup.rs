@@ -448,6 +448,54 @@ fn issues_only_status_config() -> ProjectStatusConfig {
     canonical_project_status_config()
 }
 
+fn render_issues_only_tracker_block() -> String {
+    let config = issues_only_status_config();
+    let active_states = config
+        .active_states
+        .iter()
+        .map(|state| format!("    - {state}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let terminal_states = config
+        .terminal_states
+        .iter()
+        .map(|state| format!("    - {state}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let claimable_states = config
+        .claimable_states
+        .iter()
+        .map(|state| format!("    - {state}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"tracker:
+  kind: github
+  mode: issues_only
+  api_key: $GITHUB_TOKEN
+  owner: $KAIRASTRA_GITHUB_OWNER
+  repo: $KAIRASTRA_GITHUB_REPO
+  status_source:
+    type: label
+  active_states:
+{active_states}
+  terminal_states:
+{terminal_states}
+  claimable_states:
+{claimable_states}
+  in_progress_state: {in_progress_state}
+  human_review_state: {human_review_state}
+  done_state: {done_state}"#,
+        in_progress_state = config.in_progress_state.as_deref().unwrap_or("In Progress"),
+        human_review_state = config
+            .human_review_state
+            .as_deref()
+            .unwrap_or("Human Review"),
+        done_state = config.done_state.as_deref().unwrap_or("Done"),
+    )
+}
+
 fn effective_status_config(values: &SetupValues) -> ProjectStatusConfig {
     match values.tracker_mode {
         GitHubMode::ProjectsV2 => values.project_status.clone(),
@@ -1972,31 +2020,7 @@ fn render_workflow(mode: DeployMode, values: &SetupValues) -> String {
                     render_optional_yaml_value(values.project_status.done_state.as_deref()),
             )
         }
-        GitHubMode::IssuesOnly => r#"tracker:
-  kind: github
-  mode: issues_only
-  api_key: $GITHUB_TOKEN
-  owner: $KAIRASTRA_GITHUB_OWNER
-  repo: $KAIRASTRA_GITHUB_REPO
-  status_source:
-    type: label
-  active_states:
-    - Todo
-    - In Progress
-    - Merging
-    - Rework
-  terminal_states:
-    - Closed
-    - Cancelled
-    - Canceled
-    - Duplicate
-    - Done
-  claimable_states:
-    - Todo
-  in_progress_state: In Progress
-  human_review_state: Human Review
-  done_state: Done"#
-            .to_string(),
+        GitHubMode::IssuesOnly => render_issues_only_tracker_block(),
     };
 
     format!(

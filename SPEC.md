@@ -400,7 +400,7 @@ Fields:
   - Describes where workflow state comes from.
   - Supported types for the GitHub implementation: `project_field`, `issue_field`, `github_state`,
     `label`
-  - `issues_only` workflows should use `label` so runtime-owned claim, review-handoff, and done
+  - `issues_only` workflows must use `label` so runtime-owned claim, review-handoff, and done
     transitions can write workflow state safely.
 - `priority_source` (object, optional)
   - Describes where priority comes from.
@@ -2224,7 +2224,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Runtime-owned review handoff moves an issue to `human_review_state` only when an open PR exists,
   the workpad shows non-bootstrap progress, GitHub Actions / required PR checks are green, and
   `human_review_state` is configured
-- In `issues_only`, that transition is expected to be backed by workflow-status labels rather than
+- In `issues_only`, that transition must be backed by workflow-status labels rather than
   GitHub's native `OPEN` / `CLOSED` state.
 - Runtime-owned terminal cleanup moves a closed issue to project `done_state` before workspace
   removal when that behavior is implemented and `done_state` is configured

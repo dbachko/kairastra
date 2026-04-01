@@ -989,14 +989,10 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
-    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use crate::auth::crate_env_lock;
 
     fn write_minimal_workflow(dir: &Path) -> std::path::PathBuf {
         let workflow_path = dir.join("WORKFLOW.md");
@@ -1166,7 +1162,7 @@ providers:
 
     #[test]
     fn seed_repo_support_dirs_fail_when_missing() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         std::env::set_var("KAIRASTRA_SEED_REPO", dir.path());
         let workflow_path = write_minimal_workflow(dir.path());
@@ -1182,7 +1178,7 @@ providers:
 
     #[test]
     fn seed_repo_git_fails_without_head() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         std::env::set_var("KAIRASTRA_SEED_REPO", dir.path());
 
@@ -1195,7 +1191,7 @@ providers:
 
     #[test]
     fn seed_repo_git_passes_with_head_and_origin() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         init_git_repo(dir.path());
         std::env::set_var("KAIRASTRA_SEED_REPO", dir.path());
@@ -1211,7 +1207,7 @@ providers:
 
     #[test]
     fn seed_repo_support_dirs_pass_when_present() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".agents")).unwrap();
         fs::create_dir_all(dir.path().join(".github")).unwrap();
@@ -1228,7 +1224,7 @@ providers:
 
     #[test]
     fn seed_repo_skills_fail_when_missing() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         std::env::set_var("KAIRASTRA_SEED_REPO", dir.path());
 
@@ -1243,7 +1239,7 @@ providers:
 
     #[test]
     fn seed_repo_skills_pass_when_present() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         crate::shared_skills::install_shared_skills(dir.path()).unwrap();
         std::env::set_var("KAIRASTRA_SEED_REPO", dir.path());
@@ -1276,7 +1272,7 @@ providers:
 
     #[test]
     fn doctor_fails_when_claude_oauth_is_expired() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         let home_dir = dir.path().join("home");
         let claude_dir = home_dir.join(".claude");
