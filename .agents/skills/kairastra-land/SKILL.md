@@ -1,5 +1,5 @@
 ---
-name: land
+name: kairastra-land
 description:
   Land a PR by monitoring conflicts, resolving them, waiting for checks, and
   squash-merging when green; use when asked to land, merge, or shepherd a PR to
@@ -27,11 +27,12 @@ description:
 
 1. Locate the PR for the current branch.
 2. Confirm the full gauntlet is green locally before any push.
-3. If the working tree has uncommitted changes, commit with the `commit` skill
-   and push with the `push` skill before proceeding.
-4. Check mergeability and conflicts against main.
-5. If conflicts exist, use the `pull` skill to fetch/merge `origin/main` and
-   resolve conflicts, then use the `push` skill to publish the updated branch.
+3. If the working tree has uncommitted changes, use the `kairastra-commit`
+   skill and the `kairastra-push` skill before proceeding.
+4. Check mergeability and conflicts against the default branch.
+5. If conflicts exist, use the `kairastra-pull` skill to fetch/merge
+   `origin/<default branch>` and resolve conflicts, then use the `kairastra-push` skill to
+   publish the updated branch.
 6. Ensure Codex review comments (if present) are acknowledged and any required
    fixes are handled before merging.
 7. Watch checks until complete.
@@ -68,8 +69,8 @@ pr_body=$(gh pr view --json body -q .body)
 mergeable=$(gh pr view --json mergeable -q .mergeable)
 
 if [ "$mergeable" = "CONFLICTING" ]; then
-  # Run the `pull` skill to handle fetch + merge + conflict resolution.
-  # Then run the `push` skill to publish the updated branch.
+  # Run the `kairastra-pull` skill to handle fetch + merge + conflict resolution.
+  # Then run the `kairastra-push` skill to publish the updated branch.
 fi
 
 # Preferred: use the Async Watch Helper below. The manual loop is a fallback
@@ -104,7 +105,7 @@ Preferred: use the asyncio watcher to monitor review comments, CI, and head
 updates in parallel:
 
 ```
-python3 .codex/skills/land/land_watch.py
+python3 .agents/skills/kairastra-land/land_watch.py
 ```
 
 Exit codes:
@@ -116,16 +117,16 @@ Exit codes:
 ## Failure Handling
 
 - If checks fail, pull details with `gh pr checks` and `gh run view --log`, then
-  fix locally, commit with the `commit` skill, push with the `push` skill, and
-  re-run the watch.
+  fix locally, use the `kairastra-commit` skill, push with the
+  `kairastra-push` skill, and re-run the watch.
 - Use judgment to identify flaky failures. If a failure is a flake (e.g., a
   timeout on only one platform), you may proceed without fixing it.
 - If CI pushes an auto-fix commit (authored by GitHub Actions), it does not
   trigger a fresh CI run. Detect the updated PR head, pull locally, merge
-  `origin/main` if needed, add a real author commit, and force-push to retrigger
+  `origin/<default branch>` if needed, add a real author commit, and force-push to retrigger
   CI, then restart the checks loop.
 - If all jobs fail with corrupted pnpm lockfile errors on the merge commit, the
-  remediation is to fetch latest `origin/main`, merge, force-push, and rerun CI.
+  remediation is to fetch the latest `origin/<default branch>`, merge, force-push, and rerun CI.
 - If mergeability is `UNKNOWN`, wait and re-check.
 - Do not merge while review comments (human or Codex review) are outstanding.
 - Codex review jobs retry on failure and are non-blocking; use the presence of

@@ -2,12 +2,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use dialoguer::{theme::ColorfulTheme, Input};
-use getrandom::fill as getrandom_fill;
-use reqwest::{blocking::Client, Url};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::auth::{AuthMode, AuthStatus};
 
@@ -18,25 +13,11 @@ const OAUTH_TOKEN_FILE_NAME: &str = "oauth-token";
 const AUTH_MODE_ENV: &str = "CLAUDE_AUTH_MODE";
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 pub const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
-const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const OAUTH_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
-const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-const OAUTH_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
-const OAUTH_SCOPE: &str = "user:inference";
-const DOCKER_VOLUME_HINT: &str =
-    "Docker mode persists Claude auth through the kairastra_home and kairastra_claude volumes mounted for the non-root runtime user.";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClaudeCliAuthStatus {
     logged_in: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct OAuthExchangeResponse {
-    access_token: String,
-    refresh_token: Option<String>,
-    expires_in: Option<u64>,
 }
 
 /// Matches the `claudeAiOauth` section Claude Code writes/reads in `~/.claude/.credentials.json`.
@@ -54,19 +35,6 @@ struct ClaudeOAuthCredential {
 #[serde(rename_all = "camelCase")]
 struct ClaudeCredentialsFile {
     claude_ai_oauth: ClaudeOAuthCredential,
-}
-
-const SUBSCRIPTION_TOKEN_EXPIRES_IN_SECONDS: u64 = 31_536_000;
-
-#[derive(Debug, Serialize)]
-struct OAuthCodeExchangeRequest<'a> {
-    grant_type: &'static str,
-    code: &'a str,
-    redirect_uri: &'static str,
-    client_id: &'static str,
-    code_verifier: &'a str,
-    state: &'a str,
-    expires_in: u64,
 }
 
 pub fn inspect_status() -> AuthStatus {
@@ -109,7 +77,6 @@ pub fn inspect_status() -> AuthStatus {
         auth_file_present,
         api_key_present,
         credentials_present: api_key_present || auth_file_present || logged_in,
-        docker_volume_hint: DOCKER_VOLUME_HINT,
     }
 }
 
@@ -129,10 +96,6 @@ pub fn run_login(mode: AuthMode) -> Result<()> {
 
     match mode {
         AuthMode::Subscription => {
-            if running_in_docker() {
-                return run_docker_subscription_login(command);
-            }
-
             let status = Command::new(command)
                 .args(["auth", "login"])
                 .stdin(Stdio::inherit())
@@ -157,40 +120,6 @@ pub fn run_login(mode: AuthMode) -> Result<()> {
     Ok(())
 }
 
-fn run_docker_subscription_login(_command: PathBuf) -> Result<()> {
-    eprintln!("Generating a long-lived Claude subscription token for Docker...");
-    let flow = DockerOAuthFlow::new()?;
-
-    println!("Open this URL in your browser and complete Claude sign-in:\n");
-    println!("{}", flow.authorize_url()?);
-    println!();
-    println!("After signing in, Claude will show an Authentication Code (a long string, ~40+ characters).");
-    println!("Paste that code below. If Claude shows a full URL instead, paste the entire URL.");
-    println!();
-
-    let pasted_code: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Paste Authentication Code")
-        .validate_with(|value: &String| {
-            if value.trim().is_empty() {
-                Err("Authentication code cannot be empty")
-            } else {
-                Ok(())
-            }
-        })
-        .interact_text()?;
-
-    let authorization_code = parse_authorization_code(&pasted_code, &flow.state)?;
-    eprintln!("Exchanging Claude authentication code...");
-    let response = exchange_auth_code(&flow, &authorization_code)?;
-    persist_oauth_credentials(&response)?;
-    eprintln!(
-        "Saved Claude credentials to {} (and {}).",
-        credentials_file_path().display(),
-        oauth_token_file_path().display(),
-    );
-    Ok(())
-}
-
 fn read_logged_in_status() -> Result<bool> {
     let command = match crate::auth::find_command(COMMAND_NAME) {
         Some(command) => command,
@@ -210,13 +139,6 @@ fn read_logged_in_status() -> Result<bool> {
     let status = serde_json::from_slice::<ClaudeCliAuthStatus>(&output.stdout)
         .context("failed to parse `claude auth status --json`")?;
     Ok(status.logged_in)
-}
-
-fn running_in_docker() -> bool {
-    matches!(
-        std::env::var("KAIRASTRA_DEPLOY_MODE"),
-        Ok(value) if value.trim().eq_ignore_ascii_case("docker")
-    )
 }
 
 fn auth_file_path() -> PathBuf {
@@ -259,154 +181,11 @@ fn read_oauth_token_from_file() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn persist_oauth_token(token: &str) -> Result<()> {
-    let path = oauth_token_file_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    std::fs::write(&path, token).with_context(|| format!("failed to write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let permissions = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&path, permissions)
-            .with_context(|| format!("failed to secure {}", path.display()))?;
-    }
-
-    Ok(())
-}
-
-fn parse_authorization_code(input: &str, expected_state: &str) -> Result<String> {
-    let sanitized = input
-        .replace("\u{1b}[200~", "")
-        .replace("\u{1b}[201~", "")
-        .chars()
-        .filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\r' || *ch == '\t')
-        .collect::<String>()
-        .trim()
-        .to_string();
-
-    if sanitized.is_empty() {
-        return Err(anyhow!("claude_auth_code_empty"));
-    }
-
-    if let Ok(url) = Url::parse(&sanitized) {
-        if url.as_str().starts_with(OAUTH_AUTHORIZE_URL) {
-            return Err(anyhow!(
-                "claude_auth_code_is_authorize_url: paste the Authentication Code shown by Claude after browser sign-in, not the authorize URL"
-            ));
-        }
-
-        if let Some(code) = url
-            .query_pairs()
-            .find_map(|(key, value)| (key == "code").then_some(value.into_owned()))
-        {
-            if code == "true" {
-                return Err(anyhow!(
-                    "claude_auth_code_is_authorize_url: paste the Authentication Code shown by Claude after browser sign-in, not the authorize URL"
-                ));
-            }
-            if let Some(state) = url
-                .query_pairs()
-                .find_map(|(key, value)| (key == "state").then_some(value.into_owned()))
-            {
-                validate_oauth_state(&state, expected_state)?;
-            }
-            return Ok(code);
-        }
-    }
-
-    let (code, state) = match sanitized.split_once('#') {
-        Some((code, state)) => (code.trim(), Some(state.trim())),
-        None => (sanitized.as_str(), None),
-    };
-    if let Some(state) = state {
-        validate_oauth_state(state, expected_state)?;
-    }
-    if code.is_empty() {
-        return Err(anyhow!("claude_auth_code_empty"));
-    }
-
-    Ok(code.to_string())
-}
-
-fn validate_oauth_state(actual: &str, expected: &str) -> Result<()> {
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "claude_auth_code_state_mismatch: expected {}, got {}",
-            expected,
-            actual
-        ))
-    }
-}
-
-fn exchange_auth_code(
-    flow: &DockerOAuthFlow,
-    authorization_code: &str,
-) -> Result<OAuthExchangeResponse> {
-    let request = oauth_code_exchange_request(flow, authorization_code);
-
-    let response = oauth_client()?
-        .post(OAUTH_TOKEN_URL)
-        .json(&request)
-        .send()
-        .context("failed to exchange Claude OAuth code")?;
-
-    parse_oauth_json_response::<OAuthExchangeResponse>(response, "claude_oauth_code_exchange")
-}
-
-/// Writes credentials to both `~/.claude/.credentials.json` (what Claude Code reads natively)
-/// and `~/.claude/oauth-token` (legacy fallback via `CLAUDE_CODE_OAUTH_TOKEN` env var).
-fn persist_oauth_credentials(response: &OAuthExchangeResponse) -> Result<()> {
-    let expires_in = response
-        .expires_in
-        .unwrap_or(SUBSCRIPTION_TOKEN_EXPIRES_IN_SECONDS);
-    let expires_at_ms = now_unix_ms().saturating_add(expires_in.saturating_mul(1_000));
-
-    let creds = ClaudeCredentialsFile {
-        claude_ai_oauth: ClaudeOAuthCredential {
-            access_token: response.access_token.clone(),
-            refresh_token: response.refresh_token.clone(),
-            expires_at: expires_at_ms,
-            scopes: vec!["user:inference".to_string()],
-        },
-    };
-
-    let path = credentials_file_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let json = serde_json::to_string_pretty(&creds).context("failed to serialize credentials")?;
-    std::fs::write(&path, &json).with_context(|| format!("failed to write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to secure {}", path.display()))?;
-    }
-
-    // Also keep the plain-token file so CLAUDE_CODE_OAUTH_TOKEN env var continues to work.
-    persist_oauth_token(&response.access_token)?;
-
-    Ok(())
-}
-
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
+fn is_expired(expires_at_ms: u64) -> bool {
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn is_expired(expires_at_ms: u64) -> bool {
-    // Consider expired 5 minutes early to avoid using a token right at the edge.
-    let now = now_unix_ms();
+        .as_millis() as u64;
     expires_at_ms < now.saturating_add(5 * 60 * 1_000)
 }
 
@@ -418,189 +197,4 @@ fn read_credentials_file() -> Option<ClaudeCredentialsFile> {
     let path = credentials_file_path();
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str::<ClaudeCredentialsFile>(&data).ok()
-}
-
-fn oauth_code_exchange_request<'a>(
-    flow: &'a DockerOAuthFlow,
-    authorization_code: &'a str,
-) -> OAuthCodeExchangeRequest<'a> {
-    OAuthCodeExchangeRequest {
-        grant_type: "authorization_code",
-        code: authorization_code,
-        redirect_uri: OAUTH_REDIRECT_URI,
-        client_id: OAUTH_CLIENT_ID,
-        code_verifier: flow.code_verifier.as_str(),
-        state: flow.state.as_str(),
-        expires_in: SUBSCRIPTION_TOKEN_EXPIRES_IN_SECONDS,
-    }
-}
-
-fn oauth_client() -> Result<Client> {
-    Client::builder()
-        .user_agent("kairastra/0.1")
-        .build()
-        .context("failed to build Claude OAuth client")
-}
-
-fn parse_oauth_json_response<T: for<'de> Deserialize<'de>>(
-    response: reqwest::blocking::Response,
-    context: &str,
-) -> Result<T> {
-    let status = response.status();
-    let body = response
-        .text()
-        .with_context(|| format!("{context}: failed to read response body"))?;
-
-    if !status.is_success() {
-        return Err(anyhow!(
-            "{context}_failed: http_status={status}; body={body}"
-        ));
-    }
-
-    serde_json::from_str::<T>(&body)
-        .with_context(|| format!("{context}: failed to parse response body"))
-}
-
-struct DockerOAuthFlow {
-    state: String,
-    code_verifier: String,
-    code_challenge: String,
-}
-
-impl DockerOAuthFlow {
-    fn new() -> Result<Self> {
-        let state = random_urlsafe_token(32)?;
-        let code_verifier = random_urlsafe_token(48)?;
-        let code_challenge = pkce_challenge(&code_verifier);
-
-        Ok(Self {
-            state,
-            code_verifier,
-            code_challenge,
-        })
-    }
-
-    fn authorize_url(&self) -> Result<Url> {
-        let mut url = Url::parse(OAUTH_AUTHORIZE_URL)
-            .context("failed to parse Claude OAuth authorize URL")?;
-        url.query_pairs_mut()
-            .append_pair("code", "true")
-            .append_pair("client_id", OAUTH_CLIENT_ID)
-            .append_pair("response_type", "code")
-            .append_pair("redirect_uri", OAUTH_REDIRECT_URI)
-            .append_pair("scope", OAUTH_SCOPE)
-            .append_pair("code_challenge", &self.code_challenge)
-            .append_pair("code_challenge_method", "S256")
-            .append_pair("state", &self.state);
-        Ok(url)
-    }
-}
-
-fn random_urlsafe_token(byte_len: usize) -> Result<String> {
-    let mut bytes = vec![0_u8; byte_len];
-    getrandom_fill(&mut bytes)
-        .map_err(|error| anyhow!("failed to generate random OAuth token bytes: {error}"))?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
-}
-
-fn pkce_challenge(code_verifier: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(code_verifier.as_bytes());
-    URL_SAFE_NO_PAD.encode(hasher.finalize())
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::{
-        oauth_code_exchange_request, parse_authorization_code, validate_oauth_state,
-        DockerOAuthFlow,
-    };
-
-    #[test]
-    fn parses_code_and_state_from_pasted_fragment() {
-        let code = parse_authorization_code(
-            "\u{1b}[200~abc123#expected-state\u{1b}[201~",
-            "expected-state",
-        )
-        .unwrap();
-
-        assert_eq!(code, "abc123");
-    }
-
-    #[test]
-    fn parses_code_and_state_from_callback_url() {
-        let code = parse_authorization_code(
-            "https://platform.claude.com/oauth/code/callback?code=abc123&state=expected-state",
-            "expected-state",
-        )
-        .unwrap();
-
-        assert_eq!(code, "abc123");
-    }
-
-    #[test]
-    fn rejects_authorize_url_instead_of_authentication_code() {
-        let error = parse_authorization_code(
-            "https://claude.ai/oauth/authorize?code=true&client_id=client-id&state=expected-state",
-            "expected-state",
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "claude_auth_code_is_authorize_url: paste the Authentication Code shown by Claude after browser sign-in, not the authorize URL"
-        );
-    }
-
-    #[test]
-    fn rejects_mismatched_state() {
-        let error = validate_oauth_state("wrong-state", "expected-state").unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "claude_auth_code_state_mismatch: expected expected-state, got wrong-state"
-        );
-    }
-
-    #[test]
-    fn authorize_url_contains_pkce_and_state() {
-        let flow = DockerOAuthFlow::new().unwrap();
-        let url = flow.authorize_url().unwrap();
-        let query = url.query_pairs().collect::<Vec<_>>();
-
-        assert!(query
-            .iter()
-            .any(|(key, value)| key == "client_id" && !value.is_empty()));
-        assert!(query
-            .iter()
-            .any(|(key, value)| key == "code_challenge" && !value.is_empty()));
-        assert!(query
-            .iter()
-            .any(|(key, value)| key == "state" && value == flow.state.as_str()));
-    }
-
-    #[test]
-    fn serializes_code_exchange_request_with_pkce_fields() {
-        let flow = DockerOAuthFlow {
-            state: "expected-state".to_string(),
-            code_verifier: "code-verifier".to_string(),
-            code_challenge: "code-challenge".to_string(),
-        };
-        let request = oauth_code_exchange_request(&flow, "abc123");
-
-        assert_eq!(
-            serde_json::to_value(request).unwrap(),
-            json!({
-                "grant_type": "authorization_code",
-                "code": "abc123",
-                "redirect_uri": "https://platform.claude.com/oauth/code/callback",
-                "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-                "code_verifier": "code-verifier",
-                "state": "expected-state",
-                "expires_in": 31536000,
-            })
-        );
-    }
 }

@@ -1,62 +1,128 @@
+<!--
+Derived from OpenAI Symphony and modified for Kairastra.
+Copyright 2025 OpenAI
+Copyright 2026 Dzmitry Bachko and contributors
+SPDX-License-Identifier: Apache-2.0
+-->
+
 ![Kairastra logo](.github/media/kairastra-logo.svg)
 
-# Kairastra
-
-_Align intent. Launch execution. Land the merge._
-
-Kairastra is a GitHub-native autonomous work runner for continuous issue execution.
+Kairastra is a GitHub-native autonomous work runner. It watches a GitHub issue queue, creates an
+isolated workspace per issue, runs a coding agent, and hands work back as pull requests, workpad
+updates, and review-ready state changes.
 
 ![Kairastra board](.github/media/kairastra-board.png)
 
-_In this screen, Kairastra shows a GitHub work queue, isolated agent workspaces, and reviewable
-proof of work across pull requests, CI status, and issue updates._
-
 > [!WARNING]
-> This repository is still intended for trusted environments.
+> Kairastra is intended for trusted environments.
 
-## What This Repo Is
+## Relation To Symphony
 
-This is not a generic issue-bot starter.
+Kairastra is an opinionated Rust implementation of
+[OpenAI Symphony](https://github.com/openai/symphony), adapted around a GitHub-native,
+one-repository-per-deployment operating model and multi-provider agent execution.
 
-This repository contains the Rust implementation of Kairastra for GitHub:
+## What It Does
 
-- one deployment per repository, with GitHub Issues or Projects v2 as the queue
-- per-issue isolated workspaces
-- multi-provider agent support (`codex`, `claude`, and `gemini`)
-- issue workpad comments, PR discovery, and review handoff logic
-- operator commands for setup, doctor checks, and auth bootstrap
+- Watches GitHub Issues or Projects v2 for claimable work.
+- Creates isolated per-issue workspaces on the host filesystem.
+- Supports multiple agent providers: `codex`, `claude`, and `gemini`.
+- Keeps issue workpad comments, PR discovery, and review handoff in sync with execution.
 
-The local service contract lives in [SPEC.md](SPEC.md) and documents the runtime behavior
-implemented in this repository.
+## Quick Start
 
-## Why "Kairastra"
+Kairastra is now native-first. The supported path is to install the binary on your host, generate a
+workflow, and run it directly.
 
-Kairastra is derived from `kairos`, the opportune moment, and `astra`, the stars. That fits the
-actual behavior better: the system waits for the right dispatch moment, launches isolated runs, and
-keeps work moving toward review and merge without constant operator supervision.
+Install from source:
 
-## Start Here
+```bash
+curl -fsSL https://raw.githubusercontent.com/dbachko/kairastra/main/install.sh | bash
+```
 
-If you want to run the implementation in this repository, start with:
+Requirements:
 
-- [rust/README.md](rust/README.md) for setup, deployment modes, auth, and operations
-- [docs/README.md](docs/README.md) for architecture, workflow config, and troubleshooting
-- [SPEC.md](SPEC.md) for the repo's normative service contract
+- Rust and Cargo on the host
+- `git` and `gh`
+- the provider CLI you plan to use: `codex`, `claude`, or `gemini`
 
-## Implementation Scope
+Then generate the native config:
 
-The current implementation is opinionated around GitHub:
+```bash
+krstr setup
+krstr auth menu
+krstr doctor
+krstr run
+```
 
-- `tracker.kind: github`
-- one runtime manages one repository checkout and one repository push target
-- `issues_only` is the simplest queue model; `projects_v2` is optional when you want a repo-scoped project queue
-- GitHub-backed workpad comments and PR/check integration
-- `WORKFLOW.md` as the workflow control surface: native deployments read one deployment workflow
-  directly, while Docker deployments keep deployment config in `/config/WORKFLOW.md` and can load
-  repo-root `WORKFLOW.md` prompt/hooks inside seeded workspaces
+`krstr setup` now also:
 
-The runtime also supports multiple coding-agent providers through `agent.provider` and
-`providers.<name>` workflow config blocks.
+- creates `.github/` when the repo is otherwise too empty for workspace bootstrap
+- adds `.kairastra/` to local Git ignore rules
+- inspects required GitHub labels and Project fields
+- asks before applying GitHub label or Project-field changes interactively
+- stays read-only against GitHub in `--non-interactive` mode unless `--bootstrap-github` is set
+
+## First Successful Run
+
+You are set up correctly when all of these are true:
+
+- `krstr doctor` passes.
+- Provider auth is configured.
+- A repo issue is in a claimable state.
+- Kairastra creates a workspace under your configured workspace root.
+- The issue gets a workpad update and Kairastra starts or discovers the PR flow.
+
+## End-To-End Example
+
+1. An issue enters `Todo` or another claimable state in your repo queue.
+2. Kairastra claims it and moves it into the configured in-progress state.
+3. It creates an isolated git worktree from your local repository and runs the selected agent there.
+4. The agent edits code, opens or updates a branch and PR, and writes progress into the issue
+   workpad comment.
+5. GitHub checks and PR status become visible from the same issue lifecycle.
+6. Kairastra hands the issue back in a human-review state, or reconciles it to done when the issue
+   is closed and the workflow allows automatic completion.
+
+## Main Commands
+
+| Command | What it does |
+| --- | --- |
+| `krstr run` | Start the orchestrator loop using repo-root `WORKFLOW.md` by default. |
+| `krstr run --once` | Run one dispatch pass and wait for started workers before exit. |
+| `krstr setup` | Generate repo-root `WORKFLOW.md`, `.kairastra/kairastra.env`, add `.kairastra/` to `.gitignore`, sync required `.agents/skills/` workflow skills into the repo with confirmation, scaffold repo support dirs, and optionally bootstrap GitHub metadata. |
+| `krstr setup --reconfigure` | Re-run setup and overwrite the generated local Kairastra files for the current repo. |
+| `krstr doctor` | Validate workflow, GitHub connectivity, local commands, auth state, and GitHub metadata readiness. |
+| `krstr auth status` | Show provider auth status. |
+| `krstr auth login --mode subscription` | Run subscription or browser login for the default provider. |
+| `krstr auth login --mode api-key` | Configure API-key auth for the default provider. |
+| `krstr auth menu` | Open the provider auth menu. |
+
+`krstr` is a thin wrapper installed alongside `kairastra`, so both command names work.
+
+## Configuration
+
+`WORKFLOW.md` is the main control surface for Kairastra.
+
+- One workflow owns both runtime settings and prompt behavior.
+- The repo-root `WORKFLOW.md` is the canonical workflow template.
+- `krstr setup` writes operator files under `.kairastra/` by default.
+- The generated repo-root `WORKFLOW.md` keeps setup-specific front matter and uses the canonical prompt body from the repo root template.
+- The runtime reads `WORKFLOW.md` directly from the host filesystem.
+- The generated env file keeps machine-specific settings and secrets outside the workflow file.
+
+Use [docs/workflow-reference.md](docs/workflow-reference.md) for the schema and operational rules.
+
+## Read More
+
+- [rust/README.md](rust/README.md): native runtime guide and source-based operation
+- [docs/auth.md](docs/auth.md): GitHub token and provider auth guidance
+- [docs/deployment.md](docs/deployment.md): native deployment and service setup details
+- [docs/operations.md](docs/operations.md): doctor checks, day-2 operations, and limitations
+- [docs/workflow-reference.md](docs/workflow-reference.md): `WORKFLOW.md` structure and behavior
+- [docs/architecture.md](docs/architecture.md): runtime architecture and execution model
+- [docs/troubleshooting.md](docs/troubleshooting.md): setup and runtime failure modes
+- [SPEC.md](SPEC.md): normative service contract
 
 ## License
 

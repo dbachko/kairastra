@@ -12,6 +12,7 @@ use crate::auth::{AuthMode, AuthStatus};
 use crate::config::Settings;
 use crate::deploy::DeployMode;
 use crate::github::GitHubTracker;
+use crate::model::Issue;
 
 pub const AGENT_WORKPAD_HEADER: &str = "## Agent Workpad";
 pub const CODEX_WORKPAD_HEADER: &str = "## Codex Workpad";
@@ -42,6 +43,93 @@ pub fn is_workpad_comment(body: &str) -> bool {
 
 pub fn is_bootstrap_workpad(body: &str) -> bool {
     body.contains(AGENT_BOOTSTRAP_NOTE)
+}
+
+pub fn workpad_host_alias(hostname: &str) -> String {
+    let first_label = hostname.trim().split('.').next().unwrap_or_default();
+    let mut alias = String::with_capacity(first_label.len());
+    let mut last_was_dash = false;
+
+    for ch in first_label.chars().flat_map(|ch| ch.to_lowercase()) {
+        let normalized = if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' {
+            ch
+        } else {
+            '-'
+        };
+        if normalized == '-' {
+            if !last_was_dash {
+                alias.push('-');
+            }
+            last_was_dash = true;
+        } else {
+            alias.push(normalized);
+            last_was_dash = false;
+        }
+    }
+
+    let trimmed = alias.trim_matches('-');
+    if trimmed.is_empty() {
+        "unknown-host".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn workpad_environment_stamp(hostname: &str, issue: &Issue, sha: &str) -> String {
+    let host = workpad_host_alias(hostname);
+    let issue_ref = compact_issue_ref(issue);
+    let short_sha = if sha.trim().is_empty() {
+        "unknown"
+    } else {
+        sha.trim()
+    };
+    format!("{host}:{issue_ref}@{short_sha}")
+}
+
+fn compact_issue_ref(issue: &Issue) -> String {
+    let identifier = issue.identifier.trim();
+    if let Some((repo_path, issue_number)) = identifier.split_once('#') {
+        let repo_name = repo_path
+            .rsplit('/')
+            .next()
+            .map(sanitize_issue_component)
+            .unwrap_or_default();
+        let issue_number = sanitize_issue_component(issue_number);
+        if !repo_name.is_empty() && !issue_number.is_empty() {
+            return format!("{repo_name}#{issue_number}");
+        }
+    }
+
+    let issue_id = sanitize_issue_component(issue.id.trim());
+    if issue_id.is_empty() {
+        "unknown-issue".to_string()
+    } else {
+        format!("issue-{issue_id}")
+    }
+}
+
+fn sanitize_issue_component(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    let mut last_was_dash = false;
+
+    for ch in value.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
+            ch
+        } else {
+            '-'
+        };
+        if normalized == '-' {
+            if !last_was_dash {
+                sanitized.push('-');
+            }
+            last_was_dash = true;
+        } else {
+            sanitized.push(normalized);
+            last_was_dash = false;
+        }
+    }
+
+    sanitized.trim_matches('-').to_string()
 }
 
 pub async fn start_session(
@@ -140,15 +228,6 @@ pub fn collect_setup_config(provider: &str, non_interactive: bool) -> Result<Pro
     }
 }
 
-pub fn docker_login_message(provider: &str) -> Option<&'static str> {
-    match provider {
-        "claude" => Some("Initialize Claude auth in the container"),
-        "codex" => Some("Initialize Codex auth in the container"),
-        "gemini" => Some("Initialize Gemini auth in the container"),
-        _ => None,
-    }
-}
-
 pub fn setup_auth_mode(config: &ProviderSetupConfig) -> AuthMode {
     match config {
         ProviderSetupConfig::Claude(config) => config.auth_mode,
@@ -175,9 +254,9 @@ pub fn render_env_provider_section(mode: DeployMode, config: &ProviderSetupConfi
 
 pub fn repo_support_dirs(provider: &str) -> Result<&'static [&'static str]> {
     match provider {
-        "claude" => Ok(&[".github"]),
-        "codex" => Ok(&[".github"]),
-        "gemini" => Ok(&[".github"]),
+        "claude" => Ok(&[".agents", ".github"]),
+        "codex" => Ok(&[".agents", ".github"]),
+        "gemini" => Ok(&[".agents", ".github"]),
         other => Err(anyhow!("unsupported_agent_provider: {other}")),
     }
 }
@@ -192,10 +271,33 @@ pub enum ProviderSetupConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_workpad_comment, repo_support_dirs, setup_provider_id, workpad_header,
-        ProviderSetupConfig, AGENT_WORKPAD_HEADER, CLAUDE_WORKPAD_HEADER, CODEX_WORKPAD_HEADER,
-        GEMINI_WORKPAD_HEADER,
+        is_workpad_comment, repo_support_dirs, setup_provider_id, workpad_environment_stamp,
+        workpad_header, workpad_host_alias, ProviderSetupConfig, AGENT_WORKPAD_HEADER,
+        CLAUDE_WORKPAD_HEADER, CODEX_WORKPAD_HEADER, GEMINI_WORKPAD_HEADER,
     };
+    use crate::model::Issue;
+
+    fn sample_issue() -> Issue {
+        Issue {
+            id: "17".to_string(),
+            project_item_id: None,
+            identifier: "example-owner/example-repo#17".to_string(),
+            title: "Issue".to_string(),
+            description: None,
+            priority: None,
+            state: "Todo".to_string(),
+            branch_name: None,
+            url: None,
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        }
+    }
 
     #[test]
     fn recognizes_supported_workpad_headers() {
@@ -242,6 +344,32 @@ mod tests {
 
     #[test]
     fn codex_repo_support_dirs_only_require_repo_owned_files() {
-        assert_eq!(repo_support_dirs("codex").unwrap(), &[".github"]);
+        assert_eq!(repo_support_dirs("codex").unwrap(), &[".agents", ".github"]);
+    }
+
+    #[test]
+    fn workpad_host_alias_uses_first_hostname_label() {
+        assert_eq!(workpad_host_alias("MacBookPro.attlocal.net"), "macbookpro");
+        assert_eq!(workpad_host_alias("DEV-BOX_01.local"), "dev-box-01");
+        assert_eq!(workpad_host_alias("___"), "unknown-host");
+    }
+
+    #[test]
+    fn workpad_environment_stamp_uses_repo_and_issue_identifier() {
+        let issue = sample_issue();
+        assert_eq!(
+            workpad_environment_stamp("MacBookPro.attlocal.net", &issue, "ace31c7"),
+            "macbookpro:example-repo#17@ace31c7"
+        );
+    }
+
+    #[test]
+    fn workpad_environment_stamp_falls_back_to_issue_id_for_malformed_identifier() {
+        let mut issue = sample_issue();
+        issue.identifier = "malformed".to_string();
+        assert_eq!(
+            workpad_environment_stamp("host.local", &issue, ""),
+            "host:issue-17@unknown"
+        );
     }
 }

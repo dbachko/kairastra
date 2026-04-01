@@ -44,6 +44,14 @@ pub fn apply_env(values: &HashMap<String, String>) {
     }
 }
 
+pub fn apply_env_if_missing(values: &HashMap<String, String>) {
+    for (key, value) in values {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+}
+
 fn parse_value(raw: &str) -> Result<String> {
     if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
         return Ok(raw[1..raw.len() - 1]

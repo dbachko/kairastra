@@ -32,25 +32,8 @@ hooks:
   after_create: |
     set -euo pipefail
 
-    clone_with_auth() {
-      clone_url="$1"
-      if [ -n "${GITHUB_TOKEN:-}" ] && printf '%s' "$clone_url" | grep -q '^https://github.com/'; then
-        auth_header="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
-        git -c http.extraheader="Authorization: Basic ${auth_header}" clone --depth 1 "$clone_url" .
-        git config http.https://github.com/.extraheader "Authorization: Basic ${auth_header}"
-      else
-        git clone --depth 1 "$clone_url" .
-      fi
-    }
-
-    overlay_seed_repo() {
-      seed_repo="$1"
-      if command -v rsync >/dev/null 2>&1; then
-        rsync -a --delete --exclude '.git' "${seed_repo}/" ./
-      else
-        echo "rsync is required when overlaying KAIRASTRA_SEED_REPO on top of a remote clone." >&2
-        exit 1
-      fi
+    sanitize_issue_identifier() {
+      printf '%s' "${ISSUE_IDENTIFIER:-issue}" | tr -c 'A-Za-z0-9._-' '_'
     }
 
     github_https_url() {
@@ -89,6 +72,43 @@ hooks:
       git config http.https://github.com/.extraheader "Authorization: Basic ${auth_header}"
     }
 
+    require_seed_repo() {
+      if [ -z "${KAIRASTRA_SEED_REPO:-}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+        echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
+        exit 1
+      fi
+      if ! git -C "$KAIRASTRA_SEED_REPO" rev-parse --verify HEAD >/dev/null 2>&1; then
+        echo "KAIRASTRA_SEED_REPO must have at least one commit before running Kairastra." >&2
+        exit 1
+      fi
+    }
+
+    ensure_workspace_checkout() {
+      branch_name="${KAIRASTRA_WORKTREE_BRANCH:-kairastra/$(sanitize_issue_identifier)}"
+      git -C "$KAIRASTRA_SEED_REPO" worktree prune >/dev/null 2>&1 || true
+      if git -C "$KAIRASTRA_SEED_REPO" show-ref --verify --quiet "refs/heads/$branch_name"; then
+        git -C "$KAIRASTRA_SEED_REPO" worktree add --force "$PWD" "$branch_name"
+      else
+        git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "$branch_name" "$PWD" HEAD
+      fi
+    }
+
+    configure_origin_from_seed() {
+      source_remote="$(git -C "$KAIRASTRA_SEED_REPO" config --get remote.origin.url || true)"
+      if [ -z "$source_remote" ]; then
+        echo "KAIRASTRA_SEED_REPO must define remote.origin.url before running Kairastra." >&2
+        exit 1
+      fi
+      git remote set-url origin "$source_remote"
+
+      source_push="$(git -C "$KAIRASTRA_SEED_REPO" config --get remote.origin.pushurl || true)"
+      if [ -n "${KAIRASTRA_GIT_PUSH_URL:-}" ]; then
+        git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
+      elif [ -n "$source_push" ]; then
+        git remote set-url --push origin "$source_push"
+      fi
+    }
+
     restore_support_dir_from_seed() {
       support_dir="$1"
       if [ -e "$support_dir" ]; then
@@ -100,7 +120,7 @@ hooks:
     }
 
     require_workspace_support_dirs() {
-      for support_dir in .codex .github; do
+      for support_dir in .agents .github; do
         restore_support_dir_from_seed "$support_dir"
         if [ ! -e "$support_dir" ]; then
           echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
@@ -109,41 +129,87 @@ hooks:
       done
     }
 
-    adopt_seed_repo_origin() {
-      if [ -z "${KAIRASTRA_SEED_REPO:-}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+    resolve_default_branch() {
+      if [ -n "${KAIRASTRA_GIT_DEFAULT_BRANCH:-}" ]; then
+        printf '%s\n' "${KAIRASTRA_GIT_DEFAULT_BRANCH}"
         return 0
       fi
-      source_remote="$(git -C "$KAIRASTRA_SEED_REPO" config --get remote.origin.url || true)"
-      current_remote="$(git config --get remote.origin.url || true)"
-      if [ -n "$source_remote" ] && { [ "$current_remote" = "$KAIRASTRA_SEED_REPO" ] || [ -z "$current_remote" ]; }; then
-        git remote set-url origin "$source_remote"
+
+      remote_head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+      if [ -n "$remote_head" ]; then
+        printf '%s\n' "${remote_head#origin/}"
+        return 0
+      fi
+
+      remote_head="$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | head -n 1)"
+      if [ -n "$remote_head" ]; then
+        printf '%s\n' "$remote_head"
+        return 0
+      fi
+
+      seed_branch="$(git -C "$KAIRASTRA_SEED_REPO" branch --show-current 2>/dev/null || true)"
+      if [ -n "$seed_branch" ]; then
+        printf '%s\n' "$seed_branch"
+        return 0
+      fi
+
+      printf 'HEAD\n'
+    }
+
+    fetch_origin_branch() {
+      branch_name="$1"
+      if [ -z "$branch_name" ] || [ "$branch_name" = "HEAD" ]; then
+        return 0
+      fi
+      git fetch --quiet origin "refs/heads/$branch_name:refs/remotes/origin/$branch_name" || true
+    }
+
+    ensure_default_branch_baseline() {
+      current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+      default_branch="$(resolve_default_branch)"
+      if [ -z "$default_branch" ]; then
+        return 0
+      fi
+
+      fetch_origin_branch "$default_branch"
+      if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ]; then
+        fetch_origin_branch "$current_branch"
+      fi
+
+      is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+      if [ "$is_shallow" = "true" ]; then
+        if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ] && [ "$current_branch" != "HEAD" ]; then
+          git fetch --quiet --unshallow origin \
+            "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+            "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+            || true
+        else
+          git fetch --quiet --unshallow origin \
+            "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+            || true
+        fi
+      fi
+
+      if git merge-base "origin/$default_branch" HEAD >/dev/null 2>&1; then
+        return 0
+      fi
+
+      if [ -n "$current_branch" ] && [ "$current_branch" != "HEAD" ]; then
+        git fetch --quiet origin \
+          "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+          "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+          || true
+      else
+        git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
       fi
     }
 
-    if [ -n "${KAIRASTRA_GIT_CLONE_URL:-}" ]; then
-      clone_with_auth "$KAIRASTRA_GIT_CLONE_URL"
-      if [ -n "${KAIRASTRA_SEED_REPO:-}" ] && [ -d "$KAIRASTRA_SEED_REPO" ]; then
-        overlay_seed_repo "$KAIRASTRA_SEED_REPO"
-      fi
-    elif [ -n "${KAIRASTRA_SEED_REPO:-}" ] && [ -d "$KAIRASTRA_SEED_REPO/.git" ]; then
-      git clone "$KAIRASTRA_SEED_REPO" .
-      adopt_seed_repo_origin
-    else
-      echo "Set KAIRASTRA_GIT_CLONE_URL, or point KAIRASTRA_SEED_REPO at a git checkout, before running Kairastra." >&2
-      exit 1
-    fi
-
-    if [ -n "${KAIRASTRA_GIT_PUSH_URL:-}" ]; then
-      git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
-    fi
-
+    require_seed_repo
+    ensure_workspace_checkout
     require_workspace_support_dirs
+    configure_origin_from_seed
     configure_github_auth
-
-    if git rev-parse --verify origin/main >/dev/null 2>&1 && ! git merge-base HEAD origin/main >/dev/null 2>&1; then
-      echo "Workspace history does not share a merge base with origin/main. Configure KAIRASTRA_GIT_CLONE_URL to the canonical remote and use KAIRASTRA_SEED_REPO only as an overlay." >&2
-      exit 1
-    fi
+    ensure_default_branch_baseline
 
     git config user.name "${KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}"
     git config user.email "${KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}"
@@ -152,6 +218,17 @@ hooks:
 
     git config --global --add safe.directory "$(pwd)"
 
+    require_seed_repo() {
+      if [ -z "${KAIRASTRA_SEED_REPO:-}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
+        echo "KAIRASTRA_SEED_REPO must point at a git checkout before running Kairastra." >&2
+        exit 1
+      fi
+      if ! git -C "$KAIRASTRA_SEED_REPO" rev-parse --verify HEAD >/dev/null 2>&1; then
+        echo "KAIRASTRA_SEED_REPO must have at least one commit before running Kairastra." >&2
+        exit 1
+      fi
+    }
+
     restore_support_dir_from_seed() {
       support_dir="$1"
       if [ -e "$support_dir" ]; then
@@ -163,7 +240,7 @@ hooks:
     }
 
     require_workspace_support_dirs() {
-      for support_dir in .codex .github; do
+      for support_dir in .agents .github; do
         restore_support_dir_from_seed "$support_dir"
         if [ ! -e "$support_dir" ]; then
           echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
@@ -208,25 +285,102 @@ hooks:
       git config http.https://github.com/.extraheader "Authorization: Basic ${auth_header}"
     }
 
-    adopt_seed_repo_origin() {
-      if [ -z "${KAIRASTRA_SEED_REPO:-}" ] || [ ! -d "$KAIRASTRA_SEED_REPO/.git" ]; then
-        return 0
-      fi
+    configure_origin_from_seed() {
       source_remote="$(git -C "$KAIRASTRA_SEED_REPO" config --get remote.origin.url || true)"
-      current_remote="$(git config --get remote.origin.url || true)"
-      if [ -n "$source_remote" ] && { [ "$current_remote" = "$KAIRASTRA_SEED_REPO" ] || [ -z "$current_remote" ]; }; then
-        git remote set-url origin "$source_remote"
+      if [ -z "$source_remote" ]; then
+        echo "KAIRASTRA_SEED_REPO must define remote.origin.url before running Kairastra." >&2
+        exit 1
+      fi
+      git remote set-url origin "$source_remote"
+
+      source_push="$(git -C "$KAIRASTRA_SEED_REPO" config --get remote.origin.pushurl || true)"
+      if [ -n "${KAIRASTRA_GIT_PUSH_URL:-}" ]; then
+        git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
+      elif [ -n "$source_push" ]; then
+        git remote set-url --push origin "$source_push"
       fi
     }
 
+    resolve_default_branch() {
+      if [ -n "${KAIRASTRA_GIT_DEFAULT_BRANCH:-}" ]; then
+        printf '%s\n' "${KAIRASTRA_GIT_DEFAULT_BRANCH}"
+        return 0
+      fi
+
+      remote_head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+      if [ -n "$remote_head" ]; then
+        printf '%s\n' "${remote_head#origin/}"
+        return 0
+      fi
+
+      remote_head="$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | head -n 1)"
+      if [ -n "$remote_head" ]; then
+        printf '%s\n' "$remote_head"
+        return 0
+      fi
+
+      seed_branch="$(git -C "$KAIRASTRA_SEED_REPO" branch --show-current 2>/dev/null || true)"
+      if [ -n "$seed_branch" ]; then
+        printf '%s\n' "$seed_branch"
+        return 0
+      fi
+
+      printf 'HEAD\n'
+    }
+
+    fetch_origin_branch() {
+      branch_name="$1"
+      if [ -z "$branch_name" ] || [ "$branch_name" = "HEAD" ]; then
+        return 0
+      fi
+      git fetch --quiet origin "refs/heads/$branch_name:refs/remotes/origin/$branch_name" || true
+    }
+
+    ensure_default_branch_baseline() {
+      current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+      default_branch="$(resolve_default_branch)"
+      if [ -z "$default_branch" ]; then
+        return 0
+      fi
+
+      fetch_origin_branch "$default_branch"
+      if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ]; then
+        fetch_origin_branch "$current_branch"
+      fi
+
+      is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+      if [ "$is_shallow" = "true" ]; then
+        if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ] && [ "$current_branch" != "HEAD" ]; then
+          git fetch --quiet --unshallow origin \
+            "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+            "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+            || true
+        else
+          git fetch --quiet --unshallow origin \
+            "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+            || true
+        fi
+      fi
+
+      if git merge-base "origin/$default_branch" HEAD >/dev/null 2>&1; then
+        return 0
+      fi
+
+      if [ -n "$current_branch" ] && [ "$current_branch" != "HEAD" ]; then
+        git fetch --quiet origin \
+          "refs/heads/$current_branch:refs/remotes/origin/$current_branch" \
+          "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+          || true
+      else
+        git fetch --quiet origin "refs/heads/$default_branch:refs/remotes/origin/$default_branch" || true
+      fi
+    }
+
+    require_seed_repo
     require_workspace_support_dirs
-    adopt_seed_repo_origin
-
-    if [ -n "${KAIRASTRA_GIT_PUSH_URL:-}" ]; then
-      git remote set-url --push origin "$KAIRASTRA_GIT_PUSH_URL"
-    fi
-
+    configure_origin_from_seed
     configure_github_auth
+    ensure_default_branch_baseline
 
     git config user.name "${KAIRASTRA_GIT_AUTHOR_NAME:-Kairastra}"
     git config user.email "${KAIRASTRA_GIT_AUTHOR_EMAIL:-kairastra@users.noreply.github.com}"
@@ -312,7 +466,7 @@ The agent should be able to talk to GitHub through the injected `github_graphql`
 - The runtime may already have created the bootstrap workpad comment for this issue; if so, reuse and edit that exact comment instead of creating another.
 - Your first tracker mutation must be to replace the bootstrap-only workpad with a real plan and current checklist state. Do not leave the bootstrap note or an all-unchecked workpad in place.
 - If the rendered `Current workpad` section still shows the bootstrap note or only unchecked placeholder items, update that exact comment before any further implementation or handoff work.
-- When publishing changes, explicitly open and follow `.codex/skills/push/SKILL.md`. Do not improvise PR creation with raw REST calls or ad hoc bodies.
+- When publishing changes, explicitly open and follow `.agents/skills/kairastra-push/SKILL.md`. Do not improvise PR creation with raw REST calls or ad hoc bodies.
 - Spend extra effort up front on planning and verification design before implementation.
 - Reproduce first: confirm the current behavior or failure signal before changing code so the fix target is explicit.
 - Keep issue metadata current: status, checklist, acceptance criteria, and PR linkage.
@@ -326,11 +480,11 @@ The agent should be able to talk to GitHub through the injected `github_graphql`
 
 ## Related skills
 
-- `github`: interact with GitHub issues, comments, PRs, and Project fields through the injected tracker tools.
-- `commit`: produce clean, logical commits during implementation.
-- `push`: keep the remote branch current and publish updates.
-- `pull`: keep the branch updated with latest `origin/main` before handoff.
-- `land`: when the issue reaches `Merging`, explicitly open and follow `.codex/skills/land/SKILL.md`, which includes the landing loop.
+- `kairastra-github`: interact with GitHub issues, comments, PRs, and Project fields through the injected tracker tools.
+- `kairastra-commit`: produce clean, logical commits during implementation.
+- `kairastra-push`: keep the remote branch current and publish updates.
+- `kairastra-pull`: keep the branch updated with latest `origin/<default branch>` before handoff.
+- `kairastra-land`: when the issue reaches `Merging`, explicitly open and follow `.agents/skills/kairastra-land/SKILL.md`, which includes the landing loop.
 
 ## Status map
 
@@ -353,12 +507,12 @@ The agent should be able to talk to GitHub through the injected `github_graphql`
      - If a PR is already attached, start by reviewing all open PR comments and deciding required changes versus explicit pushback responses.
    - `In Progress` -> continue execution flow from the current workpad comment.
    - `Human Review` -> wait and poll for decision or review updates.
-   - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
+   - `Merging` -> on entry, open and follow `.agents/skills/kairastra-land/SKILL.md`; do not call `gh pr merge` directly.
    - `Rework` -> run rework flow.
    - `Done` -> do nothing and shut down.
 4. Check whether a PR already exists for the current branch and whether it is closed.
-   - If a branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
-   - Create a fresh branch from `origin/main` and restart execution flow as a new attempt.
+  - If a branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
+  - Create a fresh branch from `origin/<default branch>` and restart execution flow as a new attempt.
 5. For `Todo` issues, do startup sequencing in this exact order:
    - move the issue to `In Progress`
    - find or create the bootstrap workpad comment
@@ -380,16 +534,16 @@ The agent should be able to talk to GitHub through the injected `github_graphql`
    - Remove the bootstrap note once the workpad has been reconciled into a real execution plan.
 4. Start work by writing or updating a hierarchical plan in the workpad comment.
 5. Ensure the workpad includes a compact environment stamp at the top as a code fence line:
-   - Format: `<host>:<abs-workdir>@<short-sha>`
-   - Example: `devbox-01:/home/dev-user/code/kairastra-workspaces/issue-32@7bdde33`
-   - Do not include metadata already inferable from issue fields such as issue ID, status, branch, or PR link.
+   - Format: `<host-alias>:<repo>#<issue>@<short-sha>`
+   - Example: `macbookpro:kairastra-test#32@7bdde33`
+   - Use only a privacy-safe host alias, not a full hostname or absolute path.
 6. Add explicit acceptance criteria and TODOs in checklist form in the same comment.
    - If changes are user-facing, include a UI walkthrough acceptance criterion that describes the end-to-end user path to validate.
    - If changes touch app files or runtime behavior, add explicit flow checks to `Acceptance Criteria`.
    - If the issue description or comment context includes `Validation`, `Test Plan`, or `Testing` sections, copy those requirements into the workpad `Acceptance Criteria` and `Validation` sections as required checkboxes.
 7. Run a principal-style self-review of the plan and refine it in the comment.
 8. Before implementing, capture a concrete reproduction signal and record it in the workpad `Notes` section.
-9. Run the `pull` skill to sync with latest `origin/main` before any code edits, then record the sync result in the workpad `Notes`.
+9. Run the `pull` skill to sync with the latest `origin/<default branch>` before any code edits, then record the sync result in the workpad `Notes`.
    - Include pull evidence with merge source, result (`clean` or `conflicts resolved`), and resulting `HEAD` short SHA.
 10. Compact context and proceed to execution.
 
@@ -442,11 +596,11 @@ Use this only when completion is blocked by missing required tools or missing au
 6. Re-check all acceptance criteria and close any gaps.
 7. Before every `git push` attempt, run the required validation for your scope and confirm it passes.
 8. Attach or link the PR back to the issue and keep linkage current.
-   - PR creation and updates must follow `.codex/skills/push/SKILL.md`.
+   - PR creation and updates must follow `.agents/skills/kairastra-push/SKILL.md`.
    - Use `.github/pull_request_template.md` and remove all placeholder comments before creating or editing the PR.
    - If `gh` cannot talk to GitHub because of local TLS, certificate, or host transport issues, use the push skill's direct API fallback instead of stopping.
    - Do not create pull requests with raw GitHub REST calls unless the push skill path is unavailable and the fallback body still satisfies the repository template and validation requirements.
-9. Merge latest `origin/main` into the branch, resolve conflicts, and rerun checks before review handoff.
+9. Merge the latest `origin/<default branch>` into the branch, resolve conflicts, and rerun checks before review handoff.
 10. Update the workpad comment with final checklist status and validation notes.
     - Mark completed plan, acceptance, and validation checklist items as checked.
     - Add final handoff notes including commit SHA and validation summary in the same workpad comment.
@@ -472,7 +626,7 @@ Use this only when completion is blocked by missing required tools or missing au
 2. Poll for updates as needed, including PR review comments from humans and bots.
 3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
 4. If approved, a human moves the issue to `Merging`.
-5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the landing loop until the PR is merged. Do not call `gh pr merge` directly.
+5. When the issue is in `Merging`, open and follow `.agents/skills/kairastra-land/SKILL.md`, then run the landing loop until the PR is merged. Do not call `gh pr merge` directly.
 6. After merge is complete, move the issue to `Done`.
 
 ## Step 4: Rework handling
@@ -481,7 +635,7 @@ Use this only when completion is blocked by missing required tools or missing au
 2. Re-read the full issue body and all human comments; explicitly identify what will be done differently this attempt.
 3. Close the existing PR tied to the issue if it should not be reused.
 4. Remove the existing workpad comment or replace it with a clearly fresh workpad.
-5. Create a fresh branch from `origin/main`.
+5. Create a fresh branch from `origin/<default branch>`.
 6. Start over from the normal kickoff flow:
    - if current issue state is `Todo`, move it to `In Progress`; otherwise keep the current state
    - create a new bootstrap workpad comment
@@ -499,7 +653,7 @@ Use this only when completion is blocked by missing required tools or missing au
 ## Guardrails
 
 - If the branch PR is already closed or merged, do not reuse that branch or prior implementation state for continuation.
-- For closed or merged branch PRs, create a new branch from `origin/main` and restart from reproduction and planning.
+- For closed or merged branch PRs, create a new branch from `origin/<default branch>` and restart from reproduction and planning.
 - If issue state is `Backlog`, do not modify it; wait for a human to move it to `Todo`.
 - Prefer exactly one persistent workpad comment per issue.
 - If comment editing is unavailable in-session, fall back to using the issue body as the persistent workpad. Only report blocked if neither comment editing nor issue-body editing is available.
@@ -519,7 +673,7 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 ## Agent Workpad
 
 ```text
-<hostname>:<abs-path>@<short-sha>
+<host-alias>:<repo>#<issue>@<short-sha>
 ```
 
 ### Plan

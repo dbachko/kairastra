@@ -10,9 +10,10 @@ use tracing::{info, warn};
 use crate::agent::AgentEvent;
 use crate::github::{GitHubTracker, OpenPullRequest, PullRequestChecksSummary, Tracker};
 use crate::model::Issue;
-use crate::prompt::{build_prompt, build_prompt_for_workflow, continuation_prompt};
+use crate::prompt::{build_prompt, continuation_prompt};
 use crate::providers::{
-    self, is_bootstrap_workpad, is_workpad_comment, workpad_header, AGENT_BOOTSTRAP_NOTE,
+    self, is_bootstrap_workpad, is_workpad_comment, workpad_environment_stamp, workpad_header,
+    AGENT_BOOTSTRAP_NOTE,
 };
 use crate::workflow::WorkflowSnapshot;
 use crate::workspace;
@@ -94,20 +95,7 @@ pub async fn run_issue(
                 turn_number,
             });
             let prompt = if turn_number == 1 {
-                if matches!(
-                    std::env::var("KAIRASTRA_DEPLOY_MODE").as_deref(),
-                    Ok("docker")
-                ) {
-                    let repo_workflow = workspace::load_workspace_repo_workflow(&workspace.path)?;
-                    build_prompt_for_workflow(
-                        &snapshot.settings,
-                        &repo_workflow.definition,
-                        &current_issue,
-                        attempt,
-                    )?
-                } else {
-                    build_prompt(&snapshot, &current_issue, attempt)?
-                }
+                build_prompt(&snapshot, &current_issue, attempt)?
             } else {
                 continuation_prompt(
                     &current_issue,
@@ -354,7 +342,7 @@ async fn synthesize_runtime_workpad(
     let base_body = issue
         .workpad_comment_body
         .clone()
-        .unwrap_or_else(|| render_workpad_bootstrap_sync(workspace, issue, provider, &sha));
+        .unwrap_or_else(|| render_workpad_bootstrap_sync(issue, provider, "unknown-host", &sha));
     let runtime_section =
         render_runtime_status_section(turn_number, branch, &sha, &status_lines, open_pr, pr_checks);
     Ok(merge_runtime_status_section(&base_body, &runtime_section))
@@ -434,27 +422,23 @@ async fn render_workpad_bootstrap(
     let sha = current_head_short_sha(workspace)
         .await?
         .unwrap_or_else(|| "unknown".to_string());
-    Ok(
-        render_workpad_bootstrap_sync(workspace, issue, provider, &sha).replacen(
-            "unknown-host",
-            &hostname,
-            1,
-        ),
-    )
+    Ok(render_workpad_bootstrap_sync(
+        issue, provider, &hostname, &sha,
+    ))
 }
 
 fn render_workpad_bootstrap_sync(
-    workspace: &std::path::Path,
     issue: &Issue,
     provider: &str,
+    hostname: &str,
     sha: &str,
 ) -> String {
     let issue_url = issue.url.clone().unwrap_or_default();
     let header = workpad_header(provider);
+    let stamp = workpad_environment_stamp(hostname, issue, sha);
 
     format!(
-        "{header}\n\n```text\nunknown-host:{}@{sha}\n```\n\n### Plan\n\n- [ ] 1\\. Reconcile tracker and repository state\n- [ ] 2\\. Implement the requested issue scope\n- [ ] 3\\. Run required validation\n- [ ] 4\\. Open or update the pull request and link it to the issue\n\n### Acceptance Criteria\n\n- [ ] The requested issue scope is implemented for {}.\n- [ ] Required validation from the issue is complete.\n- [ ] A pull request is opened and linked before review handoff.\n- [ ] GitHub Actions and required PR checks are green before review handoff.\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- {AGENT_BOOTSTRAP_NOTE}\n- Issue: {}\n",
-        workspace.display(),
+        "{header}\n\n```text\n{stamp}\n```\n\n### Plan\n\n- [ ] 1\\. Reconcile tracker and repository state\n- [ ] 2\\. Implement the requested issue scope\n- [ ] 3\\. Run required validation\n- [ ] 4\\. Open or update the pull request and link it to the issue\n\n### Acceptance Criteria\n\n- [ ] The requested issue scope is implemented for {}.\n- [ ] Required validation from the issue is complete.\n- [ ] A pull request is opened and linked before review handoff.\n- [ ] GitHub Actions and required PR checks are green before review handoff.\n\n### Validation\n\n- [ ] issue-provided validation steps executed\n\n### Notes\n\n- {AGENT_BOOTSTRAP_NOTE}\n- Issue: {}\n",
         issue.identifier,
         issue_url
     )
@@ -486,8 +470,6 @@ async fn runtime_hostname() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::{
         merge_runtime_status_section, render_runtime_status_section, render_workpad_bootstrap_sync,
         workpad_has_progress, PullRequestChecksSummary, RUNTIME_STATUS_END, RUNTIME_STATUS_START,
@@ -500,13 +482,13 @@ mod tests {
         Issue {
             id: "1".to_string(),
             project_item_id: None,
-            identifier: "dbachko/kairastra#1".to_string(),
+            identifier: "example-owner/example-repo#1".to_string(),
             title: "Issue".to_string(),
             description: None,
             priority: None,
             state: "In Progress".to_string(),
             branch_name: None,
-            url: Some("https://github.com/dbachko/kairastra/issues/1".to_string()),
+            url: Some("https://github.com/example-owner/example-repo/issues/1".to_string()),
             assignees: Vec::new(),
             labels: Vec::new(),
             blocked_by: Vec::new(),
@@ -514,7 +496,7 @@ mod tests {
             updated_at: None,
             workpad_comment_id: Some(1),
             workpad_comment_url: Some(
-                "https://github.com/dbachko/kairastra/issues/1#issuecomment-1".to_string(),
+                "https://github.com/example-owner/example-repo/issues/1#issuecomment-1".to_string(),
             ),
             workpad_comment_body: body.map(ToString::to_string),
         }
@@ -548,10 +530,12 @@ mod tests {
     fn bootstrap_workpad_uses_provider_specific_header() {
         let issue = issue_with_workpad(None);
         let body =
-            render_workpad_bootstrap_sync(Path::new("/tmp/workspace"), &issue, "codex", "abc123");
+            render_workpad_bootstrap_sync(&issue, "codex", "MacBookPro.attlocal.net", "abc123");
 
         assert!(body.starts_with(workpad_header("codex")));
         assert!(!body.starts_with(AGENT_WORKPAD_HEADER));
+        assert!(body.contains("macbookpro:example-repo#1@abc123"));
+        assert!(!body.contains("/tmp/workspace"));
     }
 
     #[test]

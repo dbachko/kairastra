@@ -1654,7 +1654,7 @@ fn classify_blocked_worker_failure(
         || normalized.contains("bypasspermissions")
     {
         format!(
-            "Run Claude in a non-root environment or change `providers.claude.permission_mode` / `approval_policy` so Docker does not request bypass permissions, then {}.",
+            "Run Claude in a non-root environment or change `providers.claude.permission_mode` / `approval_policy` so the runtime does not request bypass permissions, then {}.",
             move_back_action
         )
     } else if normalized.contains("failed to launch claude code")
@@ -1809,15 +1809,11 @@ fn provider_display_name(provider: &str) -> &'static str {
 
 fn render_blocked_failure_workpad(
     provider: &str,
-    workspace_path: Option<&Path>,
+    _workspace_path: Option<&Path>,
     issue: &Issue,
 ) -> String {
     let header = providers::workpad_header(provider);
-    let stamp = if let Some(workspace_path) = workspace_path {
-        format!("unknown-host:{}@unknown", workspace_path.display())
-    } else {
-        "unknown-host:unknown-workspace@unknown".to_string()
-    };
+    let stamp = providers::workpad_environment_stamp("unknown-host", issue, "unknown");
     let issue_line = issue.url.clone().unwrap_or_default();
 
     format!("{header}\n\n```text\n{stamp}\n```\n\n### Notes\n\n- Issue: {issue_line}\n")
@@ -2657,7 +2653,8 @@ providers:
         let body = render_blocked_failure_workpad("claude", Some(workspace.as_path()), &issue);
 
         assert!(body.starts_with("## Claude Workpad"));
-        assert!(body.contains("/workspaces/openai_repo_55"));
+        assert!(body.contains("unknown-host:repo#55@unknown"));
+        assert!(!body.contains("/workspaces/openai_repo_55"));
         assert!(body.contains("issues/55"));
     }
 

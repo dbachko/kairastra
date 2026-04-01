@@ -844,14 +844,14 @@ providers:
         env::set_var("KAIRASTRA_PROJECT_NUMBER", "19");
         env::set_var(
             "KAIRASTRA_PROJECT_URL",
-            "https://github.com/users/dbachko/projects/19",
+            "https://github.com/users/example-owner/projects/19",
         );
         let definition = WorkflowDefinition {
             config: serde_yaml::from_str(
                 r#"
 tracker:
   kind: github
-  owner: dbachko
+  owner: example-owner
   project_v2_number: $KAIRASTRA_PROJECT_NUMBER
   project_url: $KAIRASTRA_PROJECT_URL
 agent:
@@ -868,11 +868,11 @@ providers:
         assert_eq!(settings.tracker.project_v2_number, Some(19));
         assert_eq!(
             settings.tracker.project_url.as_deref(),
-            Some("https://github.com/users/dbachko/projects/19")
+            Some("https://github.com/users/example-owner/projects/19")
         );
         assert_eq!(
             settings.tracker_dashboard_url().as_deref(),
-            Some("https://github.com/users/dbachko/projects/19")
+            Some("https://github.com/users/example-owner/projects/19")
         );
     }
 

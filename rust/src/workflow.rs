@@ -11,6 +11,8 @@ use crate::config::Settings;
 use crate::model::WorkflowDefinition;
 
 pub const REPO_WORKFLOW_FILENAME: &str = "WORKFLOW.md";
+pub const OPERATOR_CONFIG_DIRNAME: &str = ".kairastra";
+pub const OPERATOR_ENV_FILENAME: &str = "kairastra.env";
 
 #[derive(Debug, Clone)]
 pub struct WorkflowSnapshot {
@@ -85,7 +87,26 @@ impl WorkflowStore {
 }
 
 pub fn default_workflow_path() -> Result<PathBuf> {
-    Ok(std::env::current_dir()?.join(REPO_WORKFLOW_FILENAME))
+    let cwd = std::env::current_dir()?;
+    let root = cwd.join(REPO_WORKFLOW_FILENAME);
+    Ok(root)
+}
+
+pub fn default_env_file_path() -> Result<Option<PathBuf>> {
+    let cwd = std::env::current_dir()?;
+    let repo_local = cwd
+        .join(OPERATOR_CONFIG_DIRNAME)
+        .join(OPERATOR_ENV_FILENAME);
+    if repo_local.is_file() {
+        return Ok(Some(repo_local));
+    }
+
+    let legacy = cwd.join(OPERATOR_ENV_FILENAME);
+    if legacy.is_file() {
+        return Ok(Some(legacy));
+    }
+
+    Ok(None)
 }
 
 pub fn load_definition(path: &Path) -> Result<WorkflowDefinition> {
@@ -206,13 +227,19 @@ struct RawRepoWorkflowHooks {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
 
     use tempfile::tempdir;
 
     use super::{
-        default_repo_workflow, load_definition, load_repo_workflow, RepoWorkflowHooks,
-        WorkflowStore,
+        default_repo_workflow, default_workflow_path, load_definition, load_repo_workflow,
+        RepoWorkflowHooks, WorkflowStore,
     };
+
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn supports_prompt_only_workflows() {
@@ -343,5 +370,22 @@ Repo prompt
 
         let error = load_repo_workflow(&path).unwrap_err().to_string();
         assert!(error.contains("invalid_repo_workflow_config"));
+    }
+
+    #[test]
+    fn default_workflow_path_prefers_repo_root_workflow() {
+        let _guard = cwd_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("WORKFLOW.md"), "root\n").unwrap();
+
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let resolved = default_workflow_path().unwrap();
+        std::env::set_current_dir(original).unwrap();
+
+        assert_eq!(
+            resolved,
+            fs::canonicalize(dir.path()).unwrap().join("WORKFLOW.md")
+        );
     }
 }

@@ -1,13 +1,13 @@
 ---
-name: github
+name: kairastra-github
 description: |
-  Use Symphony's injected `github_graphql` and `github_rest` tools for GitHub
+  Use Kairastra's injected `github_graphql` and `github_rest` tools for GitHub
   issue, comment, project, and PR operations during app-server sessions.
 ---
 
 # GitHub Tracker Tools
 
-Use this skill for raw GitHub tracker operations during Symphony app-server
+Use this skill for raw GitHub tracker operations during Kairastra app-server
 sessions.
 
 ## Primary tools

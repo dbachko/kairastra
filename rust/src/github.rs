@@ -1781,7 +1781,7 @@ mod tests {
             settings(&format!(
                 r#"tracker:
   kind: github
-  owner: dbachko
+  owner: example-owner
   api_key: fake
   endpoint: {0}/graphql
   rest_endpoint: {0}
@@ -1817,7 +1817,7 @@ mod tests {
                     }
                 },
                 "errors": [{
-                    "message": "Could not resolve to an Organization with the login of 'dbachko'.",
+                    "message": "Could not resolve to an Organization with the login of 'example-owner'.",
                     "type": "NOT_FOUND",
                     "path": ["organization"]
                 }]
@@ -1829,7 +1829,7 @@ mod tests {
             settings(&format!(
                 r#"tracker:
   kind: github
-  owner: dbachko
+  owner: example-owner
   api_key: fake
   endpoint: {0}/graphql
   rest_endpoint: {0}
@@ -1852,7 +1852,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains(r#""owner":"dbachko""#))
+            .and(body_string_contains(r#""owner":"example-owner""#))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
                     "organization": null,
@@ -1904,8 +1904,8 @@ mod tests {
   kind: github
   owner: openai
   repo: kairastra
-  project_owner: dbachko
-  project_url: https://github.com/users/dbachko/projects/7
+  project_owner: example-owner
+  project_url: https://github.com/users/example-owner/projects/7
   api_key: fake
   endpoint: {0}/graphql
   rest_endpoint: {0}
@@ -2007,8 +2007,8 @@ mod tests {
   kind: github
   owner: openai
   repo: kairastra
-  project_owner: dbachko
-  project_url: https://github.com/users/dbachko/projects/7
+  project_owner: example-owner
+  project_url: https://github.com/users/example-owner/projects/7
   api_key: fake
   endpoint: {0}/graphql
   rest_endpoint: {0}

@@ -14,7 +14,7 @@ want them.
 
 Kairastra already has two distinct skill layers:
 
-- Repository-local workflow skills in `.codex/skills/` that support Kairastra's issue lifecycle.
+- Repository-local workflow skills in `.agents/skills/` that support Kairastra's issue lifecycle.
 - Operator environment setup in `rust/src/setup.rs`, `rust/README.md`, `rust/.env.example`, and
   `WORKFLOW.md`.
 
@@ -25,8 +25,8 @@ Kairastra skills. Upstream documents it as an operator-installed skill bundle fo
 - symlink or copy the relevant skill directories into `~/.agents/skills/`
 - optionally install `collab` if the user wants the subagent-related skills
 
-For Kairastra, that means the integration point is the runtime environment used by Codex
-(native host or Docker container), not the issue workspace repository alone.
+For Kairastra, that means the integration point is the native runtime environment used by Codex,
+not the issue workspace repository alone.
 
 ## Goals
 
@@ -34,7 +34,7 @@ For Kairastra, that means the integration point is the runtime environment used 
 - Keep setup predictable for first-time operators.
 - Avoid surprising behavior changes from enabling a very large skill catalog by default.
 - Preserve a clear boundary between checked-in repo skills and user-environment skill bundles.
-- Make the feature work for both native and Docker deployments.
+- Make the feature work for native deployments.
 
 ## Non-Goals
 
@@ -50,7 +50,7 @@ Implementation shape:
 
 - Setup always clones `obra/superpowers`.
 - Setup always links the entire upstream skills tree into the Codex skill search path.
-- Docker images or bootstrap hooks ensure the bundle is present for every run.
+- Native bootstrap hooks ensure the bundle is present for every run.
 
 Pros:
 
@@ -108,7 +108,7 @@ Pros:
 - Good default experience without forcing the whole catalog on everyone.
 - Small surface area for the first release.
 - Keeps room for power users to opt into the full bundle.
-- Easier to explain and automate in both native and Docker paths.
+- Easier to explain and automate in the native path.
 
 Cons:
 
@@ -147,14 +147,12 @@ Kairastra should not depend on the internet at issue-run time for this feature. 
 - runtime bootstrap creates the necessary symlinks into the Codex-visible skills directory before
   Codex starts
 
-This should happen in the environment where Codex actually runs:
-
-- native mode: on the VPS user account that launches Kairastra
-- Docker mode: inside the container filesystem or a mounted persistent tools volume
+This should happen in the native environment where Codex actually runs, such as the user account
+that launches Kairastra on the host.
 
 ### Repository behavior
 
-Keep the checked-in `.codex/skills/` directory focused on Kairastra's own repo-specific workflows.
+Keep the checked-in `.agents/skills/` directory focused on Kairastra's own repo-specific workflows.
 Do not mix upstream `superpowers` skill contents into this repo tree. The repo should only store:
 
 - configuration knobs
@@ -178,15 +176,14 @@ Suggested defaults:
 - `KAIRASTRA_SUPERPOWERS_MODE=off`
 - `KAIRASTRA_SUPERPOWERS_REF=<pinned commit or tag>`
 - `KAIRASTRA_SUPERPOWERS_ENABLE_COLLAB=false`
-- `KAIRASTRA_SUPERPOWERS_HOME=/opt/kairastra/superpowers` in native mode
-- `KAIRASTRA_SUPERPOWERS_HOME=/opt/superpowers` in Docker mode
+- `KAIRASTRA_SUPERPOWERS_HOME=/opt/kairastra/superpowers`
 
 ### 2. Introduce a curated manifest for the core set
 
 Add a checked-in manifest file, for example:
 
 - `docs/plans/` for the initial spec only
-- later implementation: `.codex/superpowers-core.txt` or `rust/config/superpowers-core.txt`
+- later implementation: `.agents/superpowers-core.txt` or `rust/config/superpowers-core.txt`
 
 The manifest should contain the upstream skill directory names Kairastra considers safe and broadly
 useful for most runs. This avoids baking the core list directly into Rust source and keeps updates
@@ -212,7 +209,6 @@ Add a dedicated bootstrap script that:
 Prefer a single Kairastra-managed destination such as:
 
 - native: `~/.agents/skills/kairastra-superpowers/`
-- Docker: `/root/.agents/skills/kairastra-superpowers/`
 
 Then point the runtime bootstrap at that managed directory instead of scattering symlinks directly
 across the base skills folder.
@@ -225,7 +221,6 @@ issue task unless necessary.
 Best initial placement:
 
 - native setup: as part of setup output instructions plus doctor validation
-- Docker setup: in image startup or container bootstrap before the orchestrator loop starts
 
 Fallback placement:
 
@@ -257,11 +252,11 @@ Extend `doctor` so that when `KAIRASTRA_SUPERPOWERS_MODE != off` it checks:
 
 - add the bootstrap installer/update script
 - add the curated core manifest
-- wire native and Docker startup flows to install/link the selected mode
+- wire the native startup flow to install/link the selected mode
 
 ### Phase 3: Validation and refinement
 
-- test native and Docker flows end to end
+- test the native flow end to end
 - tune the curated core manifest based on real issue runs
 - optionally add a `custom` mode later if operators need finer control
 
@@ -269,19 +264,11 @@ Extend `doctor` so that when `KAIRASTRA_SUPERPOWERS_MODE != off` it checks:
 
 Native mode:
 
-1. Run `cargo run -- setup --mode native`.
+1. Run `cargo run -- setup`.
 2. Enable `superpowers` in `core` mode.
 3. Run `cargo run -- doctor`.
 4. Confirm the managed skill directory exists and links resolve.
 5. Start a Codex-backed Kairastra run and verify Codex sees the installed skills.
-
-Docker mode:
-
-1. Run `cargo run -- setup --mode docker`.
-2. Enable `superpowers` in `core` mode.
-3. Start the stack.
-4. Run `cargo run -- doctor --mode docker` or the container equivalent.
-5. Verify the container has the managed skill directory and Codex can use it.
 
 Upgrade path:
 

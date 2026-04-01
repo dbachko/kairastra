@@ -9,8 +9,6 @@ use crate::auth::{AuthMode, AuthStatus};
 pub const COMMAND_NAME: &str = "codex";
 const AUTH_DIR_NAME: &str = ".codex";
 const AUTH_MODE_ENV: &str = "CODEX_AUTH_MODE";
-const DOCKER_VOLUME_HINT: &str =
-    "Docker mode persists Codex auth through the kairastra_home and kairastra_codex volumes mounted for the non-root runtime user.";
 
 pub fn inspect_status() -> AuthStatus {
     let configured_mode = AuthMode::from_env_var(AUTH_MODE_ENV);
@@ -41,7 +39,6 @@ pub fn inspect_status() -> AuthStatus {
         auth_file_present,
         api_key_present,
         credentials_present: auth_file_present || api_key_present,
-        docker_volume_hint: DOCKER_VOLUME_HINT,
     }
 }
 
@@ -53,9 +50,6 @@ pub fn run_login(mode: AuthMode) -> Result<()> {
         AuthMode::Subscription => {
             let mut login = Command::new(command);
             login.arg("login");
-            if running_in_docker() {
-                login.arg("--device-auth");
-            }
             let status = login
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
@@ -91,36 +85,10 @@ pub fn run_login(mode: AuthMode) -> Result<()> {
     Ok(())
 }
 
-fn running_in_docker() -> bool {
-    matches!(
-        std::env::var("KAIRASTRA_DEPLOY_MODE"),
-        Ok(value) if value.trim().eq_ignore_ascii_case("docker")
-    )
-}
-
 fn auth_file_path() -> PathBuf {
     if let Some(home) = dirs::home_dir() {
         return home.join(AUTH_DIR_NAME).join("auth.json");
     }
 
     PathBuf::from(AUTH_DIR_NAME).join("auth.json")
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use super::running_in_docker;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn detects_docker_mode_from_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("KAIRASTRA_DEPLOY_MODE", "docker");
-        assert!(running_in_docker());
-        std::env::set_var("KAIRASTRA_DEPLOY_MODE", "native");
-        assert!(!running_in_docker());
-        std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
-    }
 }

@@ -1,5 +1,5 @@
 ---
-name: push
+name: kairastra-push
 description:
   Push current branch changes to origin and create or update the corresponding
   pull request; use when asked to push, publish updates, or create pull request.
@@ -22,7 +22,7 @@ description:
 
 ## Related Skills
 
-- `pull`: use this when push is rejected or sync is not clean (non-fast-forward,
+- `kairastra-pull`: use this when push is rejected or sync is not clean (non-fast-forward,
   merge conflict risk, or stale branch).
 
 ## Steps
@@ -36,8 +36,9 @@ description:
 3. Push branch to `origin` with upstream tracking if needed, using whatever
    remote URL is already configured.
 4. If push is not clean/rejected:
-   - If the failure is a non-fast-forward or sync problem, run the `pull`
-     skill to merge `origin/main`, resolve conflicts, and rerun validation.
+   - If the failure is a non-fast-forward or sync problem, run the
+     `kairastra-pull` skill to merge `origin/<default branch>`, resolve conflicts, and rerun
+     validation.
    - Push again; use `--force-with-lease` only when history was rewritten.
    - If the failure is due to auth, permissions, or workflow restrictions on
      the configured remote, stop and surface the exact error instead of
@@ -139,6 +140,14 @@ talk to GitHub cleanly.
 
 ```sh
 branch=$(git branch --show-current)
+default_branch=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+if [ -z "$default_branch" ]; then
+  default_branch=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | head -n 1)
+fi
+if [ -z "$default_branch" ]; then
+  echo "Could not determine the default branch for origin." >&2
+  exit 1
+fi
 repo_slug=$(git remote get-url origin | sed -E 's#(https://x-access-token:[^@]+@|https://|git@)github.com[:/]##; s#\\.git$##')
 repo_owner=${repo_slug%%/*}
 repo_name=${repo_slug#*/}
@@ -166,7 +175,7 @@ if [ -z "$existing_pr_number" ]; then
     -d @<(jq -n \
       --arg title "$pr_title" \
       --arg head "$branch" \
-      --arg base "main" \
+      --arg base "$default_branch" \
       --rawfile body "$tmp_pr_body" \
       '{title:$title, head:$head, base:$base, body:$body}') \
     | jq -r '.html_url'
