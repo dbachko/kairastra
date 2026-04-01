@@ -64,6 +64,43 @@ pub fn inspect_status() -> AuthStatus {
             }
         }
     };
+    let (credentials_usable, auth_problem) = match configured_mode {
+        AuthMode::ApiKey => (
+            api_key_present,
+            if api_key_present {
+                "api_key_ready"
+            } else {
+                "missing_credentials"
+            },
+        ),
+        AuthMode::Subscription => (
+            auth_file_present,
+            if auth_file_present {
+                "subscription_ready"
+            } else {
+                "missing_credentials"
+            },
+        ),
+        AuthMode::Auto => match inferred_mode {
+            AuthMode::ApiKey => (
+                api_key_present,
+                if api_key_present {
+                    "api_key_ready"
+                } else {
+                    "missing_credentials"
+                },
+            ),
+            AuthMode::Subscription => (
+                auth_file_present,
+                if auth_file_present {
+                    "subscription_ready"
+                } else {
+                    "missing_credentials"
+                },
+            ),
+            AuthMode::Auto => (false, "missing_credentials"),
+        },
+    };
 
     AuthStatus {
         provider: "gemini".to_string(),
@@ -74,14 +111,8 @@ pub fn inspect_status() -> AuthStatus {
         auth_file_present,
         api_key_present,
         credentials_present: auth_file_present || api_key_present,
-        credentials_usable: auth_file_present || api_key_present,
-        auth_problem: if api_key_present {
-            Some("api_key_ready".to_string())
-        } else if auth_file_present {
-            Some("subscription_ready".to_string())
-        } else {
-            Some("missing_credentials".to_string())
-        },
+        credentials_usable,
+        auth_problem: Some(auth_problem.to_string()),
     }
 }
 
@@ -214,7 +245,7 @@ mod tests {
 
     use super::{
         inspect_status, is_subscription_selected_type, login_completed_since, read_login_state,
-        run_login,
+        run_login, API_KEY_AUTH_TYPE,
     };
     use crate::auth::{crate_env_lock, AuthMode};
 
@@ -247,6 +278,17 @@ mod tests {
         }
     }
 
+    fn write_gemini_auth_files(home_dir: &std::path::Path, selected_type: &str) {
+        let gemini_dir = home_dir.join(".gemini");
+        fs::create_dir_all(&gemini_dir).unwrap();
+        fs::write(gemini_dir.join("oauth_creds.json"), "{}").unwrap();
+        fs::write(
+            gemini_dir.join("settings.json"),
+            format!(r#"{{"security":{{"auth":{{"selectedType":"{selected_type}"}}}}}}"#),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn auto_mode_prefers_api_key_when_present() {
         let _guard = crate_env_lock().lock().unwrap();
@@ -264,14 +306,7 @@ mod tests {
         let _guard = crate_env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let home_dir = dir.path().join("home");
-        let gemini_dir = home_dir.join(".gemini");
-        fs::create_dir_all(&gemini_dir).unwrap();
-        fs::write(gemini_dir.join("oauth_creds.json"), "{}").unwrap();
-        fs::write(
-            gemini_dir.join("settings.json"),
-            r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#,
-        )
-        .unwrap();
+        write_gemini_auth_files(&home_dir, "oauth-personal");
 
         let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
         let _mode = EnvVarGuard::set("GEMINI_AUTH_MODE", OsString::from("auto"));
@@ -282,6 +317,68 @@ mod tests {
         assert_eq!(status.inferred_mode, AuthMode::Subscription);
         assert!(status.auth_file_present);
         assert!(status.credentials_present);
+        assert!(status.credentials_usable);
+        assert_eq!(status.auth_problem.as_deref(), Some("subscription_ready"));
+    }
+
+    #[test]
+    fn subscription_mode_ignores_unrelated_api_key() {
+        let _guard = crate_env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let _mode = EnvVarGuard::set("GEMINI_AUTH_MODE", OsString::from("subscription"));
+        let _key = EnvVarGuard::set("GEMINI_API_KEY", OsString::from("test-key"));
+        let _google_api_key = EnvVarGuard::unset("GOOGLE_API_KEY");
+
+        let status = inspect_status();
+        assert_eq!(status.inferred_mode, AuthMode::Subscription);
+        assert!(!status.auth_file_present);
+        assert!(status.api_key_present);
+        assert!(status.credentials_present);
+        assert!(!status.credentials_usable);
+        assert_eq!(status.auth_problem.as_deref(), Some("missing_credentials"));
+    }
+
+    #[test]
+    fn api_key_mode_ignores_subscription_credentials() {
+        let _guard = crate_env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+        write_gemini_auth_files(&home_dir, "oauth-personal");
+
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let _mode = EnvVarGuard::set("GEMINI_AUTH_MODE", OsString::from("api_key"));
+        let _api_key = EnvVarGuard::unset("GEMINI_API_KEY");
+        let _google_api_key = EnvVarGuard::unset("GOOGLE_API_KEY");
+
+        let status = inspect_status();
+        assert_eq!(status.inferred_mode, AuthMode::ApiKey);
+        assert!(status.auth_file_present);
+        assert!(status.credentials_present);
+        assert!(!status.credentials_usable);
+        assert_eq!(status.auth_problem.as_deref(), Some("missing_credentials"));
+    }
+
+    #[test]
+    fn auto_mode_selected_api_key_requires_api_key_to_be_usable() {
+        let _guard = crate_env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+        write_gemini_auth_files(&home_dir, API_KEY_AUTH_TYPE);
+
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str().into());
+        let _mode = EnvVarGuard::set("GEMINI_AUTH_MODE", OsString::from("auto"));
+        let _api_key = EnvVarGuard::unset("GEMINI_API_KEY");
+        let _google_api_key = EnvVarGuard::unset("GOOGLE_API_KEY");
+
+        let status = inspect_status();
+        assert_eq!(status.inferred_mode, AuthMode::ApiKey);
+        assert!(status.auth_file_present);
+        assert!(status.credentials_present);
+        assert!(!status.credentials_usable);
+        assert_eq!(status.auth_problem.as_deref(), Some("missing_credentials"));
     }
 
     #[test]
