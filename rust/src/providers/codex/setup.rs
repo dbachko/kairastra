@@ -43,7 +43,7 @@ pub fn render_workflow_section(config: &CodexSetupConfig) -> String {
 pub fn render_env_section(mode: DeployMode, config: &CodexSetupConfig) -> String {
     let _ = mode;
     let fast = config.fast.map(bool_to_env).unwrap_or_default();
-    let lines = vec![
+    let lines = [
         format!("CODEX_AUTH_MODE={}", config.auth_mode),
         format!("KAIRASTRA_CODEX_MODEL={}", config.model),
         format!(

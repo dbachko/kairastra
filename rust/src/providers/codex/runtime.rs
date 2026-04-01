@@ -899,7 +899,7 @@ fn parse_direct_command(command_line: &str) -> Option<(String, Vec<String>)> {
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed.contains(|ch: char| matches!(ch, '|' | '&' | ';' | '<' | '>' | '$' | '`' | '\n'))
+    if trimmed.contains(['|', '&', ';', '<', '>', '$', '`', '\n'])
         || trimmed.contains('"')
         || trimmed.contains('\'')
     {
@@ -1567,6 +1567,7 @@ done
         assert!(trace.contains(r#""serviceTier":"fast""#));
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn probe_startup_does_not_inherit_parent_codex_session_env() {
         let _guard = env_lock().lock().unwrap();

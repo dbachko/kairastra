@@ -185,15 +185,13 @@ pub async fn run(options: SetupOptions) -> Result<()> {
             "{}. Start Kairastra: sudo systemctl enable --now kairastra.service",
             step + 2
         );
+    } else if options.workflow.is_some() {
+        println!(
+            "{step}. Start Kairastra: kairastra run {}",
+            workflow_path.display()
+        );
     } else {
-        if options.workflow.is_some() {
-            println!(
-                "{step}. Start Kairastra: kairastra run {}",
-                workflow_path.display()
-            );
-        } else {
-            println!("{step}. Start Kairastra: kairastra run");
-        }
+        println!("{step}. Start Kairastra: kairastra run");
     }
 
     Ok(())
