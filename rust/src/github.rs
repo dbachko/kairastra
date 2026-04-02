@@ -8,6 +8,7 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT}
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde_json::error::Category as JsonErrorCategory;
 use serde_json::{json, Value as JsonValue};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, warn};
@@ -1508,6 +1509,10 @@ fn should_retry_github_read_error(
                 error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
             })
             .unwrap_or(false)
+            || cause
+                .downcast_ref::<serde_json::Error>()
+                .map(|error| matches!(error.classify(), JsonErrorCategory::Eof))
+                .unwrap_or(false)
             || retryable_github_read_error_text(&cause.to_string())
     })
 }
@@ -1518,12 +1523,14 @@ fn retryable_github_read_error_text(message: &str) -> bool {
         "connection closed before message completed",
         "connection reset",
         "unexpected eof",
+        "unexpected end of file",
         "broken pipe",
         "request or response body error",
         "error sending request for url",
         "client error (sendrequest)",
         "channel closed",
         "end of file before message length reached",
+        "eof while parsing",
     ]
     .into_iter()
     .any(|needle| message.contains(needle))
@@ -1891,8 +1898,9 @@ fn issue_locator(issue: &Issue) -> Result<(String, String, u64)> {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::{Shutdown, TcpListener};
+    use std::net::{Shutdown, TcpListener, TcpStream};
     use std::thread;
+    use std::time::{Duration as StdDuration, Instant};
 
     use wiremock::matchers::{body_string_contains, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1918,6 +1926,28 @@ mod tests {
             prompt_template: String::new(),
         };
         Settings::from_workflow(&definition).unwrap()
+    }
+
+    fn accept_with_deadline(
+        listener: &TcpListener,
+        deadline: Instant,
+    ) -> std::io::Result<TcpStream> {
+        listener.set_nonblocking(true)?;
+        loop {
+            match listener.accept() {
+                Ok((socket, _)) => return Ok(socket),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "timed out waiting for test connection",
+                        ));
+                    }
+                    thread::sleep(StdDuration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     #[tokio::test]
@@ -1965,7 +1995,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
+            let deadline = Instant::now() + StdDuration::from_secs(5);
+            let mut socket = accept_with_deadline(&listener, deadline).unwrap();
             let mut request = [0_u8; 2048];
             let _ = socket.read(&mut request);
             socket
@@ -1975,7 +2006,66 @@ mod tests {
                 .unwrap();
             socket.shutdown(Shutdown::Both).unwrap();
 
-            let (mut socket, _) = listener.accept().unwrap();
+            let mut socket = accept_with_deadline(&listener, deadline).unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request);
+            let body = r#"[{"ok":true}]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+            socket.shutdown(Shutdown::Both).unwrap();
+        });
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  repo: kairastra
+  api_key: fake
+  endpoint: http://{0}/graphql
+  rest_endpoint: http://{0}
+  mode: issues_only
+  status_source:
+    type: label
+"#,
+                address
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let response = tracker
+            .rest_json(reqwest::Method::GET, "/repos/openai/kairastra/issues", None)
+            .await
+            .unwrap();
+        assert_eq!(response, serde_json::json!([{ "ok": true }]));
+
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rest_json_retries_truncated_json_decode_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + StdDuration::from_secs(5);
+            let mut socket = accept_with_deadline(&listener, deadline).unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request);
+            let body = r#"[{"ok":true"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+            socket.shutdown(Shutdown::Both).unwrap();
+
+            let mut socket = accept_with_deadline(&listener, deadline).unwrap();
             let mut request = [0_u8; 2048];
             let _ = socket.read(&mut request);
             let body = r#"[{"ok":true}]"#;
