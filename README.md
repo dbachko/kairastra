@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ![Kairastra logo](.github/media/kairastra-logo.svg)
 
-[![CI](https://github.com/dbachko/kairastra/actions/workflows/make-all.yml/badge.svg?branch=main)](https://github.com/dbachko/kairastra/actions/workflows/make-all.yml)
+[![CI](https://github.com/dbachko/kairastra/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dbachko/kairastra/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/dbachko/kairastra)](https://github.com/dbachko/kairastra/blob/main/LICENSE)
 [![Release](https://img.shields.io/github/v/tag/dbachko/kairastra?sort=semver&label=release)](https://github.com/dbachko/kairastra/tags)
 [![Docs](https://img.shields.io/badge/docs-workflow%20%2B%20ops-0A7EA4)](https://github.com/dbachko/kairastra/blob/main/docs/workflow-reference.md)

@@ -3365,7 +3365,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "check_runs": [
                     {
-                        "name": "make-all",
+                        "name": "CI",
                         "status": "completed",
                         "conclusion": "failure"
                     }
@@ -3407,7 +3407,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.state, PullRequestChecksState::Failing);
-        assert_eq!(summary.failing, vec!["make-all".to_string()]);
+        assert_eq!(summary.failing, vec!["CI".to_string()]);
         assert!(!summary.allows_review_handoff());
     }
 
@@ -3421,7 +3421,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "check_runs": [
                     {
-                        "name": "make-all",
+                        "name": "CI",
                         "status": "in_progress",
                         "conclusion": null
                     }
@@ -3463,7 +3463,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.state, PullRequestChecksState::Pending);
-        assert_eq!(summary.pending, vec!["make-all".to_string()]);
+        assert_eq!(summary.pending, vec!["CI".to_string()]);
         assert!(!summary.allows_review_handoff());
     }
 
