@@ -579,7 +579,7 @@ mod tests {
             Some(&PullRequestChecksSummary {
                 state: PullRequestChecksState::Pending,
                 failing: Vec::new(),
-                pending: vec!["make-all".to_string()],
+                pending: vec!["CI".to_string()],
             }),
         );
 
