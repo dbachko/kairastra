@@ -200,7 +200,8 @@ pub async fn remove_issue_workspace(settings: &Settings, identifier: &str) -> Re
             match remove_managed_git_worktree(&seed_repo, &workspace, identifier).await {
                 Ok(()) => return Ok(()),
                 Err(error) if managed_git_worktree_safety_error(&error) => return Err(error),
-                Err(_) => {}
+                Err(error) if managed_git_worktree_probe_error(&error) => {}
+                Err(error) => return Err(error),
             }
         }
     }
@@ -364,11 +365,17 @@ fn managed_git_worktree_safety_error(error: &anyhow::Error) -> bool {
         || message.contains("managed_worktree_unmerged_branch")
 }
 
+fn managed_git_worktree_probe_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("workspace is not a managed seed worktree")
+        || message.contains("seed repo is not a git checkout")
+}
+
 async fn ensure_managed_worktree_clean(workspace: &Path) -> Result<()> {
     let status_output = Command::new("git")
         .arg("-C")
         .arg(workspace)
-        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .args(["status", "--porcelain", "--untracked-files=all"])
         .output()
         .await
         .context("failed to inspect managed worktree status")?;
@@ -378,10 +385,21 @@ async fn ensure_managed_worktree_clean(workspace: &Path) -> Result<()> {
             String::from_utf8_lossy(&status_output.stderr).trim()
         ));
     }
-    if !status_output.stdout.is_empty() {
+    let has_user_changes = String::from_utf8_lossy(&status_output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .any(|line| !managed_worktree_status_line_is_kairastra_state(line));
+    if has_user_changes {
         return Err(anyhow!("managed_worktree_dirty: {}", workspace.display()));
     }
     Ok(())
+}
+
+fn managed_worktree_status_line_is_kairastra_state(line: &str) -> bool {
+    let path = line.get(3..).unwrap_or(line).trim();
+    let path = path.split(" -> ").last().unwrap_or(path).trim();
+    path == ".kairastra/pending-input.json"
 }
 
 async fn ensure_managed_branch_merged(seed_repo: &Path, identifier: &str) -> Result<()> {
@@ -503,8 +521,10 @@ mod tests {
 
     use super::{
         clear_pending_human_input, ensure_workspace, load_pending_human_input,
-        load_workspace_repo_workflow, remove_issue_workspace, run_after_run_hook, run_hook,
-        sanitize_workspace_key, write_pending_human_input,
+        load_workspace_repo_workflow, managed_git_worktree_probe_error,
+        managed_git_worktree_safety_error, managed_worktree_status_line_is_kairastra_state,
+        remove_issue_workspace, run_after_run_hook, run_hook, sanitize_workspace_key,
+        write_pending_human_input,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -661,6 +681,38 @@ workspace:
         assert!(load_pending_human_input(&workspace.path).unwrap().is_none());
     }
 
+    #[test]
+    fn managed_worktree_error_classification_controls_cleanup_fallback() {
+        assert!(managed_git_worktree_probe_error(&anyhow::anyhow!(
+            "workspace is not a managed seed worktree"
+        )));
+        assert!(managed_git_worktree_probe_error(&anyhow::anyhow!(
+            "seed repo is not a git checkout"
+        )));
+        assert!(managed_git_worktree_safety_error(&anyhow::anyhow!(
+            "managed_worktree_dirty: /tmp/workspace"
+        )));
+        assert!(!managed_git_worktree_probe_error(&anyhow::anyhow!(
+            "git worktree remove failed: locked"
+        )));
+        assert!(!managed_git_worktree_safety_error(&anyhow::anyhow!(
+            "git worktree remove failed: locked"
+        )));
+    }
+
+    #[test]
+    fn managed_worktree_cleanliness_ignores_pending_input_state_file() {
+        assert!(managed_worktree_status_line_is_kairastra_state(
+            "?? .kairastra/pending-input.json"
+        ));
+        assert!(!managed_worktree_status_line_is_kairastra_state(
+            "?? .kairastra/other.json"
+        ));
+        assert!(!managed_worktree_status_line_is_kairastra_state(
+            "?? src/lib.rs"
+        ));
+    }
+
     #[tokio::test]
     async fn removes_target_issue_workspace_only() {
         let _guard = ENV_LOCK.lock().await;
@@ -748,6 +800,65 @@ git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "kairastra/MT-6" "$PWD" HE
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&branch_output.stdout).contains("kairastra/MT-6"));
+        std::env::remove_var("KAIRASTRA_SEED_REPO");
+    }
+
+    #[tokio::test]
+    async fn removes_managed_git_worktree_with_only_pending_input_state() {
+        let _guard = ENV_LOCK.lock().await;
+        let workspace_root = tempdir().unwrap();
+        let seed_repo = tempdir().unwrap();
+        init_git_repo(seed_repo.path());
+        std::env::set_var("KAIRASTRA_SEED_REPO", seed_repo.path());
+
+        let mut settings = test_settings(workspace_root.path());
+        settings.workspace.bootstrap_mode = WorkspaceBootstrapMode::SeedWorktree;
+        settings.hooks.after_create = Some(
+            r#"
+set -euo pipefail
+git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "kairastra/MT-8" "$PWD" HEAD
+"#
+            .trim()
+            .to_string(),
+        );
+
+        let workspace = ensure_workspace(&settings, &issue("MT-8")).await.unwrap();
+        let pending = PendingHumanInput {
+            request: HumanInputRequest {
+                request_id: "input-123".to_string(),
+                provider: "codex".to_string(),
+                issue_id: "MT-8".to_string(),
+                issue_identifier: "MT-8".to_string(),
+                session_id: Some("thread-turn".to_string()),
+                requested_at: chrono::Utc::now(),
+                questions: vec![HumanInputQuestion {
+                    id: "scope".to_string(),
+                    header: Some("Scope".to_string()),
+                    question: "Pick a scope".to_string(),
+                    options: Vec::new(),
+                }],
+            },
+            status: PendingHumanInputStatus::AwaitingAnswer,
+            prompt_comment_id: Some(42),
+            prompt_comment_url: Some("https://example.com/comment".to_string()),
+            answered_comment_id: None,
+            answered_by_login: None,
+            answered_at: None,
+            answers: Vec::new(),
+        };
+        write_pending_human_input(&workspace.path, &pending).unwrap();
+
+        remove_issue_workspace(&settings, "MT-8").await.unwrap();
+
+        assert!(!workspace.path.exists());
+        let branch_output = StdCommand::new("git")
+            .args(["branch", "--list", "kairastra/MT-8"])
+            .current_dir(seed_repo.path())
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&branch_output.stdout)
+            .trim()
+            .is_empty());
         std::env::remove_var("KAIRASTRA_SEED_REPO");
     }
 

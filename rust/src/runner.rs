@@ -191,15 +191,8 @@ pub async fn run_issue(
             if captured_human_input_request.is_some() {
                 latest_human_input_request = captured_human_input_request;
             }
+            let should_clear_resolved_input = turn_number == 1 && resolved_human_input.is_some();
             turn_result?;
-            if turn_number == 1 && resolved_human_input.is_some() {
-                workspace::clear_pending_human_input(&workspace.path).with_context(|| {
-                    format!(
-                        "failed to clear consumed human input state for {}",
-                        current_issue.identifier
-                    )
-                })?;
-            }
             info!(issue_identifier = %issue.identifier, turn = turn_number, "agent turn complete");
 
             // The selected agent may have updated the persistent workpad comment during the turn.
@@ -284,17 +277,32 @@ pub async fn run_issue(
                     }
 
                     if !snapshot.settings.active_state(&issue.state) {
+                        clear_resolved_human_input_if_needed(
+                            should_clear_resolved_input,
+                            &workspace.path,
+                            &current_issue.identifier,
+                        )?;
                         session.stop().await.ok();
                         return Ok(WorkerOutcome::Completed);
                     }
 
                     current_issue = issue;
+                    clear_resolved_human_input_if_needed(
+                        should_clear_resolved_input,
+                        &workspace.path,
+                        &current_issue.identifier,
+                    )?;
                     if turn_number == snapshot.settings.agent.max_turns {
                         session.stop().await.ok();
                         return Ok(WorkerOutcome::NeedsContinuation);
                     }
                 }
                 _ => {
+                    clear_resolved_human_input_if_needed(
+                        should_clear_resolved_input,
+                        &workspace.path,
+                        &current_issue.identifier,
+                    )?;
                     session.stop().await.ok();
                     return Ok(WorkerOutcome::Completed);
                 }
@@ -347,6 +355,20 @@ fn render_resolved_human_input_context(pending: &PendingHumanInput) -> String {
     }
     context.push_str("- Treat these answers as the latest user intent and continue from them.\n");
     context
+}
+
+fn clear_resolved_human_input_if_needed(
+    should_clear: bool,
+    workspace_path: &std::path::Path,
+    issue_identifier: &str,
+) -> Result<()> {
+    if !should_clear {
+        return Ok(());
+    }
+
+    workspace::clear_pending_human_input(workspace_path).with_context(|| {
+        format!("failed to clear consumed human input state for {issue_identifier}")
+    })
 }
 
 async fn current_branch(workspace: &std::path::Path) -> Result<Option<String>> {
@@ -632,8 +654,14 @@ mod tests {
     use crate::config::Settings;
     use crate::github::GitHubTracker;
     use crate::github::PullRequestChecksState;
-    use crate::model::{Issue, WorkflowDefinition};
+    use crate::model::{
+        HumanInputAnswer, HumanInputQuestion, HumanInputRequest, Issue, PendingHumanInput,
+        PendingHumanInputStatus, WorkflowDefinition,
+    };
     use crate::providers::{workpad_header, AGENT_WORKPAD_HEADER};
+    use crate::workspace::{
+        load_pending_human_input, sanitize_workspace_key, write_pending_human_input,
+    };
 
     fn settings_with_command(
         workspace_root: &std::path::Path,
@@ -935,5 +963,170 @@ providers:
             }
         }
         assert!(saw_user_input_event);
+    }
+
+    #[tokio::test]
+    async fn run_issue_keeps_answered_input_when_post_turn_update_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues/1/comments"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/openai/kairastra/issues/1/comments"))
+            .and(body_string_contains("## Codex Workpad"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 11,
+                "body": "## Codex Workpad\n\ncreated",
+                "html_url": "https://github.com/openai/kairastra/issues/1#issuecomment-11",
+                "user": { "login": "kairastra" },
+                "author_association": "MEMBER",
+                "created_at": null,
+                "updated_at": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/openai/kairastra/issues/comments/11"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("temporary failure"))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let workspace_root = dir.path().join("workspaces");
+        let script = dir.path().join("successful-codex.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+count=0
+while IFS= read -r _line; do
+  count=$((count + 1))
+  case "$count" in
+    1)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    2)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-input"}}}'
+      ;;
+    3)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-input"}}}'
+      ;;
+    4)
+      printf '%s\n' '{"method":"turn/completed"}'
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let settings = settings_with_command(
+            &workspace_root,
+            &script.display().to_string(),
+            &server.uri(),
+        );
+        let snapshot = crate::workflow::WorkflowSnapshot {
+            definition: WorkflowDefinition {
+                config: serde_yaml::from_str(&format!(
+                    r#"---
+tracker:
+  kind: github
+  owner: openai
+  repo: kairastra
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  mode: issues_only
+  status_source:
+    type: label
+workspace:
+  root: {1}
+agent:
+  provider: codex
+providers:
+  codex:
+    command: "{2}"
+    read_timeout_ms: 15000
+    turn_sandbox_policy:
+      type: workspaceWrite
+      networkAccess: true
+"#,
+                    server.uri(),
+                    workspace_root.display(),
+                    script.display().to_string().replace('"', "\\\""),
+                ))
+                .unwrap(),
+                prompt_template: String::new(),
+            },
+            settings: settings.clone(),
+        };
+        let tracker = Arc::new(GitHubTracker::new(settings.tracker.clone()).unwrap());
+        let issue = Issue {
+            id: "1".to_string(),
+            project_item_id: None,
+            identifier: "openai/kairastra#1".to_string(),
+            title: "Need input".to_string(),
+            description: Some("body".to_string()),
+            priority: None,
+            state: "Todo".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/kairastra/issues/1".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+        let workspace_path = workspace_root.join(sanitize_workspace_key(&issue.identifier));
+        fs::create_dir_all(&workspace_path).unwrap();
+        write_pending_human_input(
+            &workspace_path,
+            &PendingHumanInput {
+                request: HumanInputRequest {
+                    request_id: "input-123".to_string(),
+                    provider: "codex".to_string(),
+                    issue_id: issue.id.clone(),
+                    issue_identifier: issue.identifier.clone(),
+                    session_id: Some("thread-input-turn-input".to_string()),
+                    requested_at: chrono::Utc::now(),
+                    questions: vec![HumanInputQuestion {
+                        id: "scope".to_string(),
+                        header: Some("Scope".to_string()),
+                        question: "Pick a scope".to_string(),
+                        options: Vec::new(),
+                    }],
+                },
+                status: PendingHumanInputStatus::Answered,
+                prompt_comment_id: Some(42),
+                prompt_comment_url: Some("https://example.com/comment".to_string()),
+                answered_comment_id: Some(43),
+                answered_by_login: Some("dbachko".to_string()),
+                answered_at: None,
+                answers: vec![HumanInputAnswer {
+                    question_id: "scope".to_string(),
+                    selected_option: Some("Full flow".to_string()),
+                    other_text: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        let (tx, _rx) = unbounded_channel();
+        let result = run_issue(snapshot, tracker, issue, None, tx).await;
+
+        assert!(result.outcome.is_err());
+        assert!(load_pending_human_input(&workspace_path).unwrap().is_some());
     }
 }

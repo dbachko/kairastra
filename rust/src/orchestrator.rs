@@ -779,6 +779,12 @@ impl Orchestrator {
                         .as_ref()
                         .and_then(|entry| entry.pending_human_input_request.clone()),
                 );
+                let persisted_workspace_path = finished_workspace_path(
+                    running
+                        .as_ref()
+                        .and_then(|entry| entry.workspace_path.as_deref()),
+                    workspace_path.as_path(),
+                );
                 match result {
                     Ok(WorkerOutcome::Completed) => {
                         match self
@@ -818,7 +824,7 @@ impl Orchestrator {
                                         .persist_human_input_request(
                                             snapshot,
                                             &issue_id,
-                                            workspace_path.as_path(),
+                                            persisted_workspace_path,
                                             request,
                                         )
                                         .await
@@ -1374,7 +1380,12 @@ fn render_human_input_prompt_comment(request: &HumanInputRequest) -> String {
     body.push_str("```text\n");
     body.push_str(&format!("/kairastra answer {}\n", request.request_id));
     for question in &request.questions {
-        body.push_str(&format!("{}: <option>\n", question.id));
+        let placeholder = if question.options.is_empty() {
+            "<answer>"
+        } else {
+            "<option>"
+        };
+        body.push_str(&format!("{}: {placeholder}\n", question.id));
         if question.options.iter().any(|option| option.is_other) {
             body.push_str(&format!("{}_other: <free text>\n", question.id));
         }
@@ -1425,6 +1436,13 @@ fn human_input_comment_is_authorized(comment: &RestIssueComment) -> bool {
         comment.author_association.as_deref(),
         Some("OWNER") | Some("MEMBER") | Some("COLLABORATOR")
     )
+}
+
+fn finished_workspace_path<'a>(
+    live_workspace_path: Option<&'a Path>,
+    fallback_workspace_path: &'a Path,
+) -> &'a Path {
+    live_workspace_path.unwrap_or(fallback_workspace_path)
 }
 
 fn parse_human_input_answer(
@@ -2532,13 +2550,14 @@ mod tests {
     use super::{
         classify_blocked_worker_failure, classify_provider_selection_block,
         codex_item_failure_is_expected_probe, extract_codex_command, extract_rate_limits,
-        extract_token_usage, find_human_input_answer, hold_blocked_claim, issue_eligible,
-        issue_provider, issue_sort_key, merge_blocker_section, parse_human_input_answer,
-        render_blocked_failure_workpad, render_human_input_prompt_comment,
-        resolve_human_input_request, select_dispatchable, should_release_blocked_claim,
-        summarize_agent_event, summarize_idle_dispatch, summarize_worker_error, tool_log_fields,
-        truncate_summary, usage_delta, IssueProviderSelection, RuntimeState, TokenUsage,
-        BLOCKER_SECTION_END, BLOCKER_SECTION_START,
+        extract_token_usage, find_human_input_answer, finished_workspace_path, hold_blocked_claim,
+        issue_eligible, issue_provider, issue_sort_key, merge_blocker_section,
+        parse_human_input_answer, render_blocked_failure_workpad,
+        render_human_input_prompt_comment, resolve_human_input_request, select_dispatchable,
+        should_release_blocked_claim, summarize_agent_event, summarize_idle_dispatch,
+        summarize_worker_error, tool_log_fields, truncate_summary, usage_delta,
+        IssueProviderSelection, RuntimeState, TokenUsage, BLOCKER_SECTION_END,
+        BLOCKER_SECTION_START,
     };
     use crate::workflow::WorkflowSnapshot;
 
@@ -3000,6 +3019,17 @@ providers:
     }
 
     #[test]
+    fn renders_human_input_prompt_with_answer_placeholder_for_free_text() {
+        let mut request = human_input_request();
+        request.questions[0].options.clear();
+
+        let rendered = render_human_input_prompt_comment(&request);
+
+        assert!(rendered.contains("scope: <answer>"));
+        assert!(!rendered.contains("scope: <option>"));
+    }
+
+    #[test]
     fn parses_human_input_answer_comment() {
         let request = human_input_request();
         let comment = answer_comment(
@@ -3054,6 +3084,18 @@ providers:
         let comment = answer_comment("/kairastra answer input-123\nscope: 4", "MEMBER", 18);
         let answers = parse_human_input_answer(&request, &comment).expect("answer should parse");
         assert_eq!(answers[0].selected_option.as_deref(), Some("Full product"));
+    }
+
+    #[test]
+    fn finished_workspace_path_prefers_live_runtime_path() {
+        let live = PathBuf::from("/tmp/live-workspace");
+        let fallback = PathBuf::from("/tmp/spawn-hint");
+
+        assert_eq!(
+            finished_workspace_path(Some(&live), &fallback),
+            live.as_path()
+        );
+        assert_eq!(finished_workspace_path(None, &fallback), fallback.as_path());
     }
 
     #[test]

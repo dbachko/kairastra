@@ -45,7 +45,7 @@ pub struct WorkflowDefinition {
 pub struct HumanInputOption {
     pub label: String,
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "isOther")]
     pub is_other: bool,
 }
 
@@ -92,4 +92,40 @@ pub struct PendingHumanInput {
     pub answered_by_login: Option<String>,
     pub answered_at: Option<DateTime<Utc>>,
     pub answers: Vec<HumanInputAnswer>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HumanInputRequest, PendingHumanInputStatus};
+
+    #[test]
+    fn human_input_option_accepts_provider_camel_case_other_flag() {
+        let request: HumanInputRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "input-123",
+            "provider": "codex",
+            "issue_id": "issue-1",
+            "issue_identifier": "openai/kairastra#1",
+            "session_id": "thread-1-turn-1",
+            "requested_at": "2026-06-01T00:00:00Z",
+            "questions": [{
+                "id": "scope",
+                "header": "Scope",
+                "question": "Pick a scope",
+                "options": [{
+                    "label": "Other",
+                    "description": "Free text",
+                    "isOther": true
+                }]
+            }]
+        }))
+        .expect("provider payload should deserialize");
+
+        assert!(request.questions[0].options[0].is_other);
+    }
+
+    #[test]
+    fn pending_human_input_status_keeps_snake_case_serialization() {
+        let encoded = serde_json::to_string(&PendingHumanInputStatus::AwaitingAnswer).unwrap();
+        assert_eq!(encoded, "\"awaiting_answer\"");
+    }
 }
