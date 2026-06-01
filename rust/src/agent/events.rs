@@ -23,6 +23,7 @@ pub enum AgentEventKind {
     ToolCallCompleted,
     ToolCallFailed,
     UnsupportedToolCall,
+    UserInputRequested,
     ToolInputAutoAnswered,
     Malformed,
     OtherMessage,

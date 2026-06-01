@@ -40,3 +40,56 @@ pub struct WorkflowDefinition {
     pub config: serde_yaml::Value,
     pub prompt_template: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HumanInputOption {
+    pub label: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub is_other: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HumanInputQuestion {
+    pub id: String,
+    pub header: Option<String>,
+    pub question: String,
+    pub options: Vec<HumanInputOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HumanInputAnswer {
+    pub question_id: String,
+    pub selected_option: Option<String>,
+    pub other_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingHumanInputStatus {
+    AwaitingAnswer,
+    Answered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HumanInputRequest {
+    pub request_id: String,
+    pub provider: String,
+    pub issue_id: String,
+    pub issue_identifier: String,
+    pub session_id: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    pub questions: Vec<HumanInputQuestion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingHumanInput {
+    pub request: HumanInputRequest,
+    pub status: PendingHumanInputStatus,
+    pub prompt_comment_id: Option<u64>,
+    pub prompt_comment_url: Option<String>,
+    pub answered_comment_id: Option<u64>,
+    pub answered_by_login: Option<String>,
+    pub answered_at: Option<DateTime<Utc>>,
+    pub answers: Vec<HumanInputAnswer>,
+}

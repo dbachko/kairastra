@@ -20,6 +20,7 @@ use crate::providers::is_workpad_comment;
 
 const GITHUB_READ_MAX_ATTEMPTS: u32 = 3;
 const GITHUB_READ_RETRY_BASE_DELAY_MS: u64 = 250;
+const GITHUB_PAGE_SIZE: usize = 100;
 
 #[async_trait]
 pub trait Tracker: Send + Sync {
@@ -79,20 +80,6 @@ impl GitHubTracker {
 
     fn issue_matches_repo_scope(&self, owner: &str, repo: &str) -> bool {
         match self.settings.repo.as_deref() {
-            Some(configured_repo) if self.settings.mode == GitHubMode::ProjectsV2 => {
-                if self.settings.project_owner.is_none()
-                    && project_owner_from_url(self.settings.project_url.as_deref())
-                        .map(|project_owner| {
-                            project_owner.eq_ignore_ascii_case(&self.settings.owner)
-                        })
-                        .unwrap_or(true)
-                {
-                    configured_repo.eq_ignore_ascii_case(repo)
-                } else {
-                    self.settings.owner.eq_ignore_ascii_case(owner)
-                        && configured_repo.eq_ignore_ascii_case(repo)
-                }
-            }
             Some(configured_repo) => {
                 self.settings.owner.eq_ignore_ascii_case(owner)
                     && configured_repo.eq_ignore_ascii_case(repo)
@@ -654,6 +641,13 @@ mutation KairastraUpdateProjectItemStatus(
         self.transition_issue_project_status(issue, target).await
     }
 
+    pub async fn transition_issue_to_in_progress(&self, issue: &Issue) -> Result<Issue> {
+        let Some(target) = self.settings.in_progress_state.as_deref() else {
+            return Ok(issue.clone());
+        };
+        self.transition_issue_project_status(issue, target).await
+    }
+
     pub async fn transition_closed_issue_to_done(&self, issue: &Issue) -> Result<Issue> {
         let Some(target) = self.settings.done_state.as_deref() else {
             return Ok(issue.clone());
@@ -710,13 +704,24 @@ mutation KairastraUpdateProjectItemStatus(
         repo: &str,
         head_sha: &str,
     ) -> Result<PullRequestChecksSummary> {
-        let check_runs_path =
-            format!("/repos/{owner}/{repo}/commits/{head_sha}/check-runs?per_page=100");
-        let check_runs_response = self
-            .rest_json(reqwest::Method::GET, &check_runs_path, None)
-            .await?;
-        let check_runs: RestCheckRunsResponse = serde_json::from_value(check_runs_response)
-            .context("invalid GitHub check-runs payload")?;
+        let mut check_runs = Vec::new();
+        let mut page = 1_u32;
+        loop {
+            let check_runs_path = format!(
+                "/repos/{owner}/{repo}/commits/{head_sha}/check-runs?per_page={GITHUB_PAGE_SIZE}&page={page}"
+            );
+            let check_runs_response = self
+                .rest_json(reqwest::Method::GET, &check_runs_path, None)
+                .await?;
+            let mut parsed: RestCheckRunsResponse = serde_json::from_value(check_runs_response)
+                .context("invalid GitHub check-runs payload")?;
+            let page_len = parsed.check_runs.len();
+            check_runs.append(&mut parsed.check_runs);
+            if page_len < GITHUB_PAGE_SIZE {
+                break;
+            }
+            page += 1;
+        }
 
         let statuses_path = format!("/repos/{owner}/{repo}/commits/{head_sha}/status");
         let statuses_response = self
@@ -725,11 +730,11 @@ mutation KairastraUpdateProjectItemStatus(
         let statuses: RestCombinedStatus = serde_json::from_value(statuses_response)
             .context("invalid GitHub commit status payload")?;
 
-        let had_checks = !(check_runs.check_runs.is_empty() && statuses.statuses.is_empty());
+        let had_checks = !(check_runs.is_empty() && statuses.statuses.is_empty());
         let mut failing = Vec::new();
         let mut pending = Vec::new();
 
-        for check in check_runs.check_runs {
+        for check in check_runs {
             match check.status.as_str() {
                 "completed" => match check.conclusion.as_deref() {
                     Some("success") | Some("neutral") | Some("skipped") => {}
@@ -776,9 +781,21 @@ mutation KairastraUpdateProjectItemStatus(
 
     pub async fn list_issue_comments(&self, issue: &Issue) -> Result<Vec<RestIssueComment>> {
         let (owner, repo, issue_number) = issue_locator(issue)?;
-        let path = format!("/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100");
-        let response = self.rest_json(reqwest::Method::GET, &path, None).await?;
-        serde_json::from_value(response).context("invalid GitHub issue comments payload")
+        self.list_all_issue_comments(&owner, &repo, issue_number)
+            .await
+    }
+
+    pub async fn create_issue_comment(
+        &self,
+        issue: &Issue,
+        body: &str,
+    ) -> Result<RestIssueComment> {
+        let (owner, repo, issue_number) = issue_locator(issue)?;
+        let path = format!("/repos/{owner}/{repo}/issues/{issue_number}/comments");
+        let response = self
+            .rest_json(reqwest::Method::POST, &path, Some(json!({ "body": body })))
+            .await?;
+        serde_json::from_value(response).context("invalid GitHub created issue comment payload")
     }
 
     fn parse_issue_comments(response: JsonValue) -> Result<Vec<RestIssueComment>> {
@@ -790,9 +807,9 @@ mutation KairastraUpdateProjectItemStatus(
 
     pub async fn ensure_workpad_comment(&self, issue: &Issue, body: &str) -> Result<Issue> {
         let (owner, repo, issue_number) = issue_locator(issue)?;
-        let path = format!("/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100");
-        let response = self.rest_json(reqwest::Method::GET, &path, None).await?;
-        let comments = Self::parse_issue_comments(response)?;
+        let comments = self
+            .list_all_issue_comments(&owner, &repo, issue_number)
+            .await?;
 
         if let Some(comment) = comments
             .into_iter()
@@ -810,12 +827,7 @@ mutation KairastraUpdateProjectItemStatus(
             return self.patch_workpad_comment(issue, comment.id, body).await;
         }
 
-        let path = format!("/repos/{owner}/{repo}/issues/{issue_number}/comments");
-        let response = self
-            .rest_json(reqwest::Method::POST, &path, Some(json!({ "body": body })))
-            .await?;
-        let comment: RestIssueComment = serde_json::from_value(response)
-            .context("invalid GitHub created issue comment payload")?;
+        let comment = self.create_issue_comment(issue, body).await?;
 
         let mut updated = issue.clone();
         updated.workpad_comment_id = Some(comment.id);
@@ -847,9 +859,9 @@ mutation KairastraUpdateProjectItemStatus(
 
     pub async fn refresh_workpad_comment(&self, issue: &Issue) -> Result<Issue> {
         let (owner, repo, issue_number) = issue_locator(issue)?;
-        let path = format!("/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100");
-        let response = self.rest_json(reqwest::Method::GET, &path, None).await?;
-        let comments = Self::parse_issue_comments(response)?;
+        let comments = self
+            .list_all_issue_comments(&owner, &repo, issue_number)
+            .await?;
 
         let mut updated = issue.clone();
         if let Some(comment) = comments
@@ -863,6 +875,30 @@ mutation KairastraUpdateProjectItemStatus(
         }
 
         Ok(updated)
+    }
+
+    async fn list_all_issue_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+    ) -> Result<Vec<RestIssueComment>> {
+        let mut page = 1_u32;
+        let mut comments = Vec::new();
+        loop {
+            let path = format!(
+                "/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page={GITHUB_PAGE_SIZE}&page={page}"
+            );
+            let response = self.rest_json(reqwest::Method::GET, &path, None).await?;
+            let mut page_comments = Self::parse_issue_comments(response)?;
+            let page_len = page_comments.len();
+            comments.append(&mut page_comments);
+            if page_len < GITHUB_PAGE_SIZE {
+                break;
+            }
+            page += 1;
+        }
+        Ok(comments)
     }
 
     async fn list_repo_issues(&self, state: &str) -> Result<Vec<RestIssue>> {
@@ -1795,9 +1831,18 @@ struct RestLabel {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RestIssueComment {
-    id: u64,
+    pub id: u64,
     pub body: String,
     pub html_url: Option<String>,
+    pub user: Option<RestIssueCommentUser>,
+    pub author_association: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RestIssueCommentUser {
+    pub login: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2415,6 +2460,28 @@ mod tests {
                                             "repository": {
                                                 "name": "other-repo",
                                                 "owner": { "login": "openai" }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "id": "item-3",
+                                        "status": { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Todo" },
+                                        "priority": null,
+                                        "content": {
+                                            "__typename": "Issue",
+                                            "id": "issue-node-3",
+                                            "number": 77,
+                                            "title": "Skip same repo name from another owner",
+                                            "body": "body",
+                                            "url": "https://github.com/not-openai/kairastra/issues/77",
+                                            "state": "OPEN",
+                                            "createdAt": "2026-03-13T00:00:00Z",
+                                            "updatedAt": "2026-03-13T01:00:00Z",
+                                            "assignees": { "nodes": [] },
+                                            "labels": { "nodes": [] },
+                                            "repository": {
+                                                "name": "kairastra",
+                                                "owner": { "login": "not-openai" }
                                             }
                                         }
                                     }
@@ -3468,6 +3535,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pull_request_checks_summary_paginates_check_runs() {
+        let server = MockServer::start().await;
+        let page_one_checks = (0..100)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("CI {index}"),
+                    "status": "completed",
+                    "conclusion": "success"
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/commits/ghi789/check-runs"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "check_runs": page_one_checks
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/commits/ghi789/check-runs"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "check_runs": [
+                    {
+                        "name": "Late CI",
+                        "status": "completed",
+                        "conclusion": "failure"
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/commits/ghi789/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statuses": []
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  repo: kairastra
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  mode: issues_only
+  status_source:
+    type: label
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let summary = tracker
+            .pull_request_checks_summary("openai", "kairastra", "ghi789")
+            .await
+            .unwrap();
+
+        assert_eq!(summary.state, PullRequestChecksState::Failing);
+        assert_eq!(summary.failing, vec!["Late CI".to_string()]);
+    }
+
+    #[tokio::test]
     async fn closed_issue_transition_updates_project_status_to_done() {
         let server = MockServer::start().await;
 
@@ -3752,6 +3894,184 @@ mod tests {
         assert_eq!(
             updated.workpad_comment_body.as_deref(),
             Some("## Agent Workpad\n\nexisting")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_issue_comments_paginates_all_pages() {
+        let server = MockServer::start().await;
+        let page_one_comments = (0..100)
+            .map(|index| {
+                serde_json::json!({
+                    "id": index + 1,
+                    "body": format!("noise {index}"),
+                    "html_url": format!("https://github.com/openai/kairastra/issues/42#issuecomment-{}", index + 1)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues/42/comments"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page_one_comments))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues/42/comments"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 101,
+                    "body": "last",
+                    "html_url": "https://github.com/openai/kairastra/issues/42#issuecomment-101"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  repo: kairastra
+  mode: issues_only
+  status_source:
+    type: label
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issue = Issue {
+            id: "issue-node-42".to_string(),
+            project_item_id: None,
+            identifier: "openai/kairastra#42".to_string(),
+            title: "Issue".to_string(),
+            description: None,
+            priority: None,
+            state: "Todo".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/kairastra/issues/42".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let comments = tracker.list_issue_comments(&issue).await.unwrap();
+
+        assert_eq!(comments.len(), 101);
+        assert_eq!(comments.last().map(|comment| comment.id), Some(101));
+    }
+
+    #[tokio::test]
+    async fn ensure_workpad_comment_finds_existing_comment_on_later_page() {
+        let server = MockServer::start().await;
+        let page_one_comments = (0..100)
+            .map(|index| {
+                serde_json::json!({
+                    "id": index + 1,
+                    "body": format!("noise {index}"),
+                    "html_url": format!("https://github.com/openai/kairastra/issues/42#issuecomment-{}", index + 1)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues/42/comments"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page_one_comments))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues/42/comments"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 101,
+                    "body": "## Agent Workpad\n\nold",
+                    "html_url": "https://github.com/openai/kairastra/issues/42#issuecomment-101"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/repos/openai/kairastra/issues/comments/101"))
+            .and(body_string_contains("## Agent Workpad"))
+            .and(body_string_contains("new"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 101,
+                "body": "## Agent Workpad\n\nnew",
+                "html_url": "https://github.com/openai/kairastra/issues/42#issuecomment-101"
+            })))
+            .mount(&server)
+            .await;
+
+        let tracker = GitHubTracker::new(
+            settings(&format!(
+                r#"tracker:
+  kind: github
+  owner: openai
+  api_key: fake
+  endpoint: {0}/graphql
+  rest_endpoint: {0}
+  repo: kairastra
+  mode: issues_only
+  status_source:
+    type: label
+"#,
+                server.uri()
+            ))
+            .tracker,
+        )
+        .unwrap();
+
+        let issue = Issue {
+            id: "issue-node-42".to_string(),
+            project_item_id: None,
+            identifier: "openai/kairastra#42".to_string(),
+            title: "Issue".to_string(),
+            description: None,
+            priority: None,
+            state: "Todo".to_string(),
+            branch_name: None,
+            url: Some("https://github.com/openai/kairastra/issues/42".to_string()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+
+        let updated = tracker
+            .ensure_workpad_comment(&issue, "## Agent Workpad\n\nnew")
+            .await
+            .unwrap();
+
+        assert_eq!(updated.workpad_comment_id, Some(101));
+        assert_eq!(
+            updated.workpad_comment_body.as_deref(),
+            Some("## Agent Workpad\n\nnew")
         );
     }
 

@@ -322,6 +322,7 @@ mod tests {
             auth_mode: crate::auth::AuthMode::Auto,
             model: String::new(),
             reasoning_effort: String::new(),
+            collaboration_mode: String::new(),
             fast: None,
         });
         let claude =
@@ -329,12 +330,14 @@ mod tests {
                 auth_mode: crate::auth::AuthMode::Auto,
                 model: String::new(),
                 reasoning_effort: String::new(),
+                permission_mode: "bypassPermissions".to_string(),
             });
         let gemini =
             ProviderSetupConfig::Gemini(crate::providers::gemini::setup::GeminiSetupConfig {
                 auth_mode: crate::auth::AuthMode::Auto,
                 model: String::new(),
                 approval_mode: "yolo".to_string(),
+                sandbox: true,
             });
 
         assert_eq!(setup_provider_id(&codex), "codex");

@@ -647,6 +647,11 @@ fn fixed_label_specs() -> Vec<RepoLabelSpec> {
             color: "0e8a16",
             description: "Assigned to Gemini-driven automation.".to_string(),
         },
+        RepoLabelSpec {
+            name: "mode:plan".to_string(),
+            color: "fbca04",
+            description: "Forces Codex issue turns to start in planning mode.".to_string(),
+        },
     ]
 }
 
@@ -841,6 +846,7 @@ mod tests {
         let names = specs.into_iter().map(|spec| spec.name).collect::<Vec<_>>();
         assert!(names.contains(&"kairastra".to_string()));
         assert!(names.contains(&"agent:codex".to_string()));
+        assert!(names.contains(&"mode:plan".to_string()));
         assert!(names.contains(&"Human Review".to_string()));
         assert!(!names.contains(&"needs-review".to_string()));
     }

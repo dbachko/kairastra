@@ -7,6 +7,17 @@ The repo-root `WORKFLOW.md` is the canonical template shipped with Kairastra. `k
 generates repo-root `WORKFLOW.md` by combining setup-specific front matter with the canonical
 prompt body from that root template.
 
+Provider runtime defaults are loaded from `.kairastra/provider-settings.json` when that file is
+present. `WORKFLOW.md` remains the orchestration source of truth, and any explicit provider values
+in workflow front matter override the local JSON defaults.
+
+The generated provider settings file is intentionally compact. It carries the operator-facing
+defaults that materially affect day-to-day runs:
+
+- `codex`: `model`, `reasoning_effort`, `collaboration_mode`, `fast`
+- `claude`: `model`, `reasoning_effort`, `permission_mode`
+- `gemini`: `model`, `approval_mode`, `sandbox`
+
 ## Structure
 
 `WORKFLOW.md` is split into:

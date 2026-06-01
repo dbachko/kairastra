@@ -16,7 +16,10 @@ use crate::github_bootstrap::{
 };
 use crate::providers;
 use crate::shared_skills;
-use crate::workflow::{default_env_file_path, default_workflow_path, load_definition};
+use crate::workflow::{
+    default_env_file_path, default_workflow_path, load_definition,
+    provider_settings_path_for_workflow,
+};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum DoctorFormat {
@@ -102,6 +105,11 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
         status: DoctorStatus::Warn,
         detail: "workflow not loaded".to_string(),
     };
+    let mut provider_settings_check = DoctorCheck {
+        name: "provider_settings_defaults",
+        status: DoctorStatus::Warn,
+        detail: "workflow not loaded".to_string(),
+    };
     let mut provider_auth_check = DoctorCheck {
         name: "agent_provider_auth",
         status: DoctorStatus::Warn,
@@ -143,6 +151,7 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
                         status: DoctorStatus::Pass,
                         detail: format!("loaded {}", path.display()),
                     });
+                    provider_settings_check = check_provider_settings_defaults(path);
                     provider_command_check = check_named_command(
                         "agent_provider_command",
                         provider_command_name(&settings)?,
@@ -181,6 +190,7 @@ pub async fn run(options: DoctorOptions) -> Result<DoctorReport> {
         });
     }
 
+    checks.push(provider_settings_check);
     checks.push(provider_command_check);
     checks.push(provider_auth_check);
     checks.push(provider_runtime_check);
@@ -253,6 +263,105 @@ fn check_named_command(check_name: &'static str, command_name: &'static str) -> 
             status: DoctorStatus::Fail,
             detail: format!("command={} not found in PATH", command_name),
         },
+    }
+}
+
+fn check_provider_settings_defaults(workflow_path: &Path) -> DoctorCheck {
+    let path = provider_settings_path_for_workflow(workflow_path);
+    if !path.is_file() {
+        return DoctorCheck {
+            name: "provider_settings_defaults",
+            status: DoctorStatus::Pass,
+            detail: format!("provider settings file not present at {}", path.display()),
+        };
+    }
+
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return DoctorCheck {
+                name: "provider_settings_defaults",
+                status: DoctorStatus::Warn,
+                detail: format!("could not read {}: {}", path.display(), error),
+            };
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            return DoctorCheck {
+                name: "provider_settings_defaults",
+                status: DoctorStatus::Warn,
+                detail: format!(
+                    "could not parse provider settings file {}: {}",
+                    path.display(),
+                    error
+                ),
+            };
+        }
+    };
+    let Some(providers) = value.as_object() else {
+        return DoctorCheck {
+            name: "provider_settings_defaults",
+            status: DoctorStatus::Warn,
+            detail: format!(
+                "provider settings file {} must contain a top-level JSON object",
+                path.display()
+            ),
+        };
+    };
+
+    let expected = [
+        (
+            "codex",
+            ["model", "reasoning_effort", "collaboration_mode", "fast"].as_slice(),
+        ),
+        (
+            "claude",
+            ["model", "reasoning_effort", "permission_mode"].as_slice(),
+        ),
+        ("gemini", ["model", "approval_mode", "sandbox"].as_slice()),
+    ];
+    let mut missing = Vec::new();
+
+    for (provider, keys) in expected {
+        match providers
+            .get(provider)
+            .and_then(serde_json::Value::as_object)
+        {
+            Some(object) => {
+                let missing_keys = keys
+                    .iter()
+                    .copied()
+                    .filter(|key| !object.contains_key(*key))
+                    .collect::<Vec<_>>();
+                if !missing_keys.is_empty() {
+                    missing.push(format!("{provider}: {}", missing_keys.join(", ")));
+                }
+            }
+            None => missing.push(format!("{provider}: missing provider object")),
+        }
+    }
+
+    if missing.is_empty() {
+        DoctorCheck {
+            name: "provider_settings_defaults",
+            status: DoctorStatus::Pass,
+            detail: format!(
+                "recommended compact provider defaults present in {}",
+                path.display()
+            ),
+        }
+    } else {
+        DoctorCheck {
+            name: "provider_settings_defaults",
+            status: DoctorStatus::Warn,
+            detail: format!(
+                "{} is missing recommended compact defaults for {}; run `krstr setup --reconfigure` to refresh it",
+                path.display(),
+                missing.join("; ")
+            ),
+        }
     }
 }
 
@@ -1008,12 +1117,13 @@ fn print_text_report(report: &DoctorReport) {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_auth_status, check_seed_repo_git, check_seed_repo_skills,
-        check_seed_repo_support_dirs, check_workspace_root, infer_mode, DoctorStatus,
+        check_auth_status, check_provider_settings_defaults, check_seed_repo_git,
+        check_seed_repo_skills, check_seed_repo_support_dirs, check_workspace_root, infer_mode,
+        DoctorStatus,
     };
     use crate::config::Settings;
     use crate::deploy::DeployMode;
-    use crate::workflow::load_definition;
+    use crate::workflow::{load_definition, provider_settings_path_for_workflow};
     use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
@@ -1206,6 +1316,12 @@ providers:
         workflow_path
     }
 
+    fn write_provider_settings(workflow_path: &Path, body: &str) {
+        let settings_path = provider_settings_path_for_workflow(workflow_path);
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(settings_path, body).unwrap();
+    }
+
     #[test]
     fn infer_mode_defaults_to_native() {
         std::env::set_var("KAIRASTRA_DEPLOY_MODE", "native");
@@ -1368,5 +1484,65 @@ providers:
         assert_eq!(check.status, DoctorStatus::Fail);
         assert!(check.detail.contains("auth_problem=expired_oauth_token"));
         assert!(check.detail.contains("credentials_usable=false"));
+    }
+
+    #[test]
+    fn provider_settings_defaults_warn_when_compact_keys_are_missing() {
+        let dir = tempdir().unwrap();
+        let workflow_path = write_minimal_workflow(dir.path());
+        write_provider_settings(
+            &workflow_path,
+            r#"{
+  "codex": {
+    "model": "gpt-5.4"
+  },
+  "claude": {
+    "model": "sonnet"
+  }
+}"#,
+        );
+
+        let check = check_provider_settings_defaults(&workflow_path);
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(check
+            .detail
+            .contains("codex: reasoning_effort, collaboration_mode, fast"));
+        assert!(check
+            .detail
+            .contains("claude: reasoning_effort, permission_mode"));
+        assert!(check.detail.contains("gemini: missing provider object"));
+    }
+
+    #[test]
+    fn provider_settings_defaults_pass_when_compact_defaults_are_present() {
+        let dir = tempdir().unwrap();
+        let workflow_path = write_minimal_workflow(dir.path());
+        write_provider_settings(
+            &workflow_path,
+            r#"{
+  "codex": {
+    "model": "gpt-5.4",
+    "reasoning_effort": "medium",
+    "collaboration_mode": "default",
+    "fast": true
+  },
+  "claude": {
+    "model": "sonnet",
+    "reasoning_effort": "medium",
+    "permission_mode": "bypassPermissions"
+  },
+  "gemini": {
+    "model": "gemini-2.5-pro",
+    "approval_mode": "yolo",
+    "sandbox": true
+  }
+}"#,
+        );
+
+        let check = check_provider_settings_defaults(&workflow_path);
+        assert_eq!(check.status, DoctorStatus::Pass);
+        assert!(check
+            .detail
+            .contains("recommended compact provider defaults present"));
     }
 }

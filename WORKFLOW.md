@@ -407,13 +407,8 @@ providers:
       networkAccess: true
   claude:
     command: claude
-    model: $KAIRASTRA_CLAUDE_MODEL
-    reasoning_effort: $KAIRASTRA_CLAUDE_REASONING_EFFORT
-    approval_policy: never
   gemini:
     command: gemini
-    model: $KAIRASTRA_GEMINI_MODEL
-    approval_mode: $KAIRASTRA_GEMINI_APPROVAL_MODE
 ---
 
 You are working on GitHub issue `{{ issue.identifier }}`.

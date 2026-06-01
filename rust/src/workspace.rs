@@ -8,13 +8,15 @@ use tokio::time::{timeout, Duration};
 
 use crate::config::Settings;
 use crate::git_checkout::checkout_git_common_dir;
-use crate::model::Issue;
+use crate::model::{Issue, PendingHumanInput};
 use crate::workflow::{default_repo_workflow, RepoWorkflow};
 
 const DEFAULT_XDG_CACHE_HOME: &str = "/tmp/kairastra/xdg-cache";
 const DEFAULT_COREPACK_HOME: &str = "/tmp/kairastra/corepack";
 const DEFAULT_PNPM_HOME: &str = "/tmp/kairastra/pnpm";
 const DEFAULT_NPM_CONFIG_CACHE: &str = "/tmp/kairastra/npm-cache";
+const KAIRASTRA_STATE_DIR: &str = ".kairastra";
+const PENDING_HUMAN_INPUT_FILE: &str = "pending-input.json";
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -51,6 +53,44 @@ pub(crate) fn apply_runtime_tool_env(command: &mut Command) {
     for (name, value) in runtime_tool_env_overrides() {
         command.env(name, value);
     }
+}
+
+pub fn pending_human_input_path(workspace: &Path) -> PathBuf {
+    workspace
+        .join(KAIRASTRA_STATE_DIR)
+        .join(PENDING_HUMAN_INPUT_FILE)
+}
+
+pub fn load_pending_human_input(workspace: &Path) -> Result<Option<PendingHumanInput>> {
+    let path = pending_human_input_path(workspace);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let pending = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(pending))
+}
+
+pub fn write_pending_human_input(workspace: &Path, pending: &PendingHumanInput) -> Result<()> {
+    let path = pending_human_input_path(workspace);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let content = serde_json::to_string_pretty(pending)
+        .context("failed to encode pending human input state")?;
+    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))
+}
+
+pub fn clear_pending_human_input(workspace: &Path) -> Result<()> {
+    let path = pending_human_input_path(workspace);
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))
 }
 
 pub async fn ensure_workspace(settings: &Settings, issue: &Issue) -> Result<Workspace> {
@@ -157,11 +197,10 @@ pub async fn remove_issue_workspace(settings: &Settings, identifier: &str) -> Re
 
     if settings.uses_seed_worktree_bootstrap() {
         if let Some(seed_repo) = configured_seed_repo() {
-            if remove_managed_git_worktree(&seed_repo, &workspace, identifier)
-                .await
-                .is_ok()
-            {
-                return Ok(());
+            match remove_managed_git_worktree(&seed_repo, &workspace, identifier).await {
+                Ok(()) => return Ok(()),
+                Err(error) if managed_git_worktree_safety_error(&error) => return Err(error),
+                Err(_) => {}
             }
         }
     }
@@ -282,9 +321,15 @@ async fn remove_managed_git_worktree(
     identifier: &str,
 ) -> Result<()> {
     let seed_repo = seed_repo.to_path_buf();
-    if seed_repo_git_common_dir(seed_repo.clone()).await?.is_none() {
+    let Some(seed_common_dir) = seed_repo_git_common_dir(seed_repo.clone()).await? else {
         return Err(anyhow!("seed repo is not a git checkout"));
+    };
+    if workspace_git_common_dir(workspace).await? != Some(seed_common_dir) {
+        return Err(anyhow!("workspace is not a managed seed worktree"));
     }
+
+    ensure_managed_worktree_clean(workspace).await?;
+    ensure_managed_branch_merged(&seed_repo, identifier).await?;
 
     let remove_output = Command::new("git")
         .arg("-C")
@@ -310,6 +355,59 @@ async fn remove_managed_git_worktree(
         .output()
         .await;
 
+    Ok(())
+}
+
+fn managed_git_worktree_safety_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("managed_worktree_dirty")
+        || message.contains("managed_worktree_unmerged_branch")
+}
+
+async fn ensure_managed_worktree_clean(workspace: &Path) -> Result<()> {
+    let status_output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .output()
+        .await
+        .context("failed to inspect managed worktree status")?;
+    if !status_output.status.success() {
+        return Err(anyhow!(
+            "managed_worktree_status_failed: {}",
+            String::from_utf8_lossy(&status_output.stderr).trim()
+        ));
+    }
+    if !status_output.stdout.is_empty() {
+        return Err(anyhow!("managed_worktree_dirty: {}", workspace.display()));
+    }
+    Ok(())
+}
+
+async fn ensure_managed_branch_merged(seed_repo: &Path, identifier: &str) -> Result<()> {
+    let branch_name = managed_issue_branch_name(identifier);
+    let branch_exists = Command::new("git")
+        .arg("-C")
+        .arg(seed_repo)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch_name}"))
+        .status()
+        .await
+        .context("failed to inspect managed branch")?;
+    if !branch_exists.success() {
+        return Ok(());
+    }
+
+    let merge_base = Command::new("git")
+        .arg("-C")
+        .arg(seed_repo)
+        .args(["merge-base", "--is-ancestor", branch_name.as_str(), "HEAD"])
+        .status()
+        .await
+        .context("failed to inspect managed branch ancestry")?;
+    if !merge_base.success() {
+        return Err(anyhow!("managed_worktree_unmerged_branch: {}", branch_name));
+    }
     Ok(())
 }
 
@@ -398,11 +496,15 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::config::{Settings, WorkspaceBootstrapMode};
-    use crate::model::{Issue, WorkflowDefinition};
+    use crate::model::{
+        HumanInputQuestion, HumanInputRequest, Issue, PendingHumanInput, PendingHumanInputStatus,
+        WorkflowDefinition,
+    };
 
     use super::{
-        ensure_workspace, load_workspace_repo_workflow, remove_issue_workspace, run_after_run_hook,
-        run_hook, sanitize_workspace_key,
+        clear_pending_human_input, ensure_workspace, load_pending_human_input,
+        load_workspace_repo_workflow, remove_issue_workspace, run_after_run_hook, run_hook,
+        sanitize_workspace_key, write_pending_human_input,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -515,6 +617,51 @@ workspace:
     }
 
     #[tokio::test]
+    async fn persists_pending_human_input_state() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
+        let dir = tempdir().unwrap();
+        let settings = test_settings(dir.path());
+        let workspace = ensure_workspace(&settings, &issue("INPUT-1"))
+            .await
+            .unwrap();
+
+        let pending = PendingHumanInput {
+            request: HumanInputRequest {
+                request_id: "input-123".to_string(),
+                provider: "codex".to_string(),
+                issue_id: "INPUT-1".to_string(),
+                issue_identifier: "INPUT-1".to_string(),
+                session_id: Some("thread-turn".to_string()),
+                requested_at: chrono::Utc::now(),
+                questions: vec![HumanInputQuestion {
+                    id: "scope".to_string(),
+                    header: Some("Scope".to_string()),
+                    question: "Pick a scope".to_string(),
+                    options: Vec::new(),
+                }],
+            },
+            status: PendingHumanInputStatus::AwaitingAnswer,
+            prompt_comment_id: Some(42),
+            prompt_comment_url: Some("https://example.com/comment".to_string()),
+            answered_comment_id: None,
+            answered_by_login: None,
+            answered_at: None,
+            answers: Vec::new(),
+        };
+
+        write_pending_human_input(&workspace.path, &pending).unwrap();
+        let loaded = load_pending_human_input(&workspace.path)
+            .unwrap()
+            .expect("pending state should exist");
+        assert_eq!(loaded.request.request_id, "input-123");
+        assert_eq!(loaded.prompt_comment_id, Some(42));
+
+        clear_pending_human_input(&workspace.path).unwrap();
+        assert!(load_pending_human_input(&workspace.path).unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn removes_target_issue_workspace_only() {
         let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
@@ -563,6 +710,103 @@ git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "kairastra/MT-1" "$PWD" HE
         assert!(String::from_utf8_lossy(&branch_output.stdout)
             .trim()
             .is_empty());
+        std::env::remove_var("KAIRASTRA_SEED_REPO");
+    }
+
+    #[tokio::test]
+    async fn refuses_to_remove_dirty_managed_git_worktree() {
+        let _guard = ENV_LOCK.lock().await;
+        let workspace_root = tempdir().unwrap();
+        let seed_repo = tempdir().unwrap();
+        init_git_repo(seed_repo.path());
+        std::env::set_var("KAIRASTRA_SEED_REPO", seed_repo.path());
+
+        let mut settings = test_settings(workspace_root.path());
+        settings.workspace.bootstrap_mode = WorkspaceBootstrapMode::SeedWorktree;
+        settings.hooks.after_create = Some(
+            r#"
+set -euo pipefail
+git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "kairastra/MT-6" "$PWD" HEAD
+"#
+            .trim()
+            .to_string(),
+        );
+
+        let workspace = ensure_workspace(&settings, &issue("MT-6")).await.unwrap();
+        fs::write(workspace.path.join("dirty.txt"), "local change\n").unwrap();
+
+        let error = remove_issue_workspace(&settings, "MT-6")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("managed_worktree_dirty"));
+        assert!(workspace.path.exists());
+
+        let branch_output = StdCommand::new("git")
+            .args(["branch", "--list", "kairastra/MT-6"])
+            .current_dir(seed_repo.path())
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&branch_output.stdout).contains("kairastra/MT-6"));
+        std::env::remove_var("KAIRASTRA_SEED_REPO");
+    }
+
+    #[tokio::test]
+    async fn refuses_to_remove_unmerged_managed_git_worktree_branch() {
+        let _guard = ENV_LOCK.lock().await;
+        let workspace_root = tempdir().unwrap();
+        let seed_repo = tempdir().unwrap();
+        init_git_repo(seed_repo.path());
+        std::env::set_var("KAIRASTRA_SEED_REPO", seed_repo.path());
+
+        let mut settings = test_settings(workspace_root.path());
+        settings.workspace.bootstrap_mode = WorkspaceBootstrapMode::SeedWorktree;
+        settings.hooks.after_create = Some(
+            r#"
+set -euo pipefail
+git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "kairastra/MT-7" "$PWD" HEAD
+"#
+            .trim()
+            .to_string(),
+        );
+
+        let workspace = ensure_workspace(&settings, &issue("MT-7")).await.unwrap();
+        fs::write(workspace.path.join("change.txt"), "committed change\n").unwrap();
+        let status = StdCommand::new("git")
+            .args(["add", "change.txt"])
+            .current_dir(&workspace.path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = StdCommand::new("git")
+            .args([
+                "-c",
+                "user.name=Kairastra",
+                "-c",
+                "user.email=kairastra@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "local change",
+            ])
+            .current_dir(&workspace.path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error = remove_issue_workspace(&settings, "MT-7")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("managed_worktree_unmerged_branch"));
+        assert!(workspace.path.exists());
+
+        let branch_output = StdCommand::new("git")
+            .args(["branch", "--list", "kairastra/MT-7"])
+            .current_dir(seed_repo.path())
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&branch_output.stdout).contains("kairastra/MT-7"));
         std::env::remove_var("KAIRASTRA_SEED_REPO");
     }
 
