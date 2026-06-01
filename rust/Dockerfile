@@ -5,6 +5,9 @@ COPY rust/Cargo.toml ./Cargo.toml
 COPY rust/Cargo.lock ./Cargo.lock
 COPY rust/src ./src
 COPY rust/README.md ./README.md
+COPY WORKFLOW.md ../WORKFLOW.md
+COPY .github/pull_request_template.md ../.github/pull_request_template.md
+COPY .agents/skills ../.agents/skills
 
 RUN cargo build --locked --release
 
@@ -43,6 +46,10 @@ RUN apt-get update \
     && chown -R kairastra:kairastra /workspace /var/lib/kairastra-auth \
     && rm -f /tmp/claude \
     && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /home/kairastra/.gemini \
+    && printf '{"projects":{}}\n' > /home/kairastra/.gemini/projects.json \
+    && chown -R kairastra:kairastra /home/kairastra/.gemini
 
 COPY --from=builder /src/rust/target/release/kairastra /usr/local/bin/kairastra
 

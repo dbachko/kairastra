@@ -20,19 +20,18 @@ use crate::github_tools::{
     execute_github_graphql as execute_shared_github_graphql,
     execute_github_rest as execute_shared_github_rest,
 };
-use crate::model::Issue;
+use crate::model::{HumanInputOption, HumanInputQuestion, HumanInputRequest, Issue};
 
-use super::config::CodexConfig;
+use super::config::{CodexCollaborationMode, CodexConfig};
 
 // Source of truth for the Codex app-server handshake and request flow:
 // https://github.com/openai/codex-plugin-cc
 const INITIALIZE_ID: u64 = 1;
 const THREAD_START_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;
-const NON_INTERACTIVE_TOOL_INPUT_ANSWER: &str =
-    "This is a non-interactive session. Operator input is unavailable.";
 const CODEX_ENV_ALLOWLIST: &[&str] = &["CODEX_AUTH_MODE"];
 const CODEX_SERVICE_NAME: &str = "kairastra";
+const PLAN_MODE_MIN_STALL_TIMEOUT_MS: u64 = 900_000;
 
 #[derive(Debug, Clone)]
 pub struct CodexBackend;
@@ -57,6 +56,7 @@ pub struct CodexSession {
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
     thread_id: String,
+    thread_model: Option<String>,
     workspace: PathBuf,
     auto_approve_requests: bool,
     approval_policy: JsonValue,
@@ -125,6 +125,7 @@ impl CodexSession {
             stdin,
             stdout: BufReader::new(stdout).lines(),
             thread_id: String::new(),
+            thread_model: None,
             workspace: workspace_path,
             auto_approve_requests,
             approval_policy,
@@ -136,10 +137,12 @@ impl CodexSession {
             .send_initialize()
             .await
             .context("codex_app_server_initialize_failed")?;
-        session.thread_id = session
+        let thread = session
             .start_thread()
             .await
             .context("codex_app_server_thread_start_failed")?;
+        session.thread_id = thread.thread_id;
+        session.thread_model = thread.model;
         Ok(session)
     }
 
@@ -178,7 +181,9 @@ impl CodexSession {
             &turn_id,
         );
 
-        let turn_id = self.await_turn_completion(Some(turn_id), on_event).await?;
+        let turn_id = self
+            .await_turn_completion(issue, Some(turn_id), on_event)
+            .await?;
         let session_id = format!("{}-{turn_id}", self.thread_id);
 
         Ok(TurnResult {
@@ -227,7 +232,7 @@ impl CodexSession {
         Ok(())
     }
 
-    async fn start_thread(&mut self) -> Result<String> {
+    async fn start_thread(&mut self) -> Result<ThreadStartResult> {
         self.write_message(json!({
             "method": "thread/start",
             "id": THREAD_START_ID,
@@ -247,16 +252,22 @@ impl CodexSession {
         let payload = self
             .await_response(THREAD_START_ID, self.config.read_timeout_ms)
             .await?;
-        payload
+        let thread_id = payload
             .get("thread")
             .and_then(|thread| thread.get("id"))
             .and_then(JsonValue::as_str)
             .map(ToString::to_string)
-            .ok_or_else(|| anyhow!("invalid_thread_payload"))
+            .ok_or_else(|| anyhow!("invalid_thread_payload"))?;
+        let model = payload
+            .get("model")
+            .and_then(JsonValue::as_str)
+            .map(ToString::to_string);
+
+        Ok(ThreadStartResult { thread_id, model })
     }
 
     async fn start_turn(&mut self, issue: &Issue, prompt: &str) -> Result<String> {
-        self.write_message(json!({
+        let mut payload = json!({
             "method": "turn/start",
             "id": TURN_START_ID,
             "params": {
@@ -276,8 +287,30 @@ impl CodexSession {
                 "effort": self.config.reasoning_effort,
                 "serviceTier": self.config.service_tier(),
             }
-        }))
-        .await?;
+        });
+        if let Some(CodexCollaborationMode::Plan) =
+            self.config.effective_collaboration_mode(&issue.labels)
+        {
+            if let Some(params) = payload.get_mut("params").and_then(JsonValue::as_object_mut) {
+                params.insert(
+                    "collaborationMode".to_string(),
+                    json!({
+                        "mode": "plan",
+                        "settings": {
+                            "model": self
+                                .config
+                                .model
+                                .clone()
+                                .or_else(|| self.thread_model.clone())
+                                .unwrap_or_else(|| "gpt-5.4".to_string()),
+                            "reasoning_effort": self.config.reasoning_effort.clone(),
+                            "developer_instructions": JsonValue::Null
+                        }
+                    }),
+                );
+            }
+        }
+        self.write_message(payload).await?;
 
         let payload = self.await_response(TURN_START_ID, 10_000).await?;
         payload
@@ -324,12 +357,14 @@ impl CodexSession {
 
     async fn await_turn_completion(
         &mut self,
+        issue: &Issue,
         initial_turn_id: Option<String>,
         on_event: &UnboundedSender<AgentEvent>,
     ) -> Result<String> {
         let turn_started = Instant::now();
         let mut last_event_at = Instant::now();
         let turn_id = initial_turn_id;
+        let stall_timeout_ms = self.effective_stall_timeout_ms(issue);
 
         loop {
             if self.config.turn_timeout_ms > 0
@@ -338,8 +373,8 @@ impl CodexSession {
                 return Err(anyhow!("turn_timeout"));
             }
 
-            if self.config.stall_timeout_ms > 0
-                && last_event_at.elapsed() >= Duration::from_millis(self.config.stall_timeout_ms)
+            if stall_timeout_ms > 0
+                && last_event_at.elapsed() >= Duration::from_millis(stall_timeout_ms)
             {
                 return Err(anyhow!("turn_stalled"));
             }
@@ -350,20 +385,18 @@ impl CodexSession {
                 Duration::from_millis(self.config.turn_timeout_ms)
                     .saturating_sub(turn_started.elapsed())
             };
-            let remaining_stall = if self.config.stall_timeout_ms == 0 {
+            let remaining_stall = if stall_timeout_ms == 0 {
                 Duration::from_secs(3600)
             } else {
-                Duration::from_millis(self.config.stall_timeout_ms)
-                    .saturating_sub(last_event_at.elapsed())
+                Duration::from_millis(stall_timeout_ms).saturating_sub(last_event_at.elapsed())
             };
             let wait_for = remaining_turn.min(remaining_stall);
 
             let line = timeout(wait_for, self.stdout.next_line())
                 .await
                 .map_err(|_| {
-                    if self.config.stall_timeout_ms > 0
-                        && last_event_at.elapsed()
-                            >= Duration::from_millis(self.config.stall_timeout_ms)
+                    if stall_timeout_ms > 0
+                        && last_event_at.elapsed() >= Duration::from_millis(stall_timeout_ms)
                     {
                         anyhow!("turn_stalled")
                     } else {
@@ -535,17 +568,20 @@ impl CodexSession {
                     });
                 }
                 "item/tool/requestUserInput" => {
-                    self.handle_tool_request_user_input(&payload).await?;
+                    let request =
+                        self.handle_tool_request_user_input(issue, &payload, turn_id.as_deref())?;
                     let session_id = turn_id
                         .as_ref()
                         .map(|value| format!("{}-{value}", self.thread_id));
                     let _ = on_event.send(AgentEvent {
-                        event: AgentEventKind::ToolInputAutoAnswered,
+                        event: AgentEventKind::UserInputRequested,
                         timestamp: now,
-                        payload,
+                        payload: serde_json::to_value(&request)
+                            .context("failed to encode user input request event")?,
                         session_id,
                         agent_process_pid: self.process_id().map(|value| value.to_string()),
                     });
+                    return Err(anyhow!("waiting_for_user_input: {}", request.request_id));
                 }
                 other => {
                     if needs_input(other, &payload) {
@@ -575,6 +611,13 @@ impl CodexSession {
                 }
             }
         }
+    }
+
+    fn effective_stall_timeout_ms(&self, issue: &Issue) -> u64 {
+        effective_stall_timeout_ms_for_mode(
+            self.config.stall_timeout_ms,
+            self.config.effective_collaboration_mode(&issue.labels),
+        )
     }
 
     async fn auto_approve(&mut self, payload: &JsonValue, method: &str) -> Result<()> {
@@ -643,8 +686,13 @@ impl CodexSession {
         Ok(success)
     }
 
-    async fn handle_tool_request_user_input(&mut self, payload: &JsonValue) -> Result<()> {
-        let id = payload
+    fn handle_tool_request_user_input(
+        &self,
+        issue: &Issue,
+        payload: &JsonValue,
+        turn_id: Option<&str>,
+    ) -> Result<HumanInputRequest> {
+        let _id = payload
             .get("id")
             .and_then(JsonValue::as_u64)
             .ok_or_else(|| anyhow!("tool input payload missing id"))?;
@@ -655,52 +703,24 @@ impl CodexSession {
             .cloned()
             .unwrap_or_default();
 
-        let mut answers = serde_json::Map::new();
-        for question in questions {
-            let Some(question_id) = question.get("id").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            let answer = if self.auto_approve_requests {
-                question
-                    .get("options")
-                    .and_then(JsonValue::as_array)
-                    .and_then(|options| {
-                        options.iter().find_map(|option| {
-                            let label = option.get("label").and_then(JsonValue::as_str)?;
-                            if label.to_lowercase().contains("approve") {
-                                Some(label.to_string())
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .or_else(|| {
-                        question
-                            .get("options")
-                            .and_then(JsonValue::as_array)
-                            .and_then(|options| {
-                                options
-                                    .first()
-                                    .and_then(|option| option.get("label"))
-                                    .and_then(JsonValue::as_str)
-                                    .map(ToString::to_string)
-                            })
-                    })
-                    .unwrap_or_else(|| NON_INTERACTIVE_TOOL_INPUT_ANSWER.to_string())
-            } else {
-                NON_INTERACTIVE_TOOL_INPUT_ANSWER.to_string()
-            };
+        let parsed_questions = questions
+            .into_iter()
+            .filter_map(|question| parse_human_input_question(&question))
+            .collect::<Vec<_>>();
 
-            answers.insert(question_id.to_string(), json!({ "answers": [answer] }));
+        if parsed_questions.is_empty() {
+            return Err(anyhow!("tool input payload missing supported questions"));
         }
 
-        self.write_message(json!({
-            "id": id,
-            "result": {
-                "answers": answers
-            }
-        }))
-        .await
+        Ok(HumanInputRequest {
+            request_id: format!("input-{}", Utc::now().timestamp_millis()),
+            provider: "codex".to_string(),
+            issue_id: issue.id.clone(),
+            issue_identifier: issue.identifier.clone(),
+            session_id: current_session_id(&self.thread_id, turn_id),
+            requested_at: Utc::now(),
+            questions: parsed_questions,
+        })
     }
 
     async fn write_message(&mut self, payload: JsonValue) -> Result<()> {
@@ -710,6 +730,72 @@ impl CodexSession {
         self.stdin.flush().await?;
         Ok(())
     }
+}
+
+fn effective_stall_timeout_ms_for_mode(
+    stall_timeout_ms: u64,
+    collaboration_mode: Option<CodexCollaborationMode>,
+) -> u64 {
+    if matches!(collaboration_mode, Some(CodexCollaborationMode::Plan)) {
+        stall_timeout_ms.max(PLAN_MODE_MIN_STALL_TIMEOUT_MS)
+    } else {
+        stall_timeout_ms
+    }
+}
+
+struct ThreadStartResult {
+    thread_id: String,
+    model: Option<String>,
+}
+
+fn parse_human_input_question(question: &JsonValue) -> Option<HumanInputQuestion> {
+    let id = question.get("id").and_then(JsonValue::as_str)?.trim();
+    let prompt = question
+        .get("question")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let header = question
+        .get("header")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let options = question
+        .get("options")
+        .and_then(JsonValue::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| {
+                    let label = option.get("label").and_then(JsonValue::as_str)?.trim();
+                    if label.is_empty() {
+                        return None;
+                    }
+                    Some(HumanInputOption {
+                        label: label.to_string(),
+                        description: option
+                            .get("description")
+                            .and_then(JsonValue::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToString::to_string),
+                        is_other: option
+                            .get("isOther")
+                            .and_then(JsonValue::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Some(HumanInputQuestion {
+        id: id.to_string(),
+        header,
+        question: prompt.to_string(),
+        options,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1156,7 +1242,7 @@ fn needs_input(method: &str, payload: &JsonValue) -> bool {
 
 fn initialize_capabilities() -> JsonValue {
     json!({
-        "experimentalApi": false,
+        "experimentalApi": true,
         "optOutNotificationMethods": [
             "item/agentMessage/delta",
             "item/reasoning/summaryTextDelta",
@@ -1216,7 +1302,10 @@ mod tests {
     use crate::github::GitHubTracker;
     use crate::model::{Issue, WorkflowDefinition};
 
-    use super::{probe_startup, AgentEventKind, CodexSession};
+    use super::{
+        effective_stall_timeout_ms_for_mode, probe_startup, AgentEventKind, CodexCollaborationMode,
+        CodexSession, PLAN_MODE_MIN_STALL_TIMEOUT_MS,
+    };
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1384,6 +1473,92 @@ done
             }
         }
         assert!(saw_input_required);
+    }
+
+    #[tokio::test]
+    async fn emits_user_input_request_and_blocks_turn() {
+        let dir = tempdir().unwrap();
+        let workspace_root = dir.path().join("workspaces");
+        let workspace = workspace_root.join("ISSUE-INPUT");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let script = dir.path().join("request-user-input-codex.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+count=0
+while IFS= read -r _line; do
+  count=$((count + 1))
+  case "$count" in
+    1)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    2)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-input"}}}'
+      ;;
+    3)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-input"}}}'
+      ;;
+    4)
+      printf '%s\n' '{"method":"item/tool/requestUserInput","id":9,"params":{"questions":[{"id":"scope","header":"Scope","question":"Pick a scope","options":[{"label":"Small","description":"Minimum change"},{"label":"Large","description":"Full flow","isOther":true}]}]}}'
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let settings = settings_with_command(
+            &workspace_root,
+            &script.display().to_string(),
+            "",
+            r#"  turn_sandbox_policy:
+    type: workspaceWrite
+    networkAccess: true"#,
+        );
+        let tracker = tracker(&settings);
+        let mut session = CodexSession::start(&settings, tracker, &workspace)
+            .await
+            .unwrap();
+        let (tx, mut rx) = unbounded_channel();
+
+        let error = session
+            .run_turn(&issue("ISSUE-INPUT"), "prompt", &tx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("waiting_for_user_input"));
+        let mut saw_request = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event.event, AgentEventKind::UserInputRequested) {
+                saw_request = true;
+                let request_id = event
+                    .payload
+                    .get("request_id")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("request id should be present");
+                assert!(request_id.starts_with("input-"));
+                assert_eq!(
+                    event
+                        .payload
+                        .get("questions")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|questions| questions.first())
+                        .and_then(|question| question.get("id"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("scope")
+                );
+            }
+        }
+        assert!(saw_request);
     }
 
     #[tokio::test]
@@ -1559,12 +1734,93 @@ done
         assert_eq!(result.turn_id, "turn-3");
 
         let trace = fs::read_to_string(trace_file).unwrap();
+        assert!(trace.contains(r#""method":"initialize""#));
+        assert!(trace.contains(r#""experimentalApi":true"#));
         assert!(trace.contains(r#""decision":"acceptForSession""#));
         assert!(trace.contains(r#""method":"thread/start""#));
         assert!(trace.contains(r#""method":"turn/start""#));
         assert!(trace.contains(r#""model":"gpt-5.4""#));
         assert!(trace.contains(r#""effort":"high""#));
         assert!(trace.contains(r#""serviceTier":"fast""#));
+    }
+
+    #[tokio::test]
+    async fn includes_plan_collaboration_mode_when_issue_has_mode_plan_label() {
+        let dir = tempdir().unwrap();
+        let workspace_root = dir.path().join("workspaces");
+        let workspace = workspace_root.join("ISSUE-PLAN");
+        fs::create_dir_all(&workspace).unwrap();
+        let trace_file = dir.path().join("plan.trace");
+
+        let script = dir.path().join("plan-mode-codex.sh");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+trace_file='{}'
+count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  printf '%s\n' "$line" >> "$trace_file"
+  case "$count" in
+    1) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    2) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"thread-plan"}}}}}}' ;;
+    3) printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-plan"}}}}}}' ;;
+    4) printf '%s\n' '{{"method":"turn/completed"}}' ;;
+  esac
+done
+"#,
+                trace_file.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let settings = settings_with_command(
+            &workspace_root,
+            &script.display().to_string(),
+            "",
+            r#"  turn_sandbox_policy:
+    type: workspaceWrite
+    networkAccess: true"#,
+        );
+        let tracker = tracker(&settings);
+        let mut session = CodexSession::start(&settings, tracker, &workspace)
+            .await
+            .unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let mut issue = issue("ISSUE-PLAN");
+        issue.labels.push("mode:plan".to_string());
+
+        let result = session.run_turn(&issue, "prompt", &tx).await.unwrap();
+        assert_eq!(result.turn_id, "turn-plan");
+
+        let trace = fs::read_to_string(trace_file).unwrap();
+        assert!(trace.contains(r#""method":"initialize""#));
+        assert!(trace.contains(r#""experimentalApi":true"#));
+        assert!(trace.contains(r#""method":"turn/start""#));
+        assert!(trace.contains(r#""collaborationMode":{"mode":"plan","settings":{"developer_instructions":null,"model":"gpt-5.4","reasoning_effort":null}}"#)
+            || trace.contains(r#""collaborationMode":{"mode":"plan","settings":{"model":"gpt-5.4","reasoning_effort":null,"developer_instructions":null}}"#)
+            || trace.contains(r#""collaborationMode":{"mode":"plan","settings":{"model":"gpt-5.4","developer_instructions":null,"reasoning_effort":null}}"#));
+    }
+
+    #[test]
+    fn plan_mode_uses_extended_effective_stall_timeout() {
+        assert_eq!(
+            effective_stall_timeout_ms_for_mode(1000, Some(CodexCollaborationMode::Plan)),
+            PLAN_MODE_MIN_STALL_TIMEOUT_MS
+        );
+        assert_eq!(
+            effective_stall_timeout_ms_for_mode(950_000, Some(CodexCollaborationMode::Plan)),
+            950_000
+        );
+        assert_eq!(effective_stall_timeout_ms_for_mode(1000, None), 1000);
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -1619,6 +1875,8 @@ done
 
         assert_eq!(probe.thread_id, "probe-thread");
         let trace = fs::read_to_string(trace_file).unwrap();
+        assert!(trace.contains(r#""method":"initialize""#));
+        assert!(trace.contains(r#""experimentalApi":true"#));
         assert!(trace.contains(r#""method":"thread/start""#));
         let inherited = fs::read_to_string(env_file).unwrap();
         assert!(inherited.trim().is_empty());

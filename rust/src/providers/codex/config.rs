@@ -17,12 +17,14 @@ const DEFAULT_CODEX_COMMAND: &str = "codex app-server";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_TURN_TIMEOUT_MS: u64 = 3_600_000;
 const DEFAULT_STALL_TIMEOUT_MS: u64 = 300_000;
+pub const MODE_PLAN_LABEL: &str = "mode:plan";
 
 #[derive(Debug, Clone)]
 pub struct CodexConfig {
     pub command: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub collaboration_mode: CodexCollaborationMode,
     pub fast: Option<bool>,
     pub approval_policy: JsonValue,
     pub thread_sandbox: String,
@@ -33,12 +35,19 @@ pub struct CodexConfig {
     trusted_seed_repo_git_dir: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexCollaborationMode {
+    Default,
+    Plan,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 struct RawCodexConfig {
     command: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    collaboration_mode: Option<String>,
     fast: Option<BoolOrString>,
     approval_policy: Option<JsonValue>,
     thread_sandbox: Option<String>,
@@ -65,6 +74,10 @@ pub fn load(settings: &Settings) -> Result<CodexConfig> {
     if let Some(value) = reasoning_effort.as_deref() {
         validate_reasoning_effort(value)?;
     }
+    let collaboration_mode = resolve_optional_string(raw.collaboration_mode)
+        .map(|value| parse_collaboration_mode(&value))
+        .transpose()?
+        .unwrap_or(CodexCollaborationMode::Default);
 
     let config = CodexConfig {
         command: raw
@@ -72,6 +85,7 @@ pub fn load(settings: &Settings) -> Result<CodexConfig> {
             .unwrap_or_else(|| DEFAULT_CODEX_COMMAND.to_string()),
         model: resolve_optional_string(raw.model),
         reasoning_effort,
+        collaboration_mode,
         fast: resolve_optional_bool(raw.fast, "providers.codex.fast")?,
         approval_policy: raw.approval_policy.unwrap_or_else(default_approval_policy),
         thread_sandbox: raw
@@ -106,6 +120,23 @@ pub fn load(settings: &Settings) -> Result<CodexConfig> {
 }
 
 impl CodexConfig {
+    pub fn effective_collaboration_mode(
+        &self,
+        labels: &[String],
+    ) -> Option<CodexCollaborationMode> {
+        if labels
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case(MODE_PLAN_LABEL))
+        {
+            return Some(CodexCollaborationMode::Plan);
+        }
+
+        match self.collaboration_mode {
+            CodexCollaborationMode::Default => None,
+            mode => Some(mode),
+        }
+    }
+
     pub fn turn_sandbox_policy(&self, workspace: &Path) -> Result<JsonValue> {
         let required_writable_roots = self.sandbox_writable_roots(workspace)?;
 
@@ -280,6 +311,16 @@ fn validate_reasoning_effort(value: &str) -> Result<()> {
     }
 }
 
+fn parse_collaboration_mode(value: &str) -> Result<CodexCollaborationMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "default" => Ok(CodexCollaborationMode::Default),
+        "plan" => Ok(CodexCollaborationMode::Plan),
+        _ => Err(anyhow!(
+            "invalid_workflow_config: providers.codex.collaboration_mode must be one of default, plan"
+        )),
+    }
+}
+
 fn default_approval_policy() -> JsonValue {
     json!({
         "reject": {
@@ -303,7 +344,7 @@ mod tests {
     use crate::config::Settings;
     use crate::model::WorkflowDefinition;
 
-    use super::load;
+    use super::{load, CodexCollaborationMode, MODE_PLAN_LABEL};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -365,6 +406,16 @@ providers:
     }
 
     #[test]
+    fn resolves_env_backed_collaboration_mode() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("KAIRASTRA_CODEX_COLLABORATION_MODE", "plan");
+        let settings = settings("    collaboration_mode: $KAIRASTRA_CODEX_COLLABORATION_MODE");
+        let config = load(&settings).unwrap();
+        assert_eq!(config.collaboration_mode, CodexCollaborationMode::Plan);
+        env::remove_var("KAIRASTRA_CODEX_COLLABORATION_MODE");
+    }
+
+    #[test]
     fn resolves_env_backed_fast_flag() {
         let _guard = ENV_LOCK.lock().unwrap();
         env::set_var("KAIRASTRA_CODEX_FAST", "true");
@@ -391,6 +442,24 @@ providers:
         let config = load(&settings).unwrap();
         assert_eq!(config.fast, Some(false));
         assert_eq!(config.service_tier(), Some("flex"));
+    }
+
+    #[test]
+    fn rejects_invalid_collaboration_mode() {
+        let settings = settings("    collaboration_mode: implement");
+        let error = load(&settings).unwrap_err().to_string();
+        assert!(error.contains("providers.codex.collaboration_mode"));
+    }
+
+    #[test]
+    fn label_override_forces_plan_mode() {
+        let settings = settings("    collaboration_mode: default");
+        let config = load(&settings).unwrap();
+        assert_eq!(
+            config.effective_collaboration_mode(&[MODE_PLAN_LABEL.to_string()]),
+            Some(CodexCollaborationMode::Plan)
+        );
+        assert_eq!(config.effective_collaboration_mode(&[]), None);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::config::{
     FieldSource, FieldSourceType, GitHubMode, TrackerSettings, WorkspaceBootstrapMode,
@@ -17,7 +18,10 @@ use crate::github_bootstrap::{
 };
 use crate::providers::{self, ProviderSetupConfig};
 use crate::shared_skills;
-use crate::workflow::{OPERATOR_CONFIG_DIRNAME, OPERATOR_ENV_FILENAME, REPO_WORKFLOW_FILENAME};
+use crate::workflow::{
+    provider_settings_path_for_workflow, OPERATOR_CONFIG_DIRNAME, OPERATOR_ENV_FILENAME,
+    REPO_WORKFLOW_FILENAME,
+};
 
 #[derive(Debug, Clone)]
 pub struct SetupOptions {
@@ -90,6 +94,7 @@ pub async fn run(options: SetupOptions) -> Result<()> {
     let workflow_path = resolve_workflow_path(&layout, options.workflow.as_ref());
     guard_default_workflow_target(&layout, options.workflow.as_ref(), &workflow_path)?;
     let env_file_path = resolve_env_file_path(&layout, mode, options.env_file.as_ref());
+    let provider_settings_path = resolve_provider_settings_path(&workflow_path);
     let service_unit_path = resolve_service_path(&layout, options.service_unit.as_ref());
 
     let values = collect_values(
@@ -105,6 +110,7 @@ pub async fn run(options: SetupOptions) -> Result<()> {
     let shared_skills = ensure_shared_skills(&layout.repo_root, options.non_interactive)?;
     let workflow_content = render_workflow(mode, &values);
     let env_file_content = render_env_file(mode, &values, &workflow_path);
+    let provider_settings_content = render_provider_settings_file(&values)?;
 
     write_text_file(
         &workflow_path,
@@ -115,6 +121,12 @@ pub async fn run(options: SetupOptions) -> Result<()> {
     write_text_file(
         &env_file_path,
         &env_file_content,
+        options.non_interactive,
+        options.reconfigure,
+    )?;
+    write_text_file(
+        &provider_settings_path,
+        &provider_settings_content,
         options.non_interactive,
         options.reconfigure,
     )?;
@@ -146,6 +158,7 @@ pub async fn run(options: SetupOptions) -> Result<()> {
     println!("Generated:");
     println!("- workflow: {}", workflow_path.display());
     println!("- env file: {}", env_file_path.display());
+    println!("- provider settings: {}", provider_settings_path.display());
     for path in &scaffolded_support_assets {
         println!("- scaffolded support asset: {}", path.display());
     }
@@ -168,6 +181,10 @@ pub async fn run(options: SetupOptions) -> Result<()> {
         step,
         workflow_path.display(),
         env_file_path.display()
+    );
+    println!(
+        "   Provider defaults live in {}",
+        provider_settings_path.display()
     );
     step += 1;
     if !provider_auth_ready {
@@ -256,6 +273,10 @@ fn resolve_env_file_path(
         .repo_root
         .join(OPERATOR_CONFIG_DIRNAME)
         .join(OPERATOR_ENV_FILENAME)
+}
+
+fn resolve_provider_settings_path(workflow_path: &Path) -> PathBuf {
+    provider_settings_path_for_workflow(workflow_path)
 }
 
 fn resolve_service_path(layout: &SetupLayout, explicit: Option<&PathBuf>) -> Option<PathBuf> {
@@ -2541,6 +2562,31 @@ RUST_LOG={rust_log}
     )
 }
 
+fn render_provider_settings_file(values: &SetupValues) -> Result<String> {
+    let mut providers = JsonMap::new();
+
+    for config in &values.provider_configs {
+        let (provider, value) = match config {
+            ProviderSetupConfig::Claude(config) => (
+                "claude",
+                crate::providers::claude::setup::render_settings_json(config),
+            ),
+            ProviderSetupConfig::Codex(config) => (
+                "codex",
+                crate::providers::codex::setup::render_settings_json(config),
+            ),
+            ProviderSetupConfig::Gemini(config) => (
+                "gemini",
+                crate::providers::gemini::setup::render_settings_json(config),
+            ),
+        };
+        providers.insert(provider.to_string(), value);
+    }
+
+    serde_json::to_string_pretty(&JsonValue::Object(providers))
+        .context("failed to render provider settings JSON")
+}
+
 fn render_systemd_unit(values: &SetupValues, workflow_path: &Path, env_file: &Path) -> String {
     format!(
         r#"[Unit]
@@ -2578,8 +2624,8 @@ fn absolute_display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_workflow_body, ensure_repo_support_dirs, render_env_file, render_systemd_unit,
-        render_workflow, SetupValues,
+        canonical_workflow_body, ensure_repo_support_dirs, render_env_file,
+        render_provider_settings_file, render_systemd_unit, render_workflow, SetupValues,
     };
     use crate::config::{GitHubMode, WorkspaceBootstrapMode};
     use crate::deploy::DeployMode;
@@ -2603,18 +2649,21 @@ mod tests {
                 ProviderSetupConfig::Codex(CodexSetupConfig {
                     auth_mode: crate::auth::AuthMode::Subscription,
                     model: "gpt-5.4".to_string(),
-                    reasoning_effort: "high".to_string(),
+                    reasoning_effort: "medium".to_string(),
+                    collaboration_mode: "default".to_string(),
                     fast: Some(true),
                 }),
                 ProviderSetupConfig::Claude(ClaudeSetupConfig {
                     auth_mode: crate::auth::AuthMode::ApiKey,
                     model: "sonnet".to_string(),
-                    reasoning_effort: "high".to_string(),
+                    reasoning_effort: "medium".to_string(),
+                    permission_mode: "bypassPermissions".to_string(),
                 }),
                 ProviderSetupConfig::Gemini(GeminiSetupConfig {
                     auth_mode: crate::auth::AuthMode::Subscription,
                     model: "gemini-2.5-pro".to_string(),
                     approval_mode: "yolo".to_string(),
+                    sandbox: true,
                 }),
             ],
             github_owner: "example-owner".to_string(),
@@ -2661,13 +2710,12 @@ mod tests {
         assert!(rendered.contains("  codex:"));
         assert!(rendered.contains("  claude:"));
         assert!(rendered.contains("  gemini:"));
-        assert!(rendered.contains("model: $KAIRASTRA_CODEX_MODEL"));
-        assert!(rendered.contains("model: $KAIRASTRA_CLAUDE_MODEL"));
-        assert!(rendered.contains("model: $KAIRASTRA_GEMINI_MODEL"));
-        assert!(rendered.contains("reasoning_effort: $KAIRASTRA_CODEX_REASONING_EFFORT"));
-        assert!(rendered.contains("reasoning_effort: $KAIRASTRA_CLAUDE_REASONING_EFFORT"));
-        assert!(rendered.contains("approval_mode: $KAIRASTRA_GEMINI_APPROVAL_MODE"));
-        assert!(rendered.contains("fast: $KAIRASTRA_CODEX_FAST"));
+        assert!(rendered.contains("command: codex app-server"));
+        assert!(rendered.contains("command: claude"));
+        assert!(rendered.contains("command: gemini"));
+        assert!(!rendered.contains("KAIRASTRA_CODEX_MODEL"));
+        assert!(!rendered.contains("KAIRASTRA_CLAUDE_MODEL"));
+        assert!(!rendered.contains("KAIRASTRA_GEMINI_MODEL"));
         assert!(rendered.contains("for support_dir in .agents .github; do"));
         assert!(!rendered.contains("for support_dir in .codex .github; do"));
         assert!(rendered.contains("git rev-parse --git-path info/exclude"));
@@ -2712,8 +2760,7 @@ mod tests {
         assert!(rendered.contains("  codex:"));
         assert!(rendered.contains("  claude:"));
         assert!(rendered.contains("  gemini:"));
-        assert!(rendered.contains("model: $KAIRASTRA_CLAUDE_MODEL"));
-        assert!(rendered.contains("reasoning_effort: $KAIRASTRA_CLAUDE_REASONING_EFFORT"));
+        assert!(rendered.contains("command: claude"));
     }
 
     #[test]
@@ -2727,15 +2774,26 @@ mod tests {
         assert!(rendered.contains("KAIRASTRA_SEED_REPO=/tmp/kairastra-seed"));
         assert!(!rendered.contains("KAIRASTRA_GIT_CLONE_URL="));
         assert!(rendered.contains("CODEX_AUTH_MODE=subscription"));
-        assert!(rendered.contains("KAIRASTRA_CODEX_MODEL=gpt-5.4"));
-        assert!(rendered.contains("KAIRASTRA_CODEX_REASONING_EFFORT=high"));
-        assert!(rendered.contains("KAIRASTRA_CODEX_FAST=true"));
         assert!(rendered.contains("CLAUDE_AUTH_MODE=api_key"));
-        assert!(rendered.contains("KAIRASTRA_CLAUDE_MODEL=sonnet"));
-        assert!(rendered.contains("KAIRASTRA_CLAUDE_REASONING_EFFORT=high"));
         assert!(rendered.contains("GEMINI_AUTH_MODE=subscription"));
-        assert!(rendered.contains("KAIRASTRA_GEMINI_MODEL=gemini-2.5-pro"));
-        assert!(rendered.contains("KAIRASTRA_GEMINI_APPROVAL_MODE=yolo"));
+        assert!(!rendered.contains("KAIRASTRA_CODEX_MODEL"));
+        assert!(!rendered.contains("KAIRASTRA_CLAUDE_MODEL"));
+        assert!(!rendered.contains("KAIRASTRA_GEMINI_MODEL"));
+    }
+
+    #[test]
+    fn provider_settings_file_contains_all_provider_defaults() {
+        let rendered = render_provider_settings_file(&sample_values()).unwrap();
+        assert!(rendered.contains(r#""codex""#));
+        assert!(rendered.contains(r#""model": "gpt-5.4""#));
+        assert!(rendered.contains(r#""reasoning_effort": "medium""#));
+        assert!(rendered.contains(r#""collaboration_mode": "default""#));
+        assert!(rendered.contains(r#""fast": true"#));
+        assert!(rendered.contains(r#""claude""#));
+        assert!(rendered.contains(r#""permission_mode": "bypassPermissions""#));
+        assert!(rendered.contains(r#""gemini""#));
+        assert!(rendered.contains(r#""approval_mode": "yolo""#));
+        assert!(rendered.contains(r#""sandbox": true"#));
     }
 
     #[test]

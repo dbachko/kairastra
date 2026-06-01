@@ -14,8 +14,10 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::agent::{AgentEvent, AgentEventKind};
 use crate::config::{normalize_issue_state, ProviderId, Settings};
-use crate::github::{is_rate_limited_error, GitHubTracker, Tracker};
-use crate::model::Issue;
+use crate::github::{is_rate_limited_error, GitHubTracker, RestIssueComment, Tracker};
+use crate::model::{
+    HumanInputAnswer, HumanInputRequest, Issue, PendingHumanInput, PendingHumanInputStatus,
+};
 use crate::providers;
 use crate::runner::{run_issue, WorkerMessage, WorkerOutcome};
 use crate::workflow::{WorkflowSnapshot, WorkflowStore};
@@ -68,6 +70,7 @@ struct RunningEntry {
     workspace_path: Option<PathBuf>,
     started_at: Instant,
     last_agent_timestamp: Instant,
+    stall_timeout_ms: u64,
     session_id: Option<String>,
     agent_process_pid: Option<String>,
     last_agent_event: Option<String>,
@@ -79,6 +82,7 @@ struct RunningEntry {
     last_reported_output_tokens: u64,
     last_reported_total_tokens: u64,
     turn_count: usize,
+    pending_human_input_request: Option<HumanInputRequest>,
     attempt: Option<u32>,
     handle: JoinHandle<()>,
 }
@@ -221,6 +225,9 @@ impl Orchestrator {
             .await?;
 
         let issues = self.tracker.fetch_candidate_issues().await?;
+        let issues = self
+            .reconcile_pending_human_inputs(snapshot, state, issues)
+            .await?;
         debug!(
             fetched = issues.len(),
             running = state.running.len(),
@@ -399,8 +406,6 @@ impl Orchestrator {
             .into_iter()
             .map(|issue| (issue.id.clone(), issue))
             .collect();
-        let stall_timeout_ms = providers::stall_timeout_ms(&snapshot.settings)?;
-
         let mut remove_ids = Vec::new();
         let mut retries = Vec::new();
         let running_ids: Vec<String> = state.running.keys().cloned().collect();
@@ -409,8 +414,9 @@ impl Orchestrator {
                 continue;
             };
 
-            if stall_timeout_ms > 0
-                && running.last_agent_timestamp.elapsed() >= Duration::from_millis(stall_timeout_ms)
+            if running.stall_timeout_ms > 0
+                && running.last_agent_timestamp.elapsed()
+                    >= Duration::from_millis(running.stall_timeout_ms)
             {
                 running.handle.abort();
                 state.claimed.remove(&issue_id);
@@ -539,6 +545,7 @@ impl Orchestrator {
         };
         let provider_name = provider.as_str().to_string();
         snapshot.settings.agent.provider = provider;
+        let stall_timeout_ms = providers::stall_timeout_ms(&snapshot.settings)?;
         state.claimed.insert(issue.id.clone());
 
         let issue_id = issue.id.clone();
@@ -550,22 +557,22 @@ impl Orchestrator {
         let issue_for_task = issue.clone();
 
         let handle = tokio::spawn(async move {
-            let result = run_issue(
+            let completion = run_issue(
                 snapshot,
                 tracker,
                 issue_for_task.clone(),
                 attempt,
                 tx.clone(),
             )
-            .await
-            .map_err(|error| format!("{error:#}"));
+            .await;
 
             let _ = tx.send(WorkerMessage::Finished {
                 issue_id: issue_for_task.id.clone(),
                 identifier: issue_for_task.identifier.clone(),
                 workspace_path: workspace_hint_for_task.unwrap_or_default(),
                 attempt,
-                result,
+                result: completion.outcome,
+                human_input_request: completion.human_input_request,
             });
         });
 
@@ -580,6 +587,7 @@ impl Orchestrator {
                 workspace_path: workspace_hint,
                 started_at,
                 last_agent_timestamp: started_at,
+                stall_timeout_ms,
                 session_id: None,
                 agent_process_pid: None,
                 last_agent_event: None,
@@ -591,6 +599,7 @@ impl Orchestrator {
                 last_reported_output_tokens: 0,
                 last_reported_total_tokens: 0,
                 turn_count: 0,
+                pending_human_input_request: None,
                 attempt,
                 handle,
             },
@@ -716,6 +725,10 @@ impl Orchestrator {
                     if let Some(usage) = extract_token_usage(&event.payload) {
                         usage_delta = Some(apply_token_usage(running, usage));
                     }
+                    if let AgentEventKind::UserInputRequested = event.event {
+                        running.pending_human_input_request =
+                            serde_json::from_value(event.payload.clone()).ok();
+                    }
                     rate_limits = extract_rate_limits(&event.payload);
                     log_provider_event(&running.provider, &running.identifier, &event);
                     if let AgentEventKind::SessionStarted = event.event {
@@ -746,6 +759,7 @@ impl Orchestrator {
                 workspace_path,
                 attempt,
                 result,
+                human_input_request,
                 ..
             } => {
                 let running = state.running.remove(&issue_id);
@@ -759,6 +773,18 @@ impl Orchestrator {
                 let session_id = running
                     .as_ref()
                     .and_then(|entry| entry.session_id.as_deref());
+                let pending_human_input_request = resolve_human_input_request(
+                    human_input_request,
+                    running
+                        .as_ref()
+                        .and_then(|entry| entry.pending_human_input_request.clone()),
+                );
+                let persisted_workspace_path = finished_workspace_path(
+                    running
+                        .as_ref()
+                        .and_then(|entry| entry.workspace_path.as_deref()),
+                    workspace_path.as_path(),
+                );
                 match result {
                     Ok(WorkerOutcome::Completed) => {
                         match self
@@ -791,7 +817,40 @@ impl Orchestrator {
                     }
                     Err(error) => {
                         error!(issue_identifier = %identifier, error, "worker failed");
-                        if let Some(blocked) =
+                        if error.contains("waiting_for_user_input") {
+                            match pending_human_input_request {
+                                Some(request) => {
+                                    match self
+                                        .persist_human_input_request(
+                                            snapshot,
+                                            &issue_id,
+                                            persisted_workspace_path,
+                                            request,
+                                        )
+                                        .await
+                                    {
+                                        Ok(issue) => hold_blocked_claim(state, &issue),
+                                        Err(annotation_error) => {
+                                            clear_blocked_claim(state, &issue_id);
+                                            log_runtime_error(
+                                                "human input request annotation",
+                                                &annotation_error,
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    clear_blocked_claim(state, &issue_id);
+                                    log_runtime_error(
+                                        "human input request annotation",
+                                        &anyhow::anyhow!(
+                                            "waiting_for_user_input without request payload (provider={provider}, session={}, issue_identifier={identifier})",
+                                            session_id.unwrap_or("unavailable"),
+                                        ),
+                                    );
+                                }
+                            }
+                        } else if let Some(blocked) =
                             classify_blocked_worker_failure(&snapshot.settings, provider, &error)
                         {
                             match self
@@ -890,6 +949,154 @@ impl Orchestrator {
             },
         )
         .await
+    }
+
+    async fn persist_human_input_request(
+        &self,
+        snapshot: &WorkflowSnapshot,
+        issue_id: &str,
+        workspace_path: &Path,
+        request: HumanInputRequest,
+    ) -> Result<Issue> {
+        let mut refreshed = self
+            .tracker
+            .fetch_issue_states_by_ids(&[issue_id.to_string()])
+            .await?;
+        let Some(mut issue) = refreshed.pop() else {
+            return Err(anyhow::anyhow!(
+                "human input issue disappeared before annotation"
+            ));
+        };
+
+        let prompt_comment = self
+            .tracker
+            .create_issue_comment(&issue, &render_human_input_prompt_comment(&request))
+            .await?;
+
+        let pending = PendingHumanInput {
+            request,
+            status: PendingHumanInputStatus::AwaitingAnswer,
+            prompt_comment_id: Some(prompt_comment.id),
+            prompt_comment_url: prompt_comment.html_url.clone(),
+            answered_comment_id: None,
+            answered_by_login: None,
+            answered_at: None,
+            answers: Vec::new(),
+        };
+        workspace::write_pending_human_input(workspace_path, &pending)?;
+
+        if issue.workpad_comment_id.is_some() {
+            issue = self.tracker.refresh_workpad_comment(&issue).await?;
+        }
+        let base_body = issue.workpad_comment_body.clone().unwrap_or_else(|| {
+            render_blocked_failure_workpad(
+                pending.request.provider.as_str(),
+                Some(workspace_path),
+                &issue,
+            )
+        });
+        let blocker_section = render_blocker_section(
+            pending.request.provider.as_str(),
+            None,
+            pending.request.session_id.as_deref(),
+            &format!("waiting_for_user_input: {}", pending.request.request_id),
+            "Reply to the pending Kairastra GitHub comment with the requested answers, then move the issue back to an active state if it does not transition automatically.",
+        );
+        let merged_body = merge_blocker_section(&base_body, &blocker_section);
+        issue = self
+            .tracker
+            .update_workpad_comment(&issue, &merged_body)
+            .await?;
+
+        if snapshot.settings.active_state(&issue.state)
+            && !snapshot.settings.terminal_state(&issue.state)
+        {
+            issue = self
+                .tracker
+                .transition_issue_to_human_review(&issue)
+                .await?;
+        }
+
+        warn!(
+            issue_identifier = %issue.identifier,
+            request_id = %pending.request.request_id,
+            state = %issue.state,
+            "issue waiting for human input; posted GitHub prompt comment"
+        );
+        Ok(issue)
+    }
+
+    async fn reconcile_pending_human_inputs(
+        &self,
+        snapshot: &WorkflowSnapshot,
+        state: &mut RuntimeState,
+        issues: Vec<Issue>,
+    ) -> Result<Vec<Issue>> {
+        let mut reconciled = Vec::with_capacity(issues.len());
+
+        for mut issue in issues {
+            let workspace_path =
+                match workspace::workspace_path(&snapshot.settings, &issue.identifier) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        reconciled.push(issue);
+                        continue;
+                    }
+                };
+
+            let Some(mut pending) = workspace::load_pending_human_input(&workspace_path)? else {
+                reconciled.push(issue);
+                continue;
+            };
+
+            match pending.status {
+                PendingHumanInputStatus::AwaitingAnswer => {
+                    if pending.prompt_comment_id.is_none() {
+                        let prompt_comment = self
+                            .tracker
+                            .create_issue_comment(
+                                &issue,
+                                &render_human_input_prompt_comment(&pending.request),
+                            )
+                            .await?;
+                        pending.prompt_comment_id = Some(prompt_comment.id);
+                        pending.prompt_comment_url = prompt_comment.html_url.clone();
+                        workspace::write_pending_human_input(&workspace_path, &pending)?;
+                    }
+
+                    let comments = self.tracker.list_issue_comments(&issue).await?;
+                    if let Some((comment, answers)) =
+                        find_human_input_answer(&pending.request, &comments)
+                    {
+                        pending.status = PendingHumanInputStatus::Answered;
+                        pending.answered_comment_id = Some(comment.id);
+                        pending.answered_by_login =
+                            comment.user.as_ref().and_then(|user| user.login.clone());
+                        pending.answered_at = comment.updated_at.or(comment.created_at);
+                        pending.answers = answers;
+                        workspace::write_pending_human_input(&workspace_path, &pending)?;
+                        let _ = self
+                            .tracker
+                            .create_issue_comment(&issue, &render_human_input_ack_comment(&pending))
+                            .await;
+                    }
+                }
+                PendingHumanInputStatus::Answered => {}
+            }
+
+            if pending.status == PendingHumanInputStatus::Answered {
+                clear_blocked_claim(state, &issue.id);
+                if !snapshot.settings.terminal_state(&issue.state) {
+                    issue = self.tracker.transition_issue_to_in_progress(&issue).await?;
+                }
+            } else {
+                hold_blocked_claim(state, &issue);
+            }
+
+            reconciled.push(issue);
+        }
+
+        Ok(reconciled)
     }
 
     async fn persist_issue_blocker(
@@ -1055,14 +1262,15 @@ fn log_generic_agent_event(provider: &str, issue_identifier: &str, event: &Agent
                 "agent requested unsupported tool"
             );
         }
-        AgentEventKind::ToolInputAutoAnswered => {
+        AgentEventKind::UserInputRequested => {
             info!(
                 issue_identifier = %issue_identifier,
                 provider,
                 payload = %event.payload,
-                "agent tool input auto-answered"
+                "agent requested structured user input"
             );
         }
+        AgentEventKind::ToolInputAutoAnswered => {}
         AgentEventKind::Malformed => {
             warn!(
                 issue_identifier = %issue_identifier,
@@ -1136,13 +1344,14 @@ fn log_codex_event(issue_identifier: &str, event: &AgentEvent) {
                 "codex emitted malformed stdout payload"
             );
         }
-        AgentEventKind::ToolInputAutoAnswered => {
+        AgentEventKind::UserInputRequested => {
             info!(
                 issue_identifier = %issue_identifier,
                 payload = %event.payload,
-                "codex tool request user input auto-answered"
+                "codex requested structured user input"
             );
         }
+        AgentEventKind::ToolInputAutoAnswered => {}
         AgentEventKind::Notification => log_codex_notification(issue_identifier, &event.payload),
         _ => {}
     }
@@ -1161,6 +1370,150 @@ fn log_generic_notification(provider: &str, issue_identifier: &str, payload: &se
         tool_id = tool_id.unwrap_or("unknown"),
         "agent tool started"
     );
+}
+
+fn render_human_input_prompt_comment(request: &HumanInputRequest) -> String {
+    let mut body = String::new();
+    body.push_str("Kairastra is waiting for structured input before it can continue.\n\n");
+    body.push_str(&format!("- Request ID: `{}`\n", request.request_id));
+    body.push_str("- Reply using this exact template:\n\n");
+    body.push_str("```text\n");
+    body.push_str(&format!("/kairastra answer {}\n", request.request_id));
+    for question in &request.questions {
+        let placeholder = if question.options.is_empty() {
+            "<answer>"
+        } else {
+            "<option>"
+        };
+        body.push_str(&format!("{}: {placeholder}\n", question.id));
+        if question.options.iter().any(|option| option.is_other) {
+            body.push_str(&format!("{}_other: <free text>\n", question.id));
+        }
+    }
+    body.push_str("```\n\n");
+    for question in &request.questions {
+        body.push_str(&format!("**{}**\n", question.question));
+        if !question.options.is_empty() {
+            for (index, option) in question.options.iter().enumerate() {
+                let code = human_input_option_code(index);
+                body.push_str(&format!("- {}. `{}`", code, option.label));
+                if let Some(description) = option.description.as_deref() {
+                    body.push_str(&format!(": {}", description));
+                }
+                if option.is_other {
+                    body.push_str(" (allows free text)");
+                }
+                body.push('\n');
+            }
+        }
+        body.push('\n');
+    }
+    body
+}
+
+fn render_human_input_ack_comment(pending: &PendingHumanInput) -> String {
+    format!(
+        "Captured answers for request `{}`. Kairastra will resume on the next run.",
+        pending.request.request_id
+    )
+}
+
+fn find_human_input_answer(
+    request: &HumanInputRequest,
+    comments: &[RestIssueComment],
+) -> Option<(RestIssueComment, Vec<HumanInputAnswer>)> {
+    comments
+        .iter()
+        .rev()
+        .filter(|comment| human_input_comment_is_authorized(comment))
+        .find_map(|comment| {
+            parse_human_input_answer(request, comment).map(|answers| (comment.clone(), answers))
+        })
+}
+
+fn human_input_comment_is_authorized(comment: &RestIssueComment) -> bool {
+    matches!(
+        comment.author_association.as_deref(),
+        Some("OWNER") | Some("MEMBER") | Some("COLLABORATOR")
+    )
+}
+
+fn finished_workspace_path<'a>(
+    live_workspace_path: Option<&'a Path>,
+    fallback_workspace_path: &'a Path,
+) -> &'a Path {
+    live_workspace_path.unwrap_or(fallback_workspace_path)
+}
+
+fn parse_human_input_answer(
+    request: &HumanInputRequest,
+    comment: &RestIssueComment,
+) -> Option<Vec<HumanInputAnswer>> {
+    let mut lines = comment
+        .body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("```"));
+
+    let command = lines.next()?;
+    if command != format!("/kairastra answer {}", request.request_id) {
+        return None;
+    }
+
+    let fields = lines
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            Some((key.trim().to_string(), value.trim().to_string()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut answers = Vec::with_capacity(request.questions.len());
+    for question in &request.questions {
+        let raw_answer = fields.get(&question.id)?.trim();
+        let selected_option = if question.options.is_empty() {
+            Some(raw_answer.to_string())
+        } else {
+            resolve_human_input_option(question, raw_answer)?
+        };
+        let other_text = fields
+            .get(&format!("{}_other", question.id))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        answers.push(HumanInputAnswer {
+            question_id: question.id.clone(),
+            selected_option,
+            other_text,
+        });
+    }
+
+    Some(answers)
+}
+
+fn resolve_human_input_option(
+    question: &crate::model::HumanInputQuestion,
+    raw_answer: &str,
+) -> Option<Option<String>> {
+    for (index, option) in question.options.iter().enumerate() {
+        if raw_answer.eq_ignore_ascii_case(&human_input_option_code(index))
+            || raw_answer == (index + 1).to_string()
+            || raw_answer.eq_ignore_ascii_case(option.label.as_str())
+        {
+            return Some(Some(option.label.clone()));
+        }
+    }
+
+    None
+}
+
+fn human_input_option_code(index: usize) -> String {
+    let mut n = index + 1;
+    let mut code = String::new();
+    while n > 0 {
+        let remainder = (n - 1) % 26;
+        code.insert(0, (b'A' + remainder as u8) as char);
+        n = (n - 1) / 26;
+    }
+    code
 }
 
 fn tool_log_fields(payload: &JsonValue) -> (Option<&str>, Option<&str>) {
@@ -1373,6 +1726,7 @@ fn agent_event_name(event: &AgentEventKind) -> &'static str {
         AgentEventKind::ToolCallCompleted => "tool_call_completed",
         AgentEventKind::ToolCallFailed => "tool_call_failed",
         AgentEventKind::UnsupportedToolCall => "unsupported_tool_call",
+        AgentEventKind::UserInputRequested => "user_input_requested",
         AgentEventKind::ToolInputAutoAnswered => "tool_input_auto_answered",
         AgentEventKind::Malformed => "malformed",
         AgentEventKind::OtherMessage => "other_message",
@@ -2115,6 +2469,13 @@ fn clear_blocked_claim(state: &mut RuntimeState, issue_id: &str) {
     state.claimed.remove(issue_id);
 }
 
+fn resolve_human_input_request(
+    explicit_request: Option<HumanInputRequest>,
+    cached_request: Option<HumanInputRequest>,
+) -> Option<HumanInputRequest> {
+    explicit_request.or(cached_request)
+}
+
 fn should_release_blocked_claim(settings: &Settings, previous_state: &str, issue: &Issue) -> bool {
     !settings.active_state(&issue.state) || normalize_issue_state(&issue.state) != previous_state
 }
@@ -2180,13 +2541,19 @@ mod tests {
 
     use crate::agent::events::{AgentEvent, AgentEventKind};
     use crate::config::Settings;
-    use crate::model::{BlockerRef, Issue, WorkflowDefinition};
+    use crate::github::{RestIssueComment, RestIssueCommentUser};
+    use crate::model::{
+        BlockerRef, HumanInputOption, HumanInputQuestion, HumanInputRequest, Issue,
+        WorkflowDefinition,
+    };
 
     use super::{
         classify_blocked_worker_failure, classify_provider_selection_block,
         codex_item_failure_is_expected_probe, extract_codex_command, extract_rate_limits,
-        extract_token_usage, hold_blocked_claim, issue_eligible, issue_provider, issue_sort_key,
-        merge_blocker_section, render_blocked_failure_workpad, select_dispatchable,
+        extract_token_usage, find_human_input_answer, finished_workspace_path, hold_blocked_claim,
+        issue_eligible, issue_provider, issue_sort_key, merge_blocker_section,
+        parse_human_input_answer, render_blocked_failure_workpad,
+        render_human_input_prompt_comment, resolve_human_input_request, select_dispatchable,
         should_release_blocked_claim, summarize_agent_event, summarize_idle_dispatch,
         summarize_worker_error, tool_log_fields, truncate_summary, usage_delta,
         IssueProviderSelection, RuntimeState, TokenUsage, BLOCKER_SECTION_END,
@@ -2333,6 +2700,50 @@ providers:
             workpad_comment_id: None,
             workpad_comment_url: None,
             workpad_comment_body: None,
+        }
+    }
+
+    fn human_input_request() -> HumanInputRequest {
+        HumanInputRequest {
+            request_id: "input-123".to_string(),
+            provider: "codex".to_string(),
+            issue_id: "1".to_string(),
+            issue_identifier: "openai/repo#1".to_string(),
+            session_id: Some("thread-1-turn-1".to_string()),
+            requested_at: chrono::Utc::now(),
+            questions: vec![HumanInputQuestion {
+                id: "scope".to_string(),
+                header: Some("Scope".to_string()),
+                question: "What scope should we implement?".to_string(),
+                options: vec![
+                    HumanInputOption {
+                        label: "Core only".to_string(),
+                        description: Some("Ship the minimum path.".to_string()),
+                        is_other: false,
+                    },
+                    HumanInputOption {
+                        label: "Full flow".to_string(),
+                        description: Some("Include all related plumbing.".to_string()),
+                        is_other: true,
+                    },
+                ],
+            }],
+        }
+    }
+
+    fn answer_comment(body: &str, association: &str, id: u64) -> RestIssueComment {
+        RestIssueComment {
+            id,
+            body: body.to_string(),
+            html_url: Some(format!(
+                "https://github.com/openai/repo/issues/1#issuecomment-{id}"
+            )),
+            user: Some(RestIssueCommentUser {
+                login: Some("dbachko".to_string()),
+            }),
+            author_association: Some(association.to_string()),
+            created_at: None,
+            updated_at: None,
         }
     }
 
@@ -2595,6 +3006,118 @@ providers:
         let summary = summarize_worker_error(&error);
         assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
         assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn renders_human_input_prompt_comment_with_template() {
+        let rendered = render_human_input_prompt_comment(&human_input_request());
+        assert!(rendered.contains("/kairastra answer input-123"));
+        assert!(rendered.contains("scope: <option>"));
+        assert!(rendered.contains("scope_other: <free text>"));
+        assert!(rendered.contains("A. `Core only`"));
+        assert!(rendered.contains("B. `Full flow`"));
+    }
+
+    #[test]
+    fn renders_human_input_prompt_with_answer_placeholder_for_free_text() {
+        let mut request = human_input_request();
+        request.questions[0].options.clear();
+
+        let rendered = render_human_input_prompt_comment(&request);
+
+        assert!(rendered.contains("scope: <answer>"));
+        assert!(!rendered.contains("scope: <option>"));
+    }
+
+    #[test]
+    fn parses_human_input_answer_comment() {
+        let request = human_input_request();
+        let comment = answer_comment(
+            "/kairastra answer input-123\nscope: B\nscope_other: include migrations",
+            "MEMBER",
+            17,
+        );
+
+        let answers = parse_human_input_answer(&request, &comment).expect("answer should parse");
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].question_id, "scope");
+        assert_eq!(answers[0].selected_option.as_deref(), Some("Full flow"));
+        assert_eq!(answers[0].other_text.as_deref(), Some("include migrations"));
+    }
+
+    #[test]
+    fn parses_human_input_answer_inside_fenced_block() {
+        let request = human_input_request();
+        let comment = answer_comment(
+            "```text\n/kairastra answer input-123\nscope: A\n```",
+            "MEMBER",
+            17,
+        );
+
+        let answers = parse_human_input_answer(&request, &comment).expect("answer should parse");
+        assert_eq!(answers[0].selected_option.as_deref(), Some("Core only"));
+    }
+
+    #[test]
+    fn human_input_options_support_more_than_three_choices() {
+        let mut request = human_input_request();
+        request.questions[0].options.extend([
+            HumanInputOption {
+                label: "Docs only".to_string(),
+                description: None,
+                is_other: false,
+            },
+            HumanInputOption {
+                label: "Full product".to_string(),
+                description: None,
+                is_other: false,
+            },
+        ]);
+
+        let rendered = render_human_input_prompt_comment(&request);
+        assert!(rendered.contains("D. `Full product`"));
+
+        let comment = answer_comment("/kairastra answer input-123\nscope: D", "MEMBER", 17);
+        let answers = parse_human_input_answer(&request, &comment).expect("answer should parse");
+        assert_eq!(answers[0].selected_option.as_deref(), Some("Full product"));
+
+        let comment = answer_comment("/kairastra answer input-123\nscope: 4", "MEMBER", 18);
+        let answers = parse_human_input_answer(&request, &comment).expect("answer should parse");
+        assert_eq!(answers[0].selected_option.as_deref(), Some("Full product"));
+    }
+
+    #[test]
+    fn finished_workspace_path_prefers_live_runtime_path() {
+        let live = PathBuf::from("/tmp/live-workspace");
+        let fallback = PathBuf::from("/tmp/spawn-hint");
+
+        assert_eq!(
+            finished_workspace_path(Some(&live), &fallback),
+            live.as_path()
+        );
+        assert_eq!(finished_workspace_path(None, &fallback), fallback.as_path());
+    }
+
+    #[test]
+    fn ignores_unauthorized_human_input_comments() {
+        let request = human_input_request();
+        let authorized = answer_comment("/kairastra answer input-123\nscope: A", "OWNER", 17);
+        let unauthorized =
+            answer_comment("/kairastra answer input-123\nscope: B", "CONTRIBUTOR", 18);
+
+        let selected = find_human_input_answer(&request, &[authorized.clone(), unauthorized]);
+        assert_eq!(selected.expect("authorized answer should win").0.id, 17);
+    }
+
+    #[test]
+    fn explicit_human_input_request_wins_over_cached_request() {
+        let explicit = human_input_request();
+        let mut cached = human_input_request();
+        cached.request_id = "input-stale".to_string();
+
+        let resolved = resolve_human_input_request(Some(explicit.clone()), Some(cached))
+            .expect("request should resolve");
+        assert_eq!(resolved.request_id, explicit.request_id);
     }
 
     #[test]

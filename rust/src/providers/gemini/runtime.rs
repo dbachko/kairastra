@@ -755,15 +755,14 @@ printf '%s\n' '{"type":"result","status":"success","stats":{"total_tokens":7}}'
                 AgentEventKind::SessionStarted => saw_session_started = true,
                 AgentEventKind::ToolCallCompleted => saw_tool_complete = true,
                 AgentEventKind::TurnCompleted => saw_turn_complete = true,
-                AgentEventKind::Notification => {
+                AgentEventKind::Notification
                     if event
                         .payload
                         .get("message")
                         .and_then(|value| value.as_str())
-                        == Some("Loaded cached credentials.")
-                    {
-                        saw_preamble_notification = true;
-                    }
+                        == Some("Loaded cached credentials.") =>
+                {
+                    saw_preamble_notification = true;
                 }
                 _ => {}
             }

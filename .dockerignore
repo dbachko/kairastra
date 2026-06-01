@@ -1,5 +1,7 @@
 .git
-.github
+.github/*
+!.github/
+!.github/pull_request_template.md
 **/target
 elixir/_build
 elixir/deps

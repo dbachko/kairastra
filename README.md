@@ -101,7 +101,7 @@ You are set up correctly when all of these are true:
 | --- | --- |
 | `krstr run` | Start the orchestrator loop using repo-root `WORKFLOW.md` by default. |
 | `krstr run --once` | Run one dispatch pass and wait for started workers before exit. |
-| `krstr setup` | Generate repo-root `WORKFLOW.md`, `.kairastra/kairastra.env`, add `.kairastra/` to `.gitignore`, sync required `.agents/skills/` workflow skills into the repo with confirmation, scaffold repo support dirs, and optionally bootstrap GitHub metadata. |
+| `krstr setup` | Generate repo-root `WORKFLOW.md`, `.kairastra/provider-settings.json`, `.kairastra/kairastra.env`, add `.kairastra/` to `.gitignore`, sync required `.agents/skills/` workflow skills into the repo with confirmation, scaffold repo support dirs, and optionally bootstrap GitHub metadata. |
 | `krstr setup --reconfigure` | Re-run setup and overwrite the generated local Kairastra files for the current repo. |
 | `krstr doctor` | Validate workflow, GitHub connectivity, local commands, auth state, and GitHub metadata readiness. |
 | `krstr auth status` | Show provider auth status. |
@@ -120,6 +120,8 @@ You are set up correctly when all of these are true:
 - `krstr setup` writes operator files under `.kairastra/` by default.
 - The generated repo-root `WORKFLOW.md` keeps setup-specific front matter and uses the canonical prompt body from the repo root template.
 - The runtime reads `WORKFLOW.md` directly from the host filesystem.
+- `.kairastra/provider-settings.json` stores compact provider defaults such as model, reasoning,
+  and autonomy settings for `codex`, `claude`, and `gemini`.
 - The generated env file keeps machine-specific settings and secrets outside the workflow file.
 
 Use [docs/workflow-reference.md](docs/workflow-reference.md) for the schema and operational rules.

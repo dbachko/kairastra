@@ -40,3 +40,92 @@ pub struct WorkflowDefinition {
     pub config: serde_yaml::Value,
     pub prompt_template: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HumanInputOption {
+    pub label: String,
+    pub description: Option<String>,
+    #[serde(default, alias = "isOther")]
+    pub is_other: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HumanInputQuestion {
+    pub id: String,
+    pub header: Option<String>,
+    pub question: String,
+    pub options: Vec<HumanInputOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HumanInputAnswer {
+    pub question_id: String,
+    pub selected_option: Option<String>,
+    pub other_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingHumanInputStatus {
+    AwaitingAnswer,
+    Answered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HumanInputRequest {
+    pub request_id: String,
+    pub provider: String,
+    pub issue_id: String,
+    pub issue_identifier: String,
+    pub session_id: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    pub questions: Vec<HumanInputQuestion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingHumanInput {
+    pub request: HumanInputRequest,
+    pub status: PendingHumanInputStatus,
+    pub prompt_comment_id: Option<u64>,
+    pub prompt_comment_url: Option<String>,
+    pub answered_comment_id: Option<u64>,
+    pub answered_by_login: Option<String>,
+    pub answered_at: Option<DateTime<Utc>>,
+    pub answers: Vec<HumanInputAnswer>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HumanInputRequest, PendingHumanInputStatus};
+
+    #[test]
+    fn human_input_option_accepts_provider_camel_case_other_flag() {
+        let request: HumanInputRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "input-123",
+            "provider": "codex",
+            "issue_id": "issue-1",
+            "issue_identifier": "openai/kairastra#1",
+            "session_id": "thread-1-turn-1",
+            "requested_at": "2026-06-01T00:00:00Z",
+            "questions": [{
+                "id": "scope",
+                "header": "Scope",
+                "question": "Pick a scope",
+                "options": [{
+                    "label": "Other",
+                    "description": "Free text",
+                    "isOther": true
+                }]
+            }]
+        }))
+        .expect("provider payload should deserialize");
+
+        assert!(request.questions[0].options[0].is_other);
+    }
+
+    #[test]
+    fn pending_human_input_status_keeps_snake_case_serialization() {
+        let encoded = serde_json::to_string(&PendingHumanInputStatus::AwaitingAnswer).unwrap();
+        assert_eq!(encoded, "\"awaiting_answer\"");
+    }
+}

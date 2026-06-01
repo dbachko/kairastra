@@ -1,7 +1,24 @@
-.PHONY: docker-bootstrap-local docker-bootstrap-local-logs
+.PHONY: install fmt fmt-check test clippy ci audit docker-build
 
-docker-bootstrap-local:
-	$(MAKE) -C rust docker-bootstrap-local
+install:
+	./install.sh
 
-docker-bootstrap-local-logs:
-	$(MAKE) -C rust docker-bootstrap-local-logs
+fmt:
+	cd rust && cargo fmt
+
+fmt-check:
+	cd rust && cargo fmt --check
+
+test:
+	cd rust && cargo test
+
+clippy:
+	cd rust && cargo clippy --all-targets --all-features -- -D warnings
+
+ci: fmt-check test clippy
+
+audit:
+	bash scripts/public-readiness-audit.sh
+
+docker-build:
+	docker build -f rust/Dockerfile -t kairastra:local .
