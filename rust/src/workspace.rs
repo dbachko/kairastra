@@ -18,6 +18,73 @@ const DEFAULT_PNPM_HOME: &str = "/tmp/kairastra/pnpm";
 const DEFAULT_NPM_CONFIG_CACHE: &str = "/tmp/kairastra/npm-cache";
 const KAIRASTRA_STATE_DIR: &str = ".kairastra";
 const PENDING_HUMAN_INPUT_FILE: &str = "pending-input.json";
+const PROVIDER_LEASE_FILE: &str = "provider-lease";
+
+pub(crate) struct ProviderLease {
+    path: PathBuf,
+    identity: String,
+}
+
+impl ProviderLease {
+    pub(crate) fn acquire(workspace: &Path) -> Result<Self> {
+        ensure_workspace_idle(workspace)?;
+        let state_dir = workspace.join(KAIRASTRA_STATE_DIR);
+        fs::create_dir_all(&state_dir)?;
+        let path = state_dir.join(PROVIDER_LEASE_FILE);
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|error| anyhow!("failed to create provider lease: {error}"))?;
+        let identity = format!("pid={} lease={random:02x?}\n", std::process::id());
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .context("workspace preserved: cannot acquire provider lease")?;
+        file.write_all(identity.as_bytes())?;
+        file.sync_all()?;
+        sync_directory(&state_dir)?;
+        sync_directory(workspace)?;
+        Ok(Self { path, identity })
+    }
+
+    pub(crate) fn release(self) -> Result<()> {
+        if fs::read(&self.path)? != self.identity.as_bytes() {
+            return Err(anyhow!(
+                "workspace preserved: provider lease identity changed"
+            ));
+        }
+        fs::remove_file(&self.path)?;
+        sync_directory(self.path.parent().expect("provider lease has a parent"))?;
+        Ok(())
+    }
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+pub(crate) fn ensure_workspace_idle(workspace: &Path) -> Result<()> {
+    let path = workspace
+        .join(KAIRASTRA_STATE_DIR)
+        .join(PROVIDER_LEASE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Err(anyhow!(
+            "workspace_quarantined: workspace preserved while provider cleanup is pending: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("workspace preserved: cannot verify provider cleanup"),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -103,7 +170,8 @@ pub fn write_pending_human_input(workspace: &Path, pending: &PendingHumanInput) 
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, &path)
+        fs::rename(&temporary, &path)?;
+        sync_directory(path.parent().expect("pending state has a parent"))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -116,7 +184,9 @@ pub fn clear_pending_human_input(workspace: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    sync_directory(path.parent().expect("pending state has a parent"))?;
+    Ok(())
 }
 
 pub async fn ensure_workspace(settings: &Settings, issue: &Issue) -> Result<Workspace> {
@@ -124,6 +194,9 @@ pub async fn ensure_workspace(settings: &Settings, issue: &Issue) -> Result<Work
     let workspace_key = sanitize_workspace_key(&issue.identifier);
     let path = root.join(&workspace_key);
     validate_workspace_path(&root, &path)?;
+    if path.is_dir() {
+        ensure_workspace_idle(&path)?;
+    }
 
     let created_now = if path.exists() {
         if path.is_dir() {
@@ -178,6 +251,7 @@ pub async fn run_after_run_hook(
     issue: &Issue,
 ) -> Result<()> {
     if let Some(script) = settings.hooks.after_run.as_deref() {
+        ensure_workspace_idle(workspace)?;
         run_hook(settings, "after_run", script, workspace, issue).await?;
     }
     Ok(())
@@ -191,6 +265,7 @@ pub async fn remove_issue_workspace(settings: &Settings, identifier: &str) -> Re
     }
 
     validate_workspace_path(&root, &workspace)?;
+    ensure_workspace_idle(&workspace)?;
 
     if let Some(script) = settings.hooks.before_remove.as_deref() {
         let synthetic_issue = Issue {

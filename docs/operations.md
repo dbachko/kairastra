@@ -52,6 +52,13 @@ Cleanup preserves a workspace with those rules still present and reports
 `managed_worktree_legacy_exclusions`; run the regenerated hooks or remove the legacy rules
 before retrying cleanup. Newly visible uncommitted files continue to block deletion.
 
+Claude and Gemini attempts keep a `.kairastra/provider-lease` file until the provider exits
+and its input/output handlers finish. A cleanup timeout returns promptly while the runtime
+continues waiting in the background. The lease blocks workspace reuse, removal, and
+`after_run` hooks until inherited stderr closes. If the daemon stops or stderr cleanup fails
+before this can be verified, the lease remains. Stop the daemon, verify that no provider or
+descendant still uses the workspace, and remove only the stale lease before retrying.
+
 - One runtime does not manage multiple repositories.
 - The current implementation targets local workers only.
 - The operator UX is terminal-first; there is no web onboarding flow here.

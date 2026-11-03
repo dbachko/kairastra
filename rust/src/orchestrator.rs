@@ -13,7 +13,7 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::agent::{AgentEvent, AgentEventKind};
-use crate::config::{normalize_issue_state, ProviderId, Settings};
+use crate::config::{normalize_issue_state, ProviderId, Settings, TrackerSettings};
 use crate::github::{is_rate_limited_error, GitHubTracker, RestIssueComment, Tracker};
 use crate::model::{
     HumanInputAnswer, HumanInputRequest, Issue, PendingHumanInput, PendingHumanInputStatus,
@@ -149,18 +149,10 @@ impl Orchestrator {
             log_runtime_error("initial poll", &error);
         }
 
-        let mut poll_interval = Duration::from_millis(snapshot.settings.polling.interval_ms);
-        let mut next_poll = tokio::time::Instant::now() + poll_interval;
+        let mut next_poll = tokio::time::Instant::now()
+            + Duration::from_millis(snapshot.settings.polling.interval_ms);
+        let mut last_rejected = None;
         loop {
-            let candidate = self.workflow_store.current()?;
-            if let Err(error) = runtime.apply_snapshot(&mut snapshot, candidate) {
-                warn!(error = ?error, "workflow reload rejected; keeping the previous runtime configuration");
-            }
-            let configured_interval = Duration::from_millis(snapshot.settings.polling.interval_ms);
-            if configured_interval != poll_interval {
-                poll_interval = configured_interval;
-                next_poll = tokio::time::Instant::now() + poll_interval;
-            }
             let retry_wait = next_retry_wait(&state);
 
             tokio::select! {
@@ -184,11 +176,37 @@ impl Orchestrator {
                     }
                 }
                 _ = tokio::time::sleep_until(next_poll) => {
+                    let candidate = self.workflow_store.current()?;
+                    if let Some(error) = runtime.apply_reload(&mut snapshot, candidate, &mut last_rejected) {
+                        warn!(error = ?error, "workflow reload rejected; keeping the previous runtime configuration");
+                    }
                     if let Err(error) = runtime.poll_tick(&snapshot, &mut state, &worker_tx).await {
                         log_runtime_error("poll tick", &error);
                     }
-                    next_poll = tokio::time::Instant::now() + poll_interval;
+                    next_poll = tokio::time::Instant::now()
+                        + Duration::from_millis(snapshot.settings.polling.interval_ms);
                 }
+            }
+        }
+    }
+
+    fn apply_reload(
+        &mut self,
+        current: &mut WorkflowSnapshot,
+        candidate: WorkflowSnapshot,
+        last_rejected: &mut Option<TrackerSettings>,
+    ) -> Option<anyhow::Error> {
+        let tracker = candidate.settings.tracker.clone();
+        match self.apply_snapshot(current, candidate) {
+            Ok(()) => {
+                *last_rejected = None;
+                None
+            }
+            Err(error) => {
+                let changed = last_rejected.as_ref() != Some(&tracker);
+                // Keep the identity private: tracker settings include credentials.
+                *last_rejected = Some(tracker);
+                changed.then_some(error)
             }
         }
     }
@@ -439,7 +457,7 @@ impl Orchestrator {
                         .retry_attempts
                         .get_mut(&issue_id)
                         .expect("retry still queued")
-                        .due_at = Instant::now() + Duration::from_secs(1);
+                        .due_at = Instant::now() + capacity_retry_wait(snapshot);
                 }
                 Ok(false) => {
                     state.retry_attempts.remove(&issue_id);
@@ -2119,6 +2137,10 @@ fn next_retry_wait(state: &RuntimeState) -> Duration {
         .unwrap_or_else(|| Duration::from_secs(3600))
 }
 
+fn capacity_retry_wait(snapshot: &WorkflowSnapshot) -> Duration {
+    Duration::from_millis(snapshot.settings.polling.interval_ms.max(1_000))
+}
+
 fn schedule_retry(
     settings: &Settings,
     state: &mut RuntimeState,
@@ -3227,6 +3249,33 @@ providers:
         assert_eq!(runtime.tracker.settings(), &previous);
     }
 
+    #[tokio::test]
+    async fn repeated_rejected_reload_warns_only_when_tracker_changes() {
+        let mut current = snapshot();
+        let mut runtime = orchestrator_for(&current);
+        let mut rejected = None;
+        let mut candidate = current.clone();
+        candidate.settings.tracker.repo = Some("changed-scope".into());
+        assert!(runtime
+            .apply_reload(&mut current, candidate.clone(), &mut rejected)
+            .is_some());
+        assert!(runtime
+            .apply_reload(&mut current, candidate.clone(), &mut rejected)
+            .is_none());
+        candidate.settings.tracker.api_key = "changed-test-token".into();
+        assert!(runtime
+            .apply_reload(&mut current, candidate.clone(), &mut rejected)
+            .is_some());
+        let accepted = current.clone();
+        assert!(runtime
+            .apply_reload(&mut current, accepted, &mut rejected)
+            .is_none());
+        assert!(rejected.is_none());
+        assert!(runtime
+            .apply_reload(&mut current, candidate, &mut rejected)
+            .is_some());
+    }
+
     #[test]
     fn human_review_is_not_dispatchable_when_not_active() {
         let snapshot = snapshot();
@@ -3866,6 +3915,7 @@ providers:
                 .mount(&server)
                 .await;
             let mut snapshot = snapshot();
+            snapshot.settings.polling.interval_ms = 90_000;
             snapshot.settings.tracker.mode = crate::config::GitHubMode::IssuesOnly;
             snapshot.settings.tracker.repo = Some("kairastra".into());
             snapshot.settings.tracker.rest_endpoint = server.uri();
@@ -3896,7 +3946,20 @@ providers:
                 assert!(!state.retry_attempts.contains_key("1"));
             } else {
                 assert_eq!(state.retry_attempts["1"].attempt, 4);
-                assert!(state.retry_attempts["1"].due_at > std::time::Instant::now());
+                assert!(
+                    state.retry_attempts["1"].due_at
+                        > std::time::Instant::now() + std::time::Duration::from_secs(89)
+                );
+                let requests = server.received_requests().await.unwrap().len();
+                orchestrator_for(&snapshot)
+                    .dispatch_due_retries(&snapshot, &mut state, &tx)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    server.received_requests().await.unwrap().len(),
+                    requests,
+                    "capacity wait must not refetch tracker data before the polling interval"
+                );
             }
         }
     }

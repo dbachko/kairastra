@@ -107,21 +107,22 @@ impl GeminiSession {
             .kill_on_drop(true);
 
         debug!(issue_identifier = %issue.identifier, argv = ?argv, "launching Gemini");
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("failed to launch Gemini CLI for {}", issue.identifier))?;
-        self.last_process_id = child.id();
-        debug!(issue_identifier = %issue.identifier, pid = ?child.id(), "Gemini process spawned");
+        let mut child =
+            crate::providers::process::ProviderProcess::spawn(&mut command, &self.workspace)
+                .with_context(|| format!("failed to launch Gemini CLI for {}", issue.identifier))?;
+        self.last_process_id = child.child_mut().id();
+        debug!(issue_identifier = %issue.identifier, pid = ?child.child_mut().id(), "Gemini process spawned");
+
+        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+        if let Some(stderr) = child.child_mut().stderr.take() {
+            child.track_stderr(tokio::spawn(log_stderr(stderr, Arc::clone(&stderr_lines))));
+        }
 
         let stdout = child
+            .child_mut()
             .stdout
             .take()
             .ok_or_else(|| anyhow!("missing_gemini_stdout"))?;
-        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
-        let stderr_logger = child.stderr.take().map(|stderr| {
-            let stderr_lines = Arc::clone(&stderr_lines);
-            tokio::spawn(log_stderr(stderr, stderr_lines))
-        });
 
         let result = self
             .await_turn_completion(BufReader::new(stdout).lines(), &turn_id, on_event)
@@ -135,7 +136,7 @@ impl GeminiSession {
             }
         });
         if let Some(reason) = timeout_reason {
-            child.start_kill().ok();
+            child.child_mut().start_kill().ok();
             emit_event(
                 on_event,
                 AgentEventKind::TurnEndedWithError,
@@ -149,11 +150,16 @@ impl GeminiSession {
         }
 
         let grace = crate::providers::process::shutdown_grace(self.config.turn_timeout_ms);
-        let status = crate::providers::process::wait_for_exit(&mut child, grace).await;
-        if let Some(task) = stderr_logger {
-            crate::providers::process::drain_task(task, grace).await?;
-        }
-        let status = status.context("failed to finish Gemini turn")?;
+        let completion = match child.finish(grace).await {
+            Ok(completion) => completion,
+            Err(cleanup) => {
+                return Err(match result {
+                    Err(turn) => anyhow!("{turn:#}; cleanup={cleanup:#}"),
+                    Ok(_) => cleanup.context("failed to finish Gemini turn"),
+                });
+            }
+        };
+        let status = completion.status;
         debug!(issue_identifier = %issue.identifier, exit_status = %status, "Gemini process exited");
         let stderr_summary = summarize_stderr(&stderr_lines);
 
@@ -567,9 +573,13 @@ fn emit_event(
     });
 }
 
-async fn log_stderr(stderr: ChildStderr, captured_lines: Arc<Mutex<Vec<String>>>) {
+async fn log_stderr(stderr: ChildStderr, captured_lines: Arc<Mutex<Vec<String>>>) -> Result<()> {
     let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .context("failed to read provider stderr")?
+    {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -582,6 +592,7 @@ async fn log_stderr(stderr: ChildStderr, captured_lines: Arc<Mutex<Vec<String>>>
         }
         warn!(provider = "gemini", stderr = trimmed, "Gemini stderr");
     }
+    Ok(())
 }
 
 fn summarize_stderr(captured_lines: &Arc<Mutex<Vec<String>>>) -> Option<String> {
@@ -872,5 +883,52 @@ exec sleep 20
             format!("{error:#}").contains("provider_shutdown_timeout"),
             "{error:#}"
         );
+    }
+    #[tokio::test]
+    async fn cleanup_timeout_preserves_primary_turn_error_and_workspace() {
+        use crate::providers::process::tests::ReleaseOnDrop;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("workspaces");
+        let workspace = root.join("ISSUE-CLEANUP");
+        fs::create_dir_all(&workspace).unwrap();
+        let release = ReleaseOnDrop(workspace.join("release"));
+        let script = dir.path().join("failed-turn-descendant.sh");
+        fs::write(&script, r#"#!/bin/sh
+(while [ ! -f release ] && [ -d .kairastra ]; do sleep 0.02; done; printf late > descendant-finished) &
+printf '%s\n' '{"type":"result","status":"error","session_id":"failed-turn","error":"primary turn failure"}'
+exit 0
+"#).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let settings = settings_with_command(
+            &root,
+            script.to_str().unwrap(),
+            "turn_timeout_ms: 10000\nstall_timeout_ms: 10000",
+        );
+        let mut session = GeminiSession::start(&settings, "fake", &workspace).unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            session.run_turn(&issue("ISSUE-CLEANUP"), "prompt", &tx),
+        )
+        .await
+        .expect("cleanup must be bounded")
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.starts_with("primary turn failure"), "{message}");
+        assert!(
+            message.contains("provider_background_task_timeout"),
+            "{message}"
+        );
+        assert!(crate::workspace::ensure_workspace_idle(&workspace).is_err());
+        drop(release);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while crate::workspace::ensure_workspace_idle(&workspace).is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("lease must release after the inherited stderr pipe closes");
+        assert!(workspace.join("descendant-finished").exists());
     }
 }
