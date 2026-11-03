@@ -52,8 +52,10 @@ Cleanup preserves a workspace with those rules still present and reports
 `managed_worktree_legacy_exclusions`; run the regenerated hooks or remove the legacy rules
 before retrying cleanup. Newly visible uncommitted files continue to block deletion.
 
-Claude and Gemini attempts keep a `.kairastra/provider-lease` file until the provider exits
-and its input/output handlers finish. A cleanup timeout returns promptly while the runtime
+Claude and Gemini attempts keep a lease under
+`<workspace-root>/.kairastra-provider-leases/<workspace-path-hash>`, outside the checkout,
+until the provider exits and its input/output handlers finish. Git cleanup cannot remove
+the lease from inside the checkout. A cleanup timeout returns promptly while the runtime
 continues waiting in the background. The lease blocks workspace reuse, removal, and
 `after_run` hooks until inherited stderr closes. If the daemon stops or stderr cleanup fails
 before this can be verified, the lease remains. Stop the daemon, verify that no provider or

@@ -22,6 +22,8 @@ const GITHUB_READ_MAX_ATTEMPTS: u32 = 3;
 const GITHUB_READ_RETRY_BASE_DELAY_MS: u64 = 250;
 const GITHUB_PAGE_SIZE: usize = 100;
 
+// async-trait 0.1.89 adds redundant must_use attributes to boxed futures on Rust 1.99.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Tracker: Send + Sync {
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>>;

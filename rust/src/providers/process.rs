@@ -158,7 +158,7 @@ pub(crate) mod tests {
         let release = ReleaseOnDrop(workspace.join("release"));
         let ending = if parent_exits { "exit 0" } else { "wait" };
         let mut command = Command::new("sh");
-        command.args(["-c", &format!("(while [ ! -f release ] && [ -d .kairastra ]; do sleep 0.02; done; printf late > descendant-finished) & printf ready > ready; {ending}")])
+        command.args(["-c", &format!("(while [ ! -f release ] && [ -d \"$PWD\" ]; do sleep 0.02; done; printf late > descendant-finished) & printf ready > ready; {ending}")])
             .current_dir(workspace).stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
         let mut process = ProviderProcess::spawn(&mut command, workspace).unwrap();
@@ -192,7 +192,21 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("WORK");
         std::fs::create_dir(&workspace).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap()
+            .success());
         let (process, release) = descendant(&workspace, true).await;
+        // A normal repository clean must not erase daemon-owned lease state.
+        assert!(std::process::Command::new("git")
+            .args(["clean", "-fdx"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap()
+            .success());
+        assert!(crate::workspace::ensure_workspace_idle(&workspace).is_err());
         let error = timeout(
             Duration::from_secs(2),
             process.finish(Duration::from_millis(50)),

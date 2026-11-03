@@ -1180,7 +1180,7 @@ exec sleep 20
         let release = ReleaseOnDrop(workspace.join("release"));
         let script = dir.path().join("failed-turn-descendant.sh");
         fs::write(&script, r#"#!/bin/sh
-(while [ ! -f release ] && [ -d .kairastra ]; do sleep 0.02; done; printf late > descendant-finished) &
+(while [ ! -f release ] && [ -d "$PWD" ]; do sleep 0.02; done; printf late > descendant-finished) &
 printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"failed-turn","result":"primary turn failure"}'
 exit 0
 "#).unwrap();

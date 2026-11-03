@@ -18,6 +18,8 @@ pub struct TurnResult {
     pub turn_id: String,
 }
 
+// async-trait 0.1.89 adds redundant must_use attributes to boxed futures on Rust 1.99.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AgentBackend: Send + Sync {
     async fn start_session(
@@ -28,6 +30,8 @@ pub trait AgentBackend: Send + Sync {
     ) -> Result<Box<dyn AgentSession>>;
 }
 
+// async-trait 0.1.89 adds redundant must_use attributes to boxed futures on Rust 1.99.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AgentSession: Send {
     async fn run_turn(

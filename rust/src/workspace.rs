@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::task::spawn_blocking;
 use tokio::time::{timeout, Duration};
@@ -18,7 +19,7 @@ const DEFAULT_PNPM_HOME: &str = "/tmp/kairastra/pnpm";
 const DEFAULT_NPM_CONFIG_CACHE: &str = "/tmp/kairastra/npm-cache";
 const KAIRASTRA_STATE_DIR: &str = ".kairastra";
 const PENDING_HUMAN_INPUT_FILE: &str = "pending-input.json";
-const PROVIDER_LEASE_FILE: &str = "provider-lease";
+const PROVIDER_LEASE_DIR: &str = ".kairastra-provider-leases";
 
 pub(crate) struct ProviderLease {
     path: PathBuf,
@@ -28,9 +29,14 @@ pub(crate) struct ProviderLease {
 impl ProviderLease {
     pub(crate) fn acquire(workspace: &Path) -> Result<Self> {
         ensure_workspace_idle(workspace)?;
-        let state_dir = workspace.join(KAIRASTRA_STATE_DIR);
-        fs::create_dir_all(&state_dir)?;
-        let path = state_dir.join(PROVIDER_LEASE_FILE);
+        let path = provider_lease_path(workspace)?;
+        let state_dir = path.parent().expect("provider lease has a parent");
+        fs::create_dir_all(state_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
+        }
         let mut random = [0u8; 16];
         getrandom::fill(&mut random)
             .map_err(|error| anyhow!("failed to create provider lease: {error}"))?;
@@ -47,8 +53,8 @@ impl ProviderLease {
             .context("workspace preserved: cannot acquire provider lease")?;
         file.write_all(identity.as_bytes())?;
         file.sync_all()?;
-        sync_directory(&state_dir)?;
-        sync_directory(workspace)?;
+        sync_directory(state_dir)?;
+        sync_directory(state_dir.parent().expect("lease directory has a parent"))?;
         Ok(Self { path, identity })
     }
 
@@ -73,9 +79,7 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
 }
 
 pub(crate) fn ensure_workspace_idle(workspace: &Path) -> Result<()> {
-    let path = workspace
-        .join(KAIRASTRA_STATE_DIR)
-        .join(PROVIDER_LEASE_FILE);
+    let path = provider_lease_path(workspace)?;
     match fs::symlink_metadata(&path) {
         Ok(_) => Err(anyhow!(
             "workspace_quarantined: workspace preserved while provider cleanup is pending: {}",
@@ -84,6 +88,27 @@ pub(crate) fn ensure_workspace_idle(workspace: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).context("workspace preserved: cannot verify provider cleanup"),
     }
+}
+
+fn provider_lease_path(workspace: &Path) -> Result<PathBuf> {
+    let identity = if workspace.exists() {
+        workspace.canonicalize()?
+    } else {
+        let parent = workspace
+            .parent()
+            .ok_or_else(|| anyhow!("workspace has no parent"))?
+            .canonicalize()?;
+        parent.join(
+            workspace
+                .file_name()
+                .ok_or_else(|| anyhow!("workspace has no name"))?,
+        )
+    };
+    let parent = identity
+        .parent()
+        .ok_or_else(|| anyhow!("workspace has no parent"))?;
+    let key = Sha256::digest(identity.as_os_str().as_encoded_bytes());
+    Ok(parent.join(PROVIDER_LEASE_DIR).join(format!("{key:x}")))
 }
 
 #[derive(Debug, Clone)]
@@ -171,7 +196,8 @@ pub fn write_pending_human_input(workspace: &Path, pending: &PendingHumanInput) 
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, &path)?;
-        sync_directory(path.parent().expect("pending state has a parent"))
+        sync_directory(path.parent().expect("pending state has a parent"))?;
+        sync_directory(workspace)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -194,9 +220,7 @@ pub async fn ensure_workspace(settings: &Settings, issue: &Issue) -> Result<Work
     let workspace_key = sanitize_workspace_key(&issue.identifier);
     let path = root.join(&workspace_key);
     validate_workspace_path(&root, &path)?;
-    if path.is_dir() {
-        ensure_workspace_idle(&path)?;
-    }
+    ensure_workspace_idle(&path)?;
 
     let created_now = if path.exists() {
         if path.is_dir() {
@@ -260,12 +284,11 @@ pub async fn run_after_run_hook(
 pub async fn remove_issue_workspace(settings: &Settings, identifier: &str) -> Result<()> {
     let root = ensure_workspace_root(&settings.workspace.root)?;
     let workspace = root.join(sanitize_workspace_key(identifier));
+    validate_workspace_path(&root, &workspace)?;
+    ensure_workspace_idle(&workspace)?;
     if !workspace.exists() {
         return Ok(());
     }
-
-    validate_workspace_path(&root, &workspace)?;
-    ensure_workspace_idle(&workspace)?;
 
     if let Some(script) = settings.hooks.before_remove.as_deref() {
         let synthetic_issue = Issue {
@@ -791,6 +814,29 @@ workspace:
             .unwrap_err();
         assert!(error.to_string().contains("workspace preserved"));
         assert_eq!(fs::read_to_string(path).unwrap(), "operator data");
+    }
+
+    #[tokio::test]
+    async fn external_provider_lease_blocks_recreating_a_removed_checkout() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("MT-1");
+        fs::create_dir(&workspace).unwrap();
+        let lease = super::ProviderLease::acquire(&workspace).unwrap();
+        fs::remove_dir(&workspace).expect("lease state must be outside the checkout");
+        let settings = test_settings(dir.path());
+        let error = ensure_workspace(&settings, &issue("MT-1"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("workspace_quarantined"));
+        let error = remove_issue_workspace(&settings, "MT-1").await.unwrap_err();
+        assert!(error.to_string().contains("workspace_quarantined"));
+        lease.release().unwrap();
+        assert!(
+            ensure_workspace(&settings, &issue("MT-1"))
+                .await
+                .unwrap()
+                .created_now
+        );
     }
 
     #[tokio::test]
