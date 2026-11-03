@@ -125,7 +125,7 @@ git log --all --name-only --pretty=format: | sed '/^$/d' | sort -u > "$history_p
 rg -n -i "$path_pattern" "$history_paths_file" > "$history_path_findings_file" || true
 
 log "Scanning working tree for high-confidence secret signatures"
-rg -n -S "$secret_pattern" --glob '!.git/**' > "$working_tree_findings_file" || true
+rg -n -S "$secret_pattern" --glob '!.git/**' . > "$working_tree_findings_file" || true
 
 log "Scanning full history for high-confidence secret signatures"
 git rev-list --all | while read -r commit; do

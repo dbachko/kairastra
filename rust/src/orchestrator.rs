@@ -87,6 +87,7 @@ struct RunningEntry {
     handle: JoinHandle<()>,
 }
 
+#[derive(Clone)]
 struct RetryEntry {
     attempt: u32,
     due_at: Instant,
@@ -112,16 +113,16 @@ impl Orchestrator {
             }
             return Err(error);
         }
-        if let Err(error) = self.poll_tick(&snapshot, &mut state, &worker_tx).await {
-            if is_rate_limited_error(&error) {
-                warn!(error = ?error, "tracker rate limited during run_once poll");
-                return Ok(());
-            }
-            return Err(error);
-        }
-
+        let poll_result = self.poll_tick(&snapshot, &mut state, &worker_tx).await;
         self.drain_workers_until_idle(&snapshot, &mut state, &mut worker_rx)
             .await?;
+        if let Err(error) = poll_result {
+            if is_rate_limited_error(&error) {
+                warn!(error = ?error, "tracker rate limited during run_once poll");
+            } else {
+                return Err(error);
+            }
+        }
 
         if !state.retry_attempts.is_empty() {
             info!(
@@ -137,20 +138,29 @@ impl Orchestrator {
         let (worker_tx, mut worker_rx) = unbounded_channel::<WorkerMessage>();
         let mut state = RuntimeState::default();
 
-        let initial_snapshot = self.workflow_store.current()?;
-        if let Err(error) = self.startup_cleanup(&initial_snapshot).await {
+        let mut snapshot = self.workflow_store.current()?;
+        let mut runtime = Self::new(self.workflow_store.clone(), self.tracker.clone());
+        let candidate = snapshot.clone();
+        runtime.apply_snapshot(&mut snapshot, candidate)?;
+        if let Err(error) = runtime.startup_cleanup(&snapshot).await {
             log_runtime_error("startup cleanup", &error);
         }
-        if let Err(error) = self
-            .poll_tick(&initial_snapshot, &mut state, &worker_tx)
-            .await
-        {
+        if let Err(error) = runtime.poll_tick(&snapshot, &mut state, &worker_tx).await {
             log_runtime_error("initial poll", &error);
         }
 
+        let mut poll_interval = Duration::from_millis(snapshot.settings.polling.interval_ms);
+        let mut next_poll = tokio::time::Instant::now() + poll_interval;
         loop {
-            let snapshot = self.workflow_store.current()?;
-            let poll_interval = Duration::from_millis(snapshot.settings.polling.interval_ms);
+            let candidate = self.workflow_store.current()?;
+            if let Err(error) = runtime.apply_snapshot(&mut snapshot, candidate) {
+                warn!(error = ?error, "workflow reload rejected; keeping the previous runtime configuration");
+            }
+            let configured_interval = Duration::from_millis(snapshot.settings.polling.interval_ms);
+            if configured_interval != poll_interval {
+                poll_interval = configured_interval;
+                next_poll = tokio::time::Instant::now() + poll_interval;
+            }
             let retry_wait = next_retry_wait(&state);
 
             tokio::select! {
@@ -163,23 +173,51 @@ impl Orchestrator {
                 }
                 maybe_message = worker_rx.recv() => {
                     if let Some(message) = maybe_message {
-                        if let Err(error) = self.handle_worker_message(&snapshot, &mut state, message).await {
+                        if let Err(error) = runtime.handle_worker_message(&snapshot, &mut state, message).await {
                             log_runtime_error("worker message handling", &error);
                         }
                     }
                 }
                 _ = sleep(retry_wait) => {
-                    if let Err(error) = self.dispatch_due_retries(&snapshot, &mut state, &worker_tx).await {
+                    if let Err(error) = runtime.dispatch_due_retries(&snapshot, &mut state, &worker_tx).await {
                         log_runtime_error("retry dispatch", &error);
                     }
                 }
-                _ = sleep(poll_interval) => {
-                    if let Err(error) = self.poll_tick(&snapshot, &mut state, &worker_tx).await {
+                _ = tokio::time::sleep_until(next_poll) => {
+                    if let Err(error) = runtime.poll_tick(&snapshot, &mut state, &worker_tx).await {
                         log_runtime_error("poll tick", &error);
                     }
+                    next_poll = tokio::time::Instant::now() + poll_interval;
                 }
             }
         }
+    }
+
+    fn apply_snapshot(
+        &mut self,
+        current: &mut WorkflowSnapshot,
+        candidate: WorkflowSnapshot,
+    ) -> Result<()> {
+        let previous = self.tracker.settings();
+        let next = &candidate.settings.tracker;
+        // Workers retain their tracker. A different repository/project would make
+        // their issue IDs unsafe for the control loop to reconcile.
+        if previous.mode != next.mode
+            || previous.owner != next.owner
+            || previous.repo != next.repo
+            || previous.project_owner != next.project_owner
+            || previous.project_v2_number != next.project_v2_number
+            || previous.project_url != next.project_url
+            || previous.graphql_endpoint != next.graphql_endpoint
+            || previous.rest_endpoint != next.rest_endpoint
+        {
+            anyhow::bail!("tracker scope changes require a restart");
+        }
+        if previous != next {
+            self.tracker = Arc::new(GitHubTracker::new(next.clone())?);
+        }
+        *current = candidate;
+        Ok(())
     }
 
     async fn startup_cleanup(&self, snapshot: &WorkflowSnapshot) -> Result<()> {
@@ -274,7 +312,7 @@ impl Orchestrator {
             }
 
             let Some(issue) = self
-                .revalidate_dispatch_issue(snapshot, state, issue)
+                .revalidate_dispatch_issue(snapshot, state, &issue.id)
                 .await?
             else {
                 continue;
@@ -347,7 +385,7 @@ impl Orchestrator {
             .collect();
 
         for issue_id in due_ids {
-            let Some(retry) = state.retry_attempts.remove(&issue_id) else {
+            let Some(retry) = state.retry_attempts.get(&issue_id).cloned() else {
                 continue;
             };
 
@@ -362,28 +400,65 @@ impl Orchestrator {
                 continue;
             }
 
-            let refreshed = self
-                .tracker
-                .fetch_issue_states_by_ids(std::slice::from_ref(&issue_id))
-                .await?;
-            match refreshed.into_iter().next() {
-                Some(issue) if snapshot.settings.active_state(&issue.state) => {
-                    let _ = self
-                        .spawn_worker(
-                            snapshot.clone(),
-                            state,
-                            worker_tx,
-                            issue,
-                            Some(retry.attempt),
-                        )
-                        .await?;
+            let dispatch = async {
+                let refreshed = self
+                    .tracker
+                    .fetch_issue_states_by_ids(std::slice::from_ref(&issue_id))
+                    .await?;
+                let Some(issue) = refreshed.into_iter().next() else {
+                    return Ok(false);
+                };
+                if snapshot.settings.terminal_state(&issue.state) {
+                    self.cleanup_terminal_issue(snapshot, issue, "retry release")
+                        .await;
+                    return Ok(false);
                 }
-                Some(issue) if snapshot.settings.terminal_state(&issue.state) => {
-                    state.claimed.remove(&issue_id);
-                    self.cleanup_terminal_issue(snapshot, issue, "retry").await;
+                if !issue_meets_dispatch_filters(snapshot, &issue, state, true) {
+                    return Ok(false);
                 }
-                _ => {
-                    state.claimed.remove(&issue_id);
+                if !has_dispatch_capacity(snapshot, &issue, &running_state_counts(state)) {
+                    return Ok(true);
+                }
+                if let Some(issue) = self.validate_dispatch_issue(snapshot, state, issue).await? {
+                    self.spawn_worker(
+                        snapshot.clone(),
+                        state,
+                        worker_tx,
+                        issue,
+                        Some(retry.attempt),
+                    )
+                    .await?;
+                }
+                Ok::<bool, anyhow::Error>(false)
+            }
+            .await;
+            match dispatch {
+                Ok(true) => {
+                    // Keep the attempt and its reservation while capacity is unavailable.
+                    state
+                        .retry_attempts
+                        .get_mut(&issue_id)
+                        .expect("retry still queued")
+                        .due_at = Instant::now() + Duration::from_secs(1);
+                }
+                Ok(false) => {
+                    state.retry_attempts.remove(&issue_id);
+                    if !state.blocked_claims.contains_key(&issue_id)
+                        && !state.running.contains_key(&issue_id)
+                    {
+                        state.claimed.remove(&issue_id);
+                    }
+                }
+                Err(error) => {
+                    schedule_retry(
+                        &snapshot.settings,
+                        state,
+                        issue_id.clone(),
+                        issue_id,
+                        retry.attempt,
+                        false,
+                    );
+                    return Err(error);
                 }
             }
         }
@@ -545,7 +620,7 @@ impl Orchestrator {
         };
         let provider_name = provider.as_str().to_string();
         snapshot.settings.agent.provider = provider;
-        let stall_timeout_ms = providers::stall_timeout_ms(&snapshot.settings)?;
+        let stall_timeout_ms = providers::stall_timeout_ms_for_issue(&snapshot.settings, &issue)?;
         state.claimed.insert(issue.id.clone());
 
         let issue_id = issue.id.clone();
@@ -612,19 +687,26 @@ impl Orchestrator {
         &self,
         snapshot: &WorkflowSnapshot,
         state: &mut RuntimeState,
-        issue: Issue,
+        issue_id: &str,
     ) -> Result<Option<Issue>> {
         let refreshed = self
             .tracker
-            .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
+            .fetch_issue_states_by_ids(&[issue_id.to_string()])
             .await?;
-        let Some(mut issue) = refreshed.into_iter().next() else {
+        let Some(issue) = refreshed.into_iter().next() else {
             return Ok(None);
         };
+        self.validate_dispatch_issue(snapshot, state, issue).await
+    }
 
-        if !snapshot.settings.active_state(&issue.state)
-            || snapshot.settings.terminal_state(&issue.state)
-        {
+    async fn validate_dispatch_issue(
+        &self,
+        snapshot: &WorkflowSnapshot,
+        state: &mut RuntimeState,
+        mut issue: Issue,
+    ) -> Result<Option<Issue>> {
+        let counts = running_state_counts(state);
+        if !issue_eligible_now(snapshot, &issue, state, &counts, true) {
             return Ok(None);
         }
 
@@ -673,6 +755,9 @@ impl Orchestrator {
                 .await?;
         }
 
+        if !issue_eligible_now(snapshot, &issue, state, &running_state_counts(state), true) {
+            return Ok(None);
+        }
         Ok(Some(issue))
     }
 
@@ -958,6 +1043,18 @@ impl Orchestrator {
         workspace_path: &Path,
         request: HumanInputRequest,
     ) -> Result<Issue> {
+        let mut pending = PendingHumanInput {
+            request,
+            status: PendingHumanInputStatus::AwaitingAnswer,
+            resume_transition_applied: false,
+            prompt_comment_id: None,
+            prompt_comment_url: None,
+            answered_comment_id: None,
+            answered_by_login: None,
+            answered_at: None,
+            answers: Vec::new(),
+        };
+        workspace::write_pending_human_input(workspace_path, &pending)?;
         let mut refreshed = self
             .tracker
             .fetch_issue_states_by_ids(&[issue_id.to_string()])
@@ -968,22 +1065,8 @@ impl Orchestrator {
             ));
         };
 
-        let prompt_comment = self
-            .tracker
-            .create_issue_comment(&issue, &render_human_input_prompt_comment(&request))
+        self.ensure_human_input_prompt(&issue, workspace_path, &mut pending)
             .await?;
-
-        let pending = PendingHumanInput {
-            request,
-            status: PendingHumanInputStatus::AwaitingAnswer,
-            prompt_comment_id: Some(prompt_comment.id),
-            prompt_comment_url: prompt_comment.html_url.clone(),
-            answered_comment_id: None,
-            answered_by_login: None,
-            answered_at: None,
-            answers: Vec::new(),
-        };
-        workspace::write_pending_human_input(workspace_path, &pending)?;
 
         if issue.workpad_comment_id.is_some() {
             issue = self.tracker.refresh_workpad_comment(&issue).await?;
@@ -1034,69 +1117,113 @@ impl Orchestrator {
     ) -> Result<Vec<Issue>> {
         let mut reconciled = Vec::with_capacity(issues.len());
 
-        for mut issue in issues {
-            let workspace_path =
-                match workspace::workspace_path(&snapshot.settings, &issue.identifier) {
-                    Ok(path) => path,
-                    Err(_) => {
-                        reconciled.push(issue);
-                        continue;
-                    }
-                };
-
-            let Some(mut pending) = workspace::load_pending_human_input(&workspace_path)? else {
-                reconciled.push(issue);
-                continue;
-            };
-
-            match pending.status {
-                PendingHumanInputStatus::AwaitingAnswer => {
-                    if pending.prompt_comment_id.is_none() {
-                        let prompt_comment = self
-                            .tracker
-                            .create_issue_comment(
-                                &issue,
-                                &render_human_input_prompt_comment(&pending.request),
-                            )
-                            .await?;
-                        pending.prompt_comment_id = Some(prompt_comment.id);
-                        pending.prompt_comment_url = prompt_comment.html_url.clone();
-                        workspace::write_pending_human_input(&workspace_path, &pending)?;
-                    }
-
-                    let comments = self.tracker.list_issue_comments(&issue).await?;
-                    if let Some((comment, answers)) =
-                        find_human_input_answer(&pending.request, &comments)
-                    {
-                        pending.status = PendingHumanInputStatus::Answered;
-                        pending.answered_comment_id = Some(comment.id);
-                        pending.answered_by_login =
-                            comment.user.as_ref().and_then(|user| user.login.clone());
-                        pending.answered_at = comment.updated_at.or(comment.created_at);
-                        pending.answers = answers;
-                        workspace::write_pending_human_input(&workspace_path, &pending)?;
-                        let _ = self
-                            .tracker
-                            .create_issue_comment(&issue, &render_human_input_ack_comment(&pending))
-                            .await;
-                    }
+        for issue in issues {
+            match self
+                .reconcile_pending_human_input(snapshot, state, issue.clone())
+                .await
+            {
+                Ok(issue) => reconciled.push(issue),
+                Err(error) => {
+                    warn!(issue_identifier = %issue.identifier, error = ?error,
+                        "pending input could not be reconciled; preserving state and blocking this issue");
+                    hold_blocked_claim(state, &issue);
+                    reconciled.push(issue);
                 }
-                PendingHumanInputStatus::Answered => {}
             }
+        }
+        Ok(reconciled)
+    }
 
-            if pending.status == PendingHumanInputStatus::Answered {
-                clear_blocked_claim(state, &issue.id);
-                if !snapshot.settings.terminal_state(&issue.state) {
-                    issue = self.tracker.transition_issue_to_in_progress(&issue).await?;
+    async fn ensure_human_input_prompt(
+        &self,
+        issue: &Issue,
+        workspace_path: &Path,
+        pending: &mut PendingHumanInput,
+    ) -> Result<()> {
+        if pending.prompt_comment_id.is_some() {
+            return Ok(());
+        }
+        let body = render_human_input_prompt_comment(&pending.request);
+        let existing = self
+            .tracker
+            .list_issue_comments(issue)
+            .await?
+            .into_iter()
+            .find(|comment| comment.body == body);
+        let comment = match existing {
+            Some(comment) => comment,
+            None => self.tracker.create_issue_comment(issue, &body).await?,
+        };
+        pending.prompt_comment_id = Some(comment.id);
+        pending.prompt_comment_url = comment.html_url;
+        workspace::write_pending_human_input(workspace_path, pending)
+    }
+
+    async fn reconcile_pending_human_input(
+        &self,
+        snapshot: &WorkflowSnapshot,
+        state: &mut RuntimeState,
+        mut issue: Issue,
+    ) -> Result<Issue> {
+        let workspace_path = match workspace::workspace_path(&snapshot.settings, &issue.identifier)
+        {
+            Ok(path) => path,
+            Err(_) => {
+                return Ok(issue);
+            }
+        };
+
+        let Some(mut pending) = workspace::load_pending_human_input(&workspace_path)? else {
+            return Ok(issue);
+        };
+
+        match pending.status {
+            PendingHumanInputStatus::AwaitingAnswer => {
+                self.ensure_human_input_prompt(&issue, &workspace_path, &mut pending)
+                    .await?;
+
+                let comments = self.tracker.list_issue_comments(&issue).await?;
+                if let Some((comment, answers)) =
+                    find_human_input_answer(&pending.request, &comments)
+                {
+                    pending.status = PendingHumanInputStatus::Answered;
+                    pending.answered_comment_id = Some(comment.id);
+                    pending.answered_by_login =
+                        comment.user.as_ref().and_then(|user| user.login.clone());
+                    pending.answered_at = comment.updated_at.or(comment.created_at);
+                    pending.answers = answers;
+                    workspace::write_pending_human_input(&workspace_path, &pending)?;
+                    let _ = self
+                        .tracker
+                        .create_issue_comment(&issue, &render_human_input_ack_comment(&pending))
+                        .await;
                 }
-            } else {
-                hold_blocked_claim(state, &issue);
             }
-
-            reconciled.push(issue);
+            PendingHumanInputStatus::Answered => {}
         }
 
-        Ok(reconciled)
+        if pending.status == PendingHumanInputStatus::Answered {
+            clear_blocked_claim(state, &issue.id);
+            if !pending.resume_transition_applied {
+                if snapshot
+                    .settings
+                    .tracker
+                    .human_review_state
+                    .as_deref()
+                    .is_some_and(|waiting| {
+                        normalize_issue_state(waiting) == normalize_issue_state(&issue.state)
+                    })
+                {
+                    issue = self.tracker.transition_issue_to_in_progress(&issue).await?;
+                }
+                pending.resume_transition_applied = true;
+                workspace::write_pending_human_input(&workspace_path, &pending)?;
+            }
+        } else {
+            hold_blocked_claim(state, &issue);
+        }
+
+        Ok(issue)
     }
 
     async fn persist_issue_blocker(
@@ -1386,7 +1513,7 @@ fn render_human_input_prompt_comment(request: &HumanInputRequest) -> String {
             "<option>"
         };
         body.push_str(&format!("{}: {placeholder}\n", question.id));
-        if question.options.iter().any(|option| option.is_other) {
+        if question.is_other || question.options.iter().any(|option| option.is_other) {
             body.push_str(&format!("{}_other: <free text>\n", question.id));
         }
     }
@@ -1404,6 +1531,12 @@ fn render_human_input_prompt_comment(request: &HumanInputRequest) -> String {
                     body.push_str(" (allows free text)");
                 }
                 body.push('\n');
+            }
+            if question.is_other {
+                body.push_str(&format!(
+                    "- {}. `Other` (allows free text)\n",
+                    human_input_option_code(question.options.len())
+                ));
             }
         }
         body.push('\n');
@@ -1475,10 +1608,20 @@ fn parse_human_input_answer(
         } else {
             resolve_human_input_option(question, raw_answer)?
         };
-        let other_text = fields
+        let mut other_text = fields
             .get(&format!("{}_other", question.id))
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        if question.is_other && selected_option.is_none() {
+            if other_text.is_none()
+                && !raw_answer.eq_ignore_ascii_case("Other")
+                && !raw_answer
+                    .eq_ignore_ascii_case(&human_input_option_code(question.options.len()))
+            {
+                other_text = Some(raw_answer.to_string()).filter(|text| !text.is_empty());
+            }
+            other_text.as_ref()?;
+        }
         answers.push(HumanInputAnswer {
             question_id: question.id.clone(),
             selected_option,
@@ -1502,7 +1645,11 @@ fn resolve_human_input_option(
         }
     }
 
-    None
+    if question.is_other {
+        Some(None)
+    } else {
+        None
+    }
 }
 
 fn human_input_option_code(index: usize) -> String {
@@ -2311,6 +2458,29 @@ fn summarize_idle_dispatch(
     Some(parts.join(" | "))
 }
 
+fn running_state_counts(state: &RuntimeState) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for running in state.running.values() {
+        *counts
+            .entry(normalize_issue_state(&running.issue.state))
+            .or_default() += 1;
+    }
+    counts
+}
+
+fn dispatch_capacity_states(settings: &Settings, issue: &Issue) -> Vec<String> {
+    let mut states = vec![normalize_issue_state(&issue.state)];
+    if settings.claimable_state(&issue.state) {
+        if let Some(target) = settings.tracker.in_progress_state.as_deref() {
+            let target = normalize_issue_state(target);
+            if !states.contains(&target) {
+                states.push(target);
+            }
+        }
+    }
+    states
+}
+
 fn select_dispatchable(
     snapshot: &WorkflowSnapshot,
     issues: &[Issue],
@@ -2333,18 +2503,18 @@ fn select_dispatchable(
 
     let mut accepted = Vec::new();
     for issue in selected {
-        let normalized_state = normalize_issue_state(&issue.state);
-        let used = per_state_counts
-            .get(&normalized_state)
-            .copied()
-            .unwrap_or(0);
-        let allowed = snapshot
-            .settings
-            .max_concurrent_agents_for_state(&issue.state);
-        if used >= allowed {
+        let capacity_states = dispatch_capacity_states(&snapshot.settings, &issue);
+        if capacity_states.iter().any(|state_name| {
+            per_state_counts.get(state_name).copied().unwrap_or(0)
+                >= snapshot
+                    .settings
+                    .max_concurrent_agents_for_state(state_name)
+        }) {
             continue;
         }
-        per_state_counts.insert(normalized_state, used + 1);
+        for state_name in capacity_states {
+            *per_state_counts.entry(state_name).or_default() += 1;
+        }
         accepted.push(issue);
     }
 
@@ -2356,6 +2526,26 @@ fn issue_eligible(
     issue: &Issue,
     state: &RuntimeState,
     per_state_counts: &HashMap<String, usize>,
+) -> bool {
+    issue_eligible_now(snapshot, issue, state, per_state_counts, false)
+}
+
+fn issue_eligible_now(
+    snapshot: &WorkflowSnapshot,
+    issue: &Issue,
+    state: &RuntimeState,
+    per_state_counts: &HashMap<String, usize>,
+    allow_queued_retry: bool,
+) -> bool {
+    issue_meets_dispatch_filters(snapshot, issue, state, allow_queued_retry)
+        && has_dispatch_capacity(snapshot, issue, per_state_counts)
+}
+
+fn issue_meets_dispatch_filters(
+    snapshot: &WorkflowSnapshot,
+    issue: &Issue,
+    state: &RuntimeState,
+    allow_queued_retry: bool,
 ) -> bool {
     if issue.id.trim().is_empty()
         || issue.identifier.trim().is_empty()
@@ -2377,8 +2567,11 @@ fn issue_eligible(
         return false;
     }
 
-    if state.claimed.contains(&issue.id) || state.running.contains_key(&issue.id) {
-        trace!(issue_identifier = %issue.identifier, "skipping: already claimed or running");
+    if state.claimed.contains(&issue.id)
+        || state.running.contains_key(&issue.id)
+        || (!allow_queued_retry && state.retry_attempts.contains_key(&issue.id))
+    {
+        trace!(issue_identifier = %issue.identifier, "skipping: already claimed, running or retrying");
         return false;
     }
 
@@ -2410,23 +2603,22 @@ fn issue_eligible(
         return false;
     }
 
-    let normalized_state = normalize_issue_state(&issue.state);
-    let used = per_state_counts
-        .get(&normalized_state)
-        .copied()
-        .unwrap_or(0);
-    let allowed = snapshot
-        .settings
-        .max_concurrent_agents_for_state(&issue.state);
-    if used >= allowed {
-        trace!(
-            issue_identifier = %issue.identifier,
-            used,
-            allowed,
-            "skipping: concurrency limit reached for state"
-        );
-    }
-    used < allowed
+    true
+}
+
+fn has_dispatch_capacity(
+    snapshot: &WorkflowSnapshot,
+    issue: &Issue,
+    per_state_counts: &HashMap<String, usize>,
+) -> bool {
+    dispatch_capacity_states(&snapshot.settings, issue)
+        .iter()
+        .all(|state_name| {
+            per_state_counts.get(state_name).copied().unwrap_or(0)
+                < snapshot
+                    .settings
+                    .max_concurrent_agents_for_state(state_name)
+        })
 }
 
 fn should_hold_blocked_claim(settings: &Settings, issue: &Issue) -> bool {
@@ -2715,6 +2907,7 @@ providers:
                 id: "scope".to_string(),
                 header: Some("Scope".to_string()),
                 question: "What scope should we implement?".to_string(),
+                is_other: false,
                 options: vec![
                     HumanInputOption {
                         label: "Core only".to_string(),
@@ -2822,6 +3015,216 @@ providers:
         let selected = select_dispatchable(&snapshot, &issues, &state);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "1");
+    }
+
+    #[test]
+    fn claim_selection_reserves_destination_state_capacity() {
+        let mut snapshot = snapshot();
+        snapshot
+            .settings
+            .agent
+            .max_concurrent_agents_by_state
+            .clear();
+        snapshot
+            .settings
+            .agent
+            .max_concurrent_agents_by_state
+            .insert("in progress".into(), 1);
+        let tasks = (1..=4)
+            .map(|id| issue(&id.to_string(), "Todo", None))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            select_dispatchable(&snapshot, &tasks, &RuntimeState::default()).len(),
+            1
+        );
+    }
+
+    fn orchestrator_for(snapshot: &WorkflowSnapshot) -> super::Orchestrator {
+        super::Orchestrator::new(
+            std::sync::Arc::new(crate::workflow::WorkflowStore::new("unused".into())),
+            std::sync::Arc::new(
+                crate::github::GitHubTracker::new(snapshot.settings.tracker.clone()).unwrap(),
+            ),
+        )
+    }
+
+    fn pending_input() -> crate::model::PendingHumanInput {
+        crate::model::PendingHumanInput {
+            request: human_input_request(),
+            status: crate::model::PendingHumanInputStatus::AwaitingAnswer,
+            resume_transition_applied: false,
+            prompt_comment_id: None,
+            prompt_comment_url: None,
+            answered_comment_id: None,
+            answered_by_login: None,
+            answered_at: None,
+            answers: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_pending_input_blocks_only_its_own_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut snapshot = snapshot();
+        snapshot.settings.workspace.root = dir.path().into();
+        let corrupt = issue("1", "In Progress", None);
+        let other = issue("2", "In Progress", None);
+        let workspace =
+            crate::workspace::workspace_path(&snapshot.settings, &corrupt.identifier).unwrap();
+        std::fs::create_dir_all(workspace.join(".kairastra")).unwrap();
+        let path = crate::workspace::pending_human_input_path(&workspace);
+        std::fs::write(&path, "{truncated").unwrap();
+        let mut state = RuntimeState::default();
+        let issues = orchestrator_for(&snapshot)
+            .reconcile_pending_human_inputs(&snapshot, &mut state, vec![corrupt, other])
+            .await
+            .unwrap();
+        let selected = select_dispatchable(&snapshot, &issues, &state);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            ["2"]
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "{truncated");
+    }
+
+    #[tokio::test]
+    async fn answered_input_does_not_reverse_backlog_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut snapshot = snapshot();
+        snapshot.settings.workspace.root = dir.path().into();
+        let task = issue("1", "Backlog", None);
+        let workspace =
+            crate::workspace::workspace_path(&snapshot.settings, &task.identifier).unwrap();
+        let mut pending = pending_input();
+        pending.status = crate::model::PendingHumanInputStatus::Answered;
+        crate::workspace::write_pending_human_input(&workspace, &pending).unwrap();
+        let mut state = RuntimeState::default();
+        let result = orchestrator_for(&snapshot)
+            .reconcile_pending_human_input(&snapshot, &mut state, task)
+            .await
+            .unwrap();
+        assert_eq!(result.state, "Backlog");
+        assert!(
+            crate::workspace::load_pending_human_input(&workspace)
+                .unwrap()
+                .unwrap()
+                .resume_transition_applied
+        );
+    }
+
+    #[tokio::test]
+    async fn human_input_is_saved_before_tracker_refresh() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({"message":"offline"})))
+            .mount(&server)
+            .await;
+        let mut snapshot = snapshot();
+        snapshot.settings.tracker.mode = crate::config::GitHubMode::IssuesOnly;
+        snapshot.settings.tracker.repo = Some("kairastra".into());
+        snapshot.settings.tracker.rest_endpoint = server.uri();
+        let dir = tempfile::tempdir().unwrap();
+        let request = human_input_request();
+        assert!(orchestrator_for(&snapshot)
+            .persist_human_input_request(&snapshot, "1", dir.path(), request.clone())
+            .await
+            .is_err());
+        let saved = crate::workspace::load_pending_human_input(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.request, request);
+        assert!(saved.prompt_comment_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn human_input_prompt_recovery_reuses_an_accepted_post() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let mut pending = pending_input();
+        let body = render_human_input_prompt_comment(&pending.request);
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/repo/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"id":42,"body":body}])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut snapshot = snapshot();
+        snapshot.settings.tracker.rest_endpoint = server.uri();
+        let dir = tempfile::tempdir().unwrap();
+        let mut task = issue("1", "Human Review", None);
+        task.identifier = "openai/repo#1".into();
+        orchestrator_for(&snapshot)
+            .ensure_human_input_prompt(&task, dir.path(), &mut pending)
+            .await
+            .unwrap();
+        assert_eq!(pending.prompt_comment_id, Some(42));
+    }
+
+    #[test]
+    fn question_level_other_allows_custom_answers() {
+        let mut request = human_input_request();
+        request.questions[0].is_other = true;
+        request.questions[0]
+            .options
+            .iter_mut()
+            .for_each(|option| option.is_other = false);
+        assert!(render_human_input_prompt_comment(&request).contains("C. `Other`"));
+        let comment = answer_comment(
+            "/kairastra answer input-123\nscope: Other\nscope_other: custom scope",
+            "OWNER",
+            1,
+        );
+        let answers = parse_human_input_answer(&request, &comment).unwrap();
+        assert_eq!(answers[0].other_text.as_deref(), Some("custom scope"));
+        assert_eq!(answers[0].selected_option, None);
+        let empty = answer_comment("/kairastra answer input-123\nscope: Other", "OWNER", 2);
+        assert!(parse_human_input_answer(&request, &empty).is_none());
+    }
+
+    #[tokio::test]
+    async fn reload_updates_tracker_auth_and_rejects_repository_switch() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe"))
+            .and(header("authorization", "Bearer rotated-test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
+            .mount(&server)
+            .await;
+        let mut current = snapshot();
+        current.settings.tracker.rest_endpoint = server.uri();
+        let mut runtime = orchestrator_for(&current);
+        let mut changed = current.clone();
+        changed.settings.tracker.api_key = "rotated-test-token".into();
+        changed.settings.tracker.human_review_state = Some("Needs Review".into());
+        runtime.apply_snapshot(&mut current, changed).unwrap();
+        assert_eq!(
+            runtime.tracker.settings().human_review_state.as_deref(),
+            Some("Needs Review")
+        );
+        runtime
+            .tracker
+            .rest_json(reqwest::Method::GET, "/probe", None)
+            .await
+            .unwrap();
+        let previous = current.settings.tracker.clone();
+        let mut changed = current.clone();
+        changed.settings.tracker.repo = Some("different".into());
+        assert!(runtime.apply_snapshot(&mut current, changed).is_err());
+        assert_eq!(current.settings.tracker, previous);
+        assert_eq!(runtime.tracker.settings(), &previous);
     }
 
     #[test]
@@ -3368,5 +3771,352 @@ providers:
         let (tool_name, tool_id) = tool_log_fields(&payload);
         assert_eq!(tool_name, Some("github_rest"));
         assert_eq!(tool_id, Some("toolu_abc"));
+    }
+
+    #[test]
+    fn review_retry_backoff_blocks_fresh_dispatch() {
+        let snapshot = snapshot();
+        let mut state = RuntimeState::default();
+        let task = issue("1", "In Progress", Some(1));
+        super::schedule_retry(
+            &snapshot.settings,
+            &mut state,
+            task.id.clone(),
+            task.identifier.clone(),
+            6,
+            false,
+        );
+        assert!(
+            state.retry_attempts[&task.id].due_at
+                > std::time::Instant::now() + std::time::Duration::from_secs(100)
+        );
+        assert!(
+            select_dispatchable(&snapshot, &[task], &state).is_empty(),
+            "a future retry must not be dispatched by a regular poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_retry_survives_tracker_error() {
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({"message":"temporarily unavailable"})),
+            )
+            .mount(&server)
+            .await;
+        let mut snapshot = snapshot();
+        snapshot.settings.tracker.mode = crate::config::GitHubMode::IssuesOnly;
+        snapshot.settings.tracker.repo = Some("kairastra".into());
+        snapshot.settings.tracker.rest_endpoint = server.uri();
+        let tracker =
+            Arc::new(crate::github::GitHubTracker::new(snapshot.settings.tracker.clone()).unwrap());
+        let store = Arc::new(crate::workflow::WorkflowStore::new(
+            std::path::PathBuf::from("unused"),
+        ));
+        let orchestrator = super::Orchestrator::new(store, tracker);
+        let mut state = RuntimeState::default();
+        state.retry_attempts.insert(
+            "1".into(),
+            super::RetryEntry {
+                attempt: 6,
+                due_at: std::time::Instant::now(),
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(orchestrator
+            .dispatch_due_retries(&snapshot, &mut state, &tx)
+            .await
+            .is_err());
+        assert!(
+            state.retry_attempts.contains_key("1"),
+            "transient tracker error must retain scheduled retry and attempt count"
+        );
+        assert_eq!(state.retry_attempts["1"].attempt, 6);
+        assert!(state.retry_attempts["1"].due_at > std::time::Instant::now());
+    }
+
+    #[tokio::test]
+    async fn retries_wait_for_state_capacity_and_respect_dependencies() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for blocked in [false, true] {
+            let server = MockServer::start().await;
+            let status = if blocked { "Todo" } else { "In Progress" };
+            Mock::given(method("GET")).and(path("/repos/openai/kairastra/issues")).and(query_param("page", "1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"id":1,"node_id":"1","number":1,"title":"Test","state":"open","assignees":[],"labels":[{"name":status}]}]))).mount(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/repos/openai/kairastra/issues"))
+                .and(query_param("page", "2"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/repos/openai/kairastra/issues/1/dependencies/blocked_by",
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!([{"id":9,"state":"open"}])),
+                )
+                .mount(&server)
+                .await;
+            let mut snapshot = snapshot();
+            snapshot.settings.tracker.mode = crate::config::GitHubMode::IssuesOnly;
+            snapshot.settings.tracker.repo = Some("kairastra".into());
+            snapshot.settings.tracker.rest_endpoint = server.uri();
+            snapshot.settings.tracker.status_source = Some(crate::config::FieldSource {
+                source_type: crate::config::FieldSourceType::Label,
+                name: None,
+            });
+            snapshot
+                .settings
+                .agent
+                .max_concurrent_agents_by_state
+                .insert("in progress".into(), 0);
+            let mut state = RuntimeState::default();
+            state.retry_attempts.insert(
+                "1".into(),
+                super::RetryEntry {
+                    attempt: 4,
+                    due_at: std::time::Instant::now(),
+                },
+            );
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            orchestrator_for(&snapshot)
+                .dispatch_due_retries(&snapshot, &mut state, &tx)
+                .await
+                .unwrap();
+            assert!(state.running.is_empty());
+            if blocked {
+                assert!(!state.retry_attempts.contains_key("1"));
+            } else {
+                assert_eq!(state.retry_attempts["1"].attempt, 4);
+                assert!(state.retry_attempts["1"].due_at > std::time::Instant::now());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_once_finishes_started_workers_after_later_dispatch_error() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let all_reads = Arc::new(AtomicUsize::new(0));
+        let reads = all_reads.clone();
+        Mock::given(method("GET")).and(path("/repos/openai/kairastra/issues")).and(query_param("page", "1"))
+            .respond_with(move |request: &wiremock::Request| {
+                let all = request.url.query_pairs().any(|(name, value)| name == "state" && value == "all");
+                if all && reads.fetch_add(1, Ordering::SeqCst) >= 2 {
+                    return ResponseTemplate::new(503).set_body_json(json!({"message":"offline"}));
+                }
+                ResponseTemplate::new(200).set_body_json(json!([
+                    {"id":1,"node_id":"1","number":1,"title":"A","state":"open","assignees":[],"labels":[{"name":"In Progress"}]},
+                    {"id":2,"node_id":"2","number":2,"title":"B","state":"open","assignees":[],"labels":[{"name":"In Progress"}]}
+                ]))
+            }).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("finalized");
+        let file = dir.path().join("WORKFLOW.md");
+        std::fs::write(&file, format!("---\ntracker:\n  kind: github\n  owner: openai\n  repo: kairastra\n  mode: issues_only\n  status_source:\n    type: label\n  api_key: fake\n  rest_endpoint: {}\nworkspace:\n  root: {}\nhooks:\n  before_run: 'sleep 0.1; exit 1'\n  after_run: \"touch '{}'\"\nagent:\n  provider: codex\n  max_concurrent_agents: 2\nproviders:\n  codex: {{}}\n---\nPrompt\n", server.uri(), dir.path().join("workspaces").display(), marker.display())).unwrap();
+        let store = Arc::new(crate::workflow::WorkflowStore::new(file));
+        let snapshot = store.current().unwrap();
+        let runtime = super::Orchestrator::new(
+            store,
+            Arc::new(crate::github::GitHubTracker::new(snapshot.settings.tracker).unwrap()),
+        );
+        assert!(runtime.run_once().await.is_err());
+        assert!(all_reads.load(Ordering::SeqCst) >= 3);
+        assert!(
+            marker.exists(),
+            "run_once returned before its previously launched worker finalized"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_plan_mode_outer_watchdog_uses_plan_timeout() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let mut snapshot = snapshot();
+        snapshot.settings.workspace.root = dir.path().into();
+        let mut task = issue("1", "In Progress", Some(1));
+        task.labels.push("mode:plan".into());
+        let tracker =
+            Arc::new(crate::github::GitHubTracker::new(snapshot.settings.tracker.clone()).unwrap());
+        let store = Arc::new(crate::workflow::WorkflowStore::new(
+            std::path::PathBuf::from("unused"),
+        ));
+        let orchestrator = super::Orchestrator::new(store, tracker);
+        let mut state = RuntimeState::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(orchestrator
+            .spawn_worker(snapshot, &mut state, &tx, task, None)
+            .await
+            .unwrap());
+        let running = &state.running["1"];
+        running.handle.abort();
+        assert!(running.stall_timeout_ms >= 900_000, "outer orchestrator watchdog must respect the provider's 15-minute planning timeout, got {}", running.stall_timeout_ms);
+    }
+
+    #[tokio::test]
+    async fn review_retry_honors_changed_assignee_filter() {
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let payload = json!([{"id":1,"node_id":"1","number":1,"title":"Issue", "state":"open", "assignees":[{"login":"someone-else"}], "labels":[{"name":"In Progress"}]}]);
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(payload))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let mut snapshot = snapshot_with_assignee("codex-bot");
+        let dir = tempfile::tempdir().unwrap();
+        snapshot.settings.workspace.root = dir.path().into();
+        snapshot.settings.tracker.mode = crate::config::GitHubMode::IssuesOnly;
+        snapshot.settings.tracker.status_source = Some(crate::config::FieldSource {
+            source_type: crate::config::FieldSourceType::Label,
+            name: None,
+        });
+        snapshot.settings.tracker.repo = Some("kairastra".into());
+        snapshot.settings.tracker.rest_endpoint = server.uri();
+        let tracker =
+            Arc::new(crate::github::GitHubTracker::new(snapshot.settings.tracker.clone()).unwrap());
+        let fetched =
+            crate::github::Tracker::fetch_issue_states_by_ids(tracker.as_ref(), &["1".to_string()])
+                .await
+                .unwrap();
+        assert_eq!(fetched[0].state, "In Progress");
+        let orchestrator = super::Orchestrator::new(
+            Arc::new(crate::workflow::WorkflowStore::new("unused".into())),
+            tracker,
+        );
+        let mut state = RuntimeState::default();
+        state.retry_attempts.insert(
+            "1".into(),
+            super::RetryEntry {
+                attempt: 2,
+                due_at: std::time::Instant::now(),
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        orchestrator
+            .dispatch_due_retries(&snapshot, &mut state, &tx)
+            .await
+            .unwrap();
+        let started = !state.running.is_empty();
+        for running in state.running.values() {
+            running.handle.abort();
+        }
+        assert!(
+            !started,
+            "retry launched work after the issue was reassigned away from the configured bot"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_polling_continues_during_worker_events() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("codex-spam.py");
+        let ready = dir.path().join("ready");
+        let script_body = format!(
+            r##"#!/usr/bin/env python3
+import json, sys, time
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get('method')
+    if method == 'initialize':
+        print(json.dumps({{'id':1,'result':{{}}}}), flush=True)
+    elif method == 'thread/start':
+        print(json.dumps({{'id':2,'result':{{'thread':{{'id':'review-thread'}}}}}}), flush=True)
+    elif method == 'turn/start':
+        print(json.dumps({{'id':3,'result':{{'turn':{{'id':'review-turn'}}}}}}), flush=True)
+        open({ready:?}, 'w').close()
+        for i in range(150):
+            print(json.dumps({{'method':'turn/plan/updated','params':{{'plan':[]}}}}), flush=True)
+            time.sleep(0.004)
+        print(json.dumps({{'method':'turn/completed','params':{{'turn':{{'id':'review-turn','status':'completed'}}}}}}), flush=True)
+"##,
+            ready = ready.to_str().unwrap()
+        );
+        std::fs::write(&script, script_body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let issue_payload = json!([{"id":1,"node_id":"1","number":1,"title":"Issue", "state":"open", "assignees":[], "labels":[{"name":"In Progress"}]}]);
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issue_payload))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/openai/kairastra/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id":9,"body":"## Codex Workpad\ncreated"})),
+            )
+            .mount(&server)
+            .await;
+        let yaml = format!("tracker:\n  kind: github\n  owner: openai\n  repo: kairastra\n  mode: issues_only\n  status_source:\n    type: label\n  api_key: fake\n  rest_endpoint: {}\npolling:\n  interval_ms: 30\nworkspace:\n  root: {}\nagent:\n  provider: codex\n  max_concurrent_agents: 1\nproviders:\n  codex:\n    command: {}\n", server.uri(), dir.path().join("workspaces").display(), script.display());
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        std::fs::write(&workflow_path, format!("---\n{yaml}---\nPrompt\n")).unwrap();
+        let store = Arc::new(crate::workflow::WorkflowStore::new(workflow_path));
+        let snapshot = store.current().unwrap();
+        let tracker =
+            Arc::new(crate::github::GitHubTracker::new(snapshot.settings.tracker).unwrap());
+        let orchestrator = super::Orchestrator::new(store, tracker);
+        let handle = tokio::spawn(async move { orchestrator.run().await });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            ready.exists(),
+            "fake provider never reached its event stream"
+        );
+        let before = server.received_requests().await.unwrap().len();
+        tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+        let after = server.received_requests().await.unwrap().len();
+        handle.abort();
+        let _ = handle.await;
+        // The fake provider exits after its short stream; allow detached worker cleanup.
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(after > before, "no polling/reconciliation requests occurred during 6 configured poll intervals while the worker streamed events ({before} -> {after})");
     }
 }

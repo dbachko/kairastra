@@ -163,7 +163,7 @@ impl ClaudeSession {
             }
         });
         if let Some(reason) = timeout_reason {
-            child.kill().await.ok();
+            child.start_kill().ok();
             emit_event(
                 on_event,
                 AgentEventKind::TurnEndedWithError,
@@ -176,19 +176,18 @@ impl ClaudeSession {
             );
         }
 
-        let status = child
-            .wait()
-            .await
-            .context("failed to wait for Claude turn")?;
-        debug!(issue_identifier = %issue.identifier, exit_status = %status, "Claude process exited");
-        let stdin_error = match stdin_writer.await {
+        let grace = crate::providers::process::shutdown_grace(self.config.turn_timeout_ms);
+        let status = crate::providers::process::wait_for_exit(&mut child, grace).await;
+        let stdin_error = match crate::providers::process::drain_task(stdin_writer, grace).await {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(error.to_string()),
             Err(error) => Some(format!("failed to join Claude stdin writer: {error}")),
         };
         if let Some(task) = stderr_logger {
-            let _ = task.await;
+            crate::providers::process::drain_task(task, grace).await?;
         }
+        let status = status.context("failed to finish Claude turn")?;
+        debug!(issue_identifier = %issue.identifier, exit_status = %status, "Claude process exited");
         let stderr_summary = summarize_stderr(&stderr_lines);
         match result {
             Ok(result) => {
@@ -1117,5 +1116,46 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
             .unwrap();
 
         assert_eq!(result.session_id, "claude-session-large");
+    }
+    #[tokio::test]
+    async fn provider_result_does_not_allow_unbounded_process_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("workspaces");
+        let workspace = root.join("ISSUE-1");
+        fs::create_dir_all(&workspace).unwrap();
+        let script = dir.path().join("slow-shutdown.py");
+        fs::write(&script, r#"#!/bin/sh
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"review-session","result":"ok"}'
+exec sleep 20
+"#).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let settings = settings_with_command(
+            &root,
+            &script.display().to_string(),
+            "turn_timeout_ms: 10000\nstall_timeout_ms: 10000",
+        );
+        let mut session = ClaudeSession::start(&settings, "fake", &workspace).unwrap();
+        let (tx, mut rx) = unbounded_channel();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            session.run_turn(&issue("ISSUE-1"), "prompt", &tx),
+        )
+        .await;
+        let mut saw_result = false;
+        while let Ok(event) = rx.try_recv() {
+            saw_result |= matches!(event.event, crate::agent::AgentEventKind::TurnCompleted);
+        }
+        assert!(
+            saw_result,
+            "fake provider never emitted its result; outcome: {result:?}"
+        );
+        let error = result
+            .expect("process shutdown must be bounded")
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("provider_shutdown_timeout"),
+            "{error:#}"
+        );
     }
 }

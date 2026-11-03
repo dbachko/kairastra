@@ -59,6 +59,8 @@ impl GitHubTracker {
 
         let client = Client::builder()
             .default_headers(headers)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .context("failed to build GitHub HTTP client")?;
 
@@ -515,7 +517,7 @@ query KairastraProjectStatusField($owner: String!, $projectNumber: Int!) {
         match self.settings.mode {
             GitHubMode::ProjectsV2 => {
                 let Some(project_item_id) = issue.project_item_id.as_ref() else {
-                    return Ok(issue.clone());
+                    return Err(anyhow!("github_project_item_missing: {}", issue.identifier));
                 };
 
                 let metadata = self.load_project_status_field_metadata().await?;
@@ -528,8 +530,9 @@ query KairastraProjectStatusField($owner: String!, $projectNumber: Int!) {
                         anyhow!("github_project_status_option_not_found: {target_status}")
                     })?;
 
-                self.graphql_raw(
-                    r#"
+                let response = self
+                    .graphql_raw(
+                        r#"
 mutation KairastraUpdateProjectItemStatus(
   $projectId: ID!,
   $itemId: ID!,
@@ -549,14 +552,33 @@ mutation KairastraUpdateProjectItemStatus(
     }
   }
 }"#,
-                    json!({
-                        "projectId": metadata.project_id,
-                        "itemId": project_item_id,
-                        "fieldId": metadata.field_id,
-                        "optionId": option_id,
-                    }),
-                )
-                .await?;
+                        json!({
+                            "projectId": metadata.project_id,
+                            "itemId": project_item_id,
+                            "fieldId": metadata.field_id,
+                            "optionId": option_id,
+                        }),
+                    )
+                    .await?;
+                let parsed: GraphqlEnvelope<JsonValue> = serde_json::from_value(response)
+                    .context("invalid project status mutation response")?;
+                if let Some(errors) = parsed.errors.filter(|errors| !errors.is_empty()) {
+                    if graphql_errors_indicate_rate_limit(&errors) {
+                        return Err(anyhow!("github_rate_limit"));
+                    }
+                    return Err(anyhow!("github_graphql_errors: {errors:?}"));
+                }
+                if parsed
+                    .data
+                    .as_ref()
+                    .and_then(|data| {
+                        data.pointer("/updateProjectV2ItemFieldValue/projectV2Item/id")
+                    })
+                    .and_then(JsonValue::as_str)
+                    != Some(project_item_id.as_str())
+                {
+                    return Err(anyhow!("github_project_status_mutation_not_confirmed"));
+                }
             }
             GitHubMode::IssuesOnly => {
                 self.transition_issue_label_status(issue, target_status)
@@ -567,11 +589,19 @@ mutation KairastraUpdateProjectItemStatus(
         let refreshed = self
             .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
             .await?;
-        Ok(refreshed.into_iter().next().unwrap_or_else(|| {
-            let mut updated = issue.clone();
-            updated.state = target_status.to_string();
-            updated
-        }))
+        let updated = refreshed.into_iter().next().ok_or_else(|| {
+            anyhow!(
+                "github_issue_missing_after_transition: {}",
+                issue.identifier
+            )
+        })?;
+        if normalize_issue_state(&updated.state) != normalize_issue_state(target_status) {
+            return Err(anyhow!(
+                "github_status_transition_not_confirmed: expected {target_status}, got {}",
+                updated.state
+            ));
+        }
+        Ok(updated)
     }
 
     async fn transition_issue_label_status(
@@ -723,14 +753,28 @@ mutation KairastraUpdateProjectItemStatus(
             page += 1;
         }
 
-        let statuses_path = format!("/repos/{owner}/{repo}/commits/{head_sha}/status");
-        let statuses_response = self
-            .rest_json(reqwest::Method::GET, &statuses_path, None)
-            .await?;
-        let statuses: RestCombinedStatus = serde_json::from_value(statuses_response)
-            .context("invalid GitHub commit status payload")?;
+        let mut status_contexts = Vec::new();
+        let mut aggregate_state = None;
+        let mut total_status_count = 0;
+        let mut page = 1_u32;
+        loop {
+            let path = format!("/repos/{owner}/{repo}/commits/{head_sha}/status?per_page={GITHUB_PAGE_SIZE}&page={page}");
+            let response = self.rest_json(reqwest::Method::GET, &path, None).await?;
+            let parsed: RestCombinedStatus =
+                serde_json::from_value(response).context("invalid GitHub commit status payload")?;
+            if page == 1 {
+                aggregate_state = parsed.state;
+                total_status_count = parsed.total_count.unwrap_or(parsed.statuses.len());
+            }
+            let page_len = parsed.statuses.len();
+            status_contexts.extend(parsed.statuses);
+            if page_len == 0 || status_contexts.len() >= total_status_count {
+                break;
+            }
+            page += 1;
+        }
 
-        let had_checks = !(check_runs.is_empty() && statuses.statuses.is_empty());
+        let had_checks = !(check_runs.is_empty() && status_contexts.is_empty());
         let mut failing = Vec::new();
         let mut pending = Vec::new();
 
@@ -744,13 +788,30 @@ mutation KairastraUpdateProjectItemStatus(
             }
         }
 
-        for status in statuses.statuses {
+        for status in status_contexts {
             let name = status.context.unwrap_or_else(|| "status".to_string());
             match status.state.as_deref() {
                 Some("success") => {}
                 Some("failure") | Some("error") => failing.push(name),
                 Some("pending") => pending.push(name),
                 Some(_) | None => pending.push(name),
+            }
+        }
+
+        if total_status_count > 0 {
+            match aggregate_state.as_deref() {
+                Some("failure" | "error") if failing.is_empty() => {
+                    failing.push("combined commit status".to_string())
+                }
+                Some(state)
+                    if state != "success"
+                        && state != "failure"
+                        && state != "error"
+                        && pending.is_empty() =>
+                {
+                    pending.push("combined commit status".to_string())
+                }
+                _ => {}
             }
         }
 
@@ -773,7 +834,14 @@ mutation KairastraUpdateProjectItemStatus(
 
     pub async fn update_workpad_comment(&self, issue: &Issue, body: &str) -> Result<Issue> {
         let Some(comment_id) = issue.workpad_comment_id else {
-            return self.ensure_workpad_comment(issue, body).await;
+            let located = self.ensure_workpad_comment(issue, body).await?;
+            if located.workpad_comment_body.as_deref() == Some(body) {
+                return Ok(located);
+            }
+            let id = located
+                .workpad_comment_id
+                .context("missing discovered workpad id")?;
+            return self.patch_workpad_comment(&located, id, body).await;
         };
 
         self.patch_workpad_comment(issue, comment_id, body).await
@@ -816,15 +884,11 @@ mutation KairastraUpdateProjectItemStatus(
             .rev()
             .find(|comment| is_workpad_comment(&comment.body))
         {
-            if comment.body == body {
-                let mut updated = issue.clone();
-                updated.workpad_comment_id = Some(comment.id);
-                updated.workpad_comment_url = comment.html_url;
-                updated.workpad_comment_body = Some(comment.body);
-                return Ok(updated);
-            }
-
-            return self.patch_workpad_comment(issue, comment.id, body).await;
+            let mut updated = issue.clone();
+            updated.workpad_comment_id = Some(comment.id);
+            updated.workpad_comment_url = comment.html_url;
+            updated.workpad_comment_body = Some(comment.body);
+            return Ok(updated);
         }
 
         let comment = self.create_issue_comment(issue, body).await?;
@@ -942,8 +1006,14 @@ mutation KairastraUpdateProjectItemStatus(
         let response = match self.rest_json(reqwest::Method::GET, &path, None).await {
             Ok(response) => response,
             Err(error) => {
-                debug!(issue_number, error = ?error, "blocked_by lookup failed; treating as empty");
-                return Ok(Vec::new());
+                if error.to_string().contains("github_rest_status: 404") {
+                    debug!(
+                        issue_number,
+                        "dependency endpoint unavailable; treating as unsupported"
+                    );
+                    return Ok(Vec::new());
+                }
+                return Err(error).context("failed to determine issue dependencies");
             }
         };
 
@@ -1109,17 +1179,21 @@ mutation KairastraUpdateProjectItemStatus(
             .or_else(|| self.settings.repo.clone())
             .ok_or_else(|| anyhow!("missing_github_repo"))?;
 
-        let field_values = match self
+        let needs_issue_fields = self
             .settings
             .status_source
             .as_ref()
-            .map(|source| source.source_type)
-        {
-            Some(FieldSourceType::IssueField) => self
-                .fetch_issue_field_values(&owner, &repo, issue.number)
-                .await
-                .unwrap_or_default(),
-            _ => HashMap::new(),
+            .is_some_and(|source| source.source_type == FieldSourceType::IssueField)
+            || self
+                .settings
+                .priority_source
+                .as_ref()
+                .is_some_and(|source| source.source_type == FieldSourceType::IssueField);
+        let field_values = if needs_issue_fields {
+            self.fetch_issue_field_values(&owner, &repo, issue.number)
+                .await?
+        } else {
+            HashMap::new()
         };
 
         let state = resolve_issue_state(&self.settings, &issue, &field_values);
@@ -1234,6 +1308,7 @@ impl Tracker for GitHubTracker {
                     if let Some(content) = &item.content {
                         let issue_id = match content {
                             ProjectItemContent::Issue(issue) => &issue.id,
+                            ProjectItemContent::Other => continue,
                         };
                         if ids.iter().any(|candidate| candidate == issue_id) {
                             if let Some(issue) = self.normalize_project_issue(item).await? {
@@ -1751,7 +1826,9 @@ struct ProjectFieldValue {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "__typename")]
 enum ProjectItemContent {
-    Issue(ProjectIssue),
+    Issue(Box<ProjectIssue>),
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1917,6 +1994,8 @@ struct RestCheckRun {
 
 #[derive(Debug, Deserialize)]
 struct RestCombinedStatus {
+    state: Option<String>,
+    total_count: Option<usize>,
     statuses: Vec<RestStatusContext>,
 }
 
@@ -2152,7 +2231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projects_v2_candidate_fetch_normalizes_issue_fields() {
+    async fn projects_v2_candidate_fetch_skips_drafts_and_pull_requests() {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -2164,7 +2243,8 @@ mod tests {
                         "projectV2": {
                             "items": {
                                 "pageInfo": { "hasNextPage": false, "endCursor": null },
-                                "nodes": [{
+                                "nodes": [{"id":"draft-1", "content":{"__typename":"DraftIssue"}},
+                                    {"id":"pr-1", "content":{"__typename":"PullRequest"}}, {
                                     "id": "item-1",
                                     "status": { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Todo" },
                                     "priority": { "__typename": "ProjectV2ItemFieldNumberValue", "number": 1 },
@@ -3741,7 +3821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_workpad_comment_updates_existing_comment_body() {
+    async fn ensure_workpad_comment_preserves_existing_comment_body() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -3825,7 +3905,7 @@ mod tests {
         );
         assert_eq!(
             updated.workpad_comment_body.as_deref(),
-            Some("## Agent Workpad\n\nnew")
+            Some("## Agent Workpad\n\nexisting")
         );
     }
 
@@ -4071,7 +4151,7 @@ mod tests {
         assert_eq!(updated.workpad_comment_id, Some(101));
         assert_eq!(
             updated.workpad_comment_body.as_deref(),
-            Some("## Agent Workpad\n\nnew")
+            Some("## Agent Workpad\n\nold")
         );
     }
 
@@ -4226,5 +4306,198 @@ mod tests {
             updated.workpad_comment_url.as_deref(),
             Some("https://github.com/openai/kairastra/issues/42#issuecomment-11")
         );
+    }
+    #[tokio::test]
+    async fn review_workpad_bootstrap_preserves_existing_progress() {
+        let server = MockServer::start().await;
+        let completed = "## Codex Workpad\n\n### Plan\n- [x] Implemented\n\n### Acceptance Criteria\n- [x] Complete\n\n### Validation\n- [x] Tests passed\n";
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{"id":9,"body":completed}])),
+            )
+            .mount(&server)
+            .await;
+        let bootstrap = "## Codex Workpad\n\n- Bootstrap created by Kairastra runtime before the first agent turn.";
+        Mock::given(method("PATCH"))
+            .and(path("/repos/openai/kairastra/issues/comments/9"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id":9,"body":bootstrap})),
+            )
+            .mount(&server)
+            .await;
+        let tracker = GitHubTracker::new(settings(&format!("tracker:\n  kind: github\n  owner: openai\n  project_v2_number: 7\n  api_key: fake\n  rest_endpoint: {}\n", server.uri())).tracker).unwrap();
+        let issue = Issue {
+            id: "1".into(),
+            project_item_id: None,
+            identifier: "openai/kairastra#1".into(),
+            title: "Test".into(),
+            description: None,
+            priority: None,
+            state: "In Progress".into(),
+            branch_name: None,
+            url: None,
+            assignees: vec![],
+            labels: vec![],
+            blocked_by: vec![],
+            created_at: None,
+            updated_at: None,
+            workpad_comment_id: None,
+            workpad_comment_url: None,
+            workpad_comment_body: None,
+        };
+        let resumed = tracker
+            .ensure_workpad_comment(&issue, bootstrap)
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.workpad_comment_body.as_deref(),
+            Some(completed),
+            "resuming must not replace completed work with bootstrap"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_combined_status_failure_cannot_be_hidden_on_later_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/commits/head-sha/check-runs"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"check_runs":[]})),
+            )
+            .mount(&server)
+            .await;
+        let first_page = (0..100)
+            .map(|i| serde_json::json!({"state":"success","context":format!("passing-{i}")}))
+            .collect::<Vec<_>>();
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/commits/head-sha/status"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"state":"failure","total_count":101,"statuses":first_page}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/commits/head-sha/status"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state":"failure", "total_count":101,
+                "statuses":[{"state":"failure", "context":"failing-on-page-two"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tracker = GitHubTracker::new(settings(&format!("tracker:\n  kind: github\n  owner: openai\n  project_v2_number: 7\n  api_key: fake\n  rest_endpoint: {}\n", server.uri())).tracker).unwrap();
+        let summary = tracker
+            .pull_request_checks_summary("openai", "kairastra", "head-sha")
+            .await
+            .unwrap();
+        assert_eq!(summary.failing, ["failing-on-page-two"]);
+        assert!(!summary.allows_review_handoff(), "GitHub's combined status is failure, but runtime reports passing because the failing context is outside the first page");
+    }
+
+    #[tokio::test]
+    async fn dependency_errors_do_not_mean_unblocked() {
+        let server = MockServer::start().await;
+        let tracker = GitHubTracker::new(settings(&format!("tracker:\n  kind: github\n  owner: openai\n  project_v2_number: 7\n  api_key: fake\n  rest_endpoint: {}\n", server.uri())).tracker).unwrap();
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/openai/kairastra/issues/1/dependencies/blocked_by",
+            ))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_json(serde_json::json!({"message":"offline"})),
+            )
+            .mount(&server)
+            .await;
+        assert!(tracker
+            .fetch_blocked_by("openai", "kairastra", 1)
+            .await
+            .is_err());
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/openai/kairastra/issues/2/dependencies/blocked_by",
+            ))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(serde_json::json!({"message":"API rate limit exceeded"})),
+            )
+            .mount(&server)
+            .await;
+        let error = tracker
+            .fetch_blocked_by("openai", "kairastra", 2)
+            .await
+            .unwrap_err();
+        assert!(super::is_rate_limited_error(&error));
+        // An older host without the endpoint retains the documented compatibility path.
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/openai/kairastra/issues/3/dependencies/blocked_by",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"message":"Not Found"})),
+            )
+            .mount(&server)
+            .await;
+        assert!(tracker
+            .fetch_blocked_by("openai", "kairastra", 3)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn issue_field_priority_works_with_label_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/openai/kairastra/issues/1/issue-field-values"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"field":{"name":"Priority"},"value":2}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tracker = GitHubTracker::new(settings(&format!("tracker:\n  kind: github\n  owner: openai\n  repo: kairastra\n  mode: issues_only\n  api_key: fake\n  rest_endpoint: {}\n  status_source:\n    type: label\n  priority_source:\n    type: issue_field\n    name: Priority\n", server.uri())).tracker).unwrap();
+        let raw = serde_json::from_value(serde_json::json!({"id":1,"number":1,"title":"Test","state":"open","labels":[{"name":"In Progress"}],"assignees":[]})).unwrap();
+        let issue = tracker.normalize_rest_issue(raw).await.unwrap();
+        assert_eq!(issue.state, "In Progress");
+        assert_eq!(issue.priority, Some(2));
+    }
+
+    #[tokio::test]
+    async fn project_transition_rejects_errors_and_missing_refresh() {
+        for mutation in [
+            serde_json::json!({"data":null,"errors":[{"message":"option was removed"}]}),
+            serde_json::json!({"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"item-1"}}}}),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(body_string_contains("KairastraProjectStatusField"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"organization":{"projectV2":{
+                    "id":"project-1","fields":{"nodes":[{"__typename":"ProjectV2SingleSelectField","id":"status","name":"Status","options":[{"id":"progress","name":"In Progress"}]}]}
+                }}}}))).mount(&server).await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("KairastraUpdateProjectItemStatus"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(mutation))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST")).and(body_string_contains("KairastraProjectItems"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"organization":{"projectV2":{"items":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}))).mount(&server).await;
+            let tracker = GitHubTracker::new(settings(&format!("tracker:\n  kind: github\n  owner: openai\n  project_v2_number: 7\n  api_key: fake\n  endpoint: {}/graphql\n", server.uri())).tracker).unwrap();
+            let mut issue: crate::model::Issue = serde_json::from_value(serde_json::json!({
+                "id":"issue-1","project_item_id":"item-1","identifier":"openai/kairastra#1","title":"Test","state":"Todo","assignees":[],"labels":[],"blocked_by":[]
+            })).unwrap();
+            assert!(tracker
+                .transition_issue_to_in_progress_on_claim(&issue)
+                .await
+                .is_err());
+            issue.project_item_id = None;
+            assert!(tracker
+                .transition_issue_to_in_progress_on_claim(&issue)
+                .await
+                .is_err());
+        }
     }
 }

@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+mod process;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -163,6 +164,18 @@ pub fn stall_timeout_ms(settings: &Settings) -> Result<u64> {
         "codex" => Ok(codex::config::load(settings)?.stall_timeout_ms),
         "gemini" => Ok(gemini::config::load(settings)?.stall_timeout_ms),
         other => Err(anyhow!("unsupported_agent_provider: {other}")),
+    }
+}
+
+pub fn stall_timeout_ms_for_issue(settings: &Settings, issue: &Issue) -> Result<u64> {
+    if settings.agent.provider.as_str() == "codex" {
+        let config = codex::config::load(settings)?;
+        Ok(codex::runtime::effective_stall_timeout_ms_for_mode(
+            config.stall_timeout_ms,
+            config.effective_collaboration_mode(&issue.labels),
+        ))
+    } else {
+        stall_timeout_ms(settings)
     }
 }
 

@@ -25,7 +25,7 @@ pub struct Settings {
     pub providers: ProviderSettings,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackerSettings {
     pub kind: String,
     pub mode: GitHubMode,
@@ -136,7 +136,7 @@ pub enum FieldSourceType {
     Label,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct FieldSource {
     #[serde(rename = "type")]
     pub source_type: FieldSourceType,

@@ -76,26 +76,6 @@ pub async fn run_issue(
         }
     };
     info!(issue_identifier = %issue.identifier, workspace = %workspace.path.display(), "workspace ready");
-    let loaded_pending_human_input = match workspace::load_pending_human_input(&workspace.path)
-        .with_context(|| {
-            format!(
-                "failed to load pending human input for {}",
-                issue.identifier
-            )
-        }) {
-        Ok(pending) => pending,
-        Err(error) => {
-            return RunIssueResult {
-                outcome: Err(format!("{error:#}")),
-                human_input_request: None,
-            };
-        }
-    };
-    let resolved_human_input = loaded_pending_human_input
-        .as_ref()
-        .filter(|pending| pending.status == PendingHumanInputStatus::Answered)
-        .map(render_resolved_human_input_context);
-
     let _ = event_tx.send(WorkerMessage::RuntimeInfo {
         issue_id: issue.id.clone(),
         identifier: issue.identifier.clone(),
@@ -103,18 +83,22 @@ pub async fn run_issue(
     });
 
     info!(issue_identifier = %issue.identifier, "running before_run hook");
-    if let Err(error) =
-        workspace::run_before_run_hook(&snapshot.settings, &workspace.path, &issue).await
-    {
-        return RunIssueResult {
-            outcome: Err(format!("{error:#}")),
-            human_input_request: None,
-        };
-    }
-    info!(issue_identifier = %issue.identifier, "before_run hook complete");
-
     let mut latest_human_input_request = None;
     let result: Result<WorkerOutcome> = async {
+        let loaded_pending_human_input = workspace::load_pending_human_input(&workspace.path)
+            .with_context(|| {
+                format!(
+                    "failed to load pending human input for {}",
+                    issue.identifier
+                )
+            })?;
+        let resolved_human_input = loaded_pending_human_input
+            .as_ref()
+            .filter(|pending| pending.status == PendingHumanInputStatus::Answered)
+            .map(render_resolved_human_input_context);
+
+        workspace::run_before_run_hook(&snapshot.settings, &workspace.path, &issue).await?;
+        info!(issue_identifier = %issue.identifier, "before_run hook complete");
         info!(issue_identifier = %issue.identifier, "starting provider session");
         let mut session =
             providers::start_session(&snapshot.settings, tracker.clone(), &workspace.path).await?;
@@ -1105,10 +1089,12 @@ providers:
                         id: "scope".to_string(),
                         header: Some("Scope".to_string()),
                         question: "Pick a scope".to_string(),
+                        is_other: false,
                         options: Vec::new(),
                     }],
                 },
                 status: PendingHumanInputStatus::Answered,
+                resume_transition_applied: false,
                 prompt_comment_id: Some(42),
                 prompt_comment_url: Some("https://example.com/comment".to_string()),
                 answered_comment_id: Some(43),
@@ -1128,5 +1114,29 @@ providers:
 
         assert!(result.outcome.is_err());
         assert!(load_pending_human_input(&workspace_path).unwrap().is_some());
+    }
+    #[tokio::test]
+    async fn review_after_run_executes_after_before_run_failure() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("cleanup-ran");
+        let mut settings = settings_with_command(
+            &dir.path().join("workspaces"),
+            "unused-provider",
+            "http://127.0.0.1:1",
+        );
+        settings.hooks.before_run = Some("exit 1".to_string());
+        settings.hooks.after_run = Some(format!("touch '{}'", marker.display()));
+        let snapshot = crate::workflow::WorkflowSnapshot {
+            definition: WorkflowDefinition::default(),
+            settings: settings.clone(),
+        };
+        let tracker = Arc::new(GitHubTracker::new(settings.tracker).unwrap());
+        let (tx, _rx) = unbounded_channel();
+        let result = run_issue(snapshot, tracker, issue_with_workpad(None), None, tx).await;
+        assert!(result.outcome.is_err());
+        assert!(
+            marker.exists(),
+            "workspace exists but failed before_run skipped the promised after_run cleanup hook"
+        );
     }
 }

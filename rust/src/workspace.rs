@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -82,7 +83,32 @@ pub fn write_pending_human_input(workspace: &Path, pending: &PendingHumanInput) 
     }
     let content = serde_json::to_string_pretty(pending)
         .context("failed to encode pending human input state")?;
-    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|error| anyhow!("failed to create state nonce: {error}"))?;
+    let nonce = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let temporary = path.with_file_name(format!(".pending-input-{nonce}.tmp"));
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.with_context(|| format!("failed to write {}", path.display()))
 }
 
 pub fn clear_pending_human_input(workspace: &Path) -> Result<()> {
@@ -110,9 +136,10 @@ pub async fn ensure_workspace(settings: &Settings, issue: &Issue) -> Result<Work
                 false
             }
         } else {
-            fs::remove_file(&path).or_else(|_| fs::remove_dir_all(&path))?;
-            fs::create_dir_all(&path)?;
-            true
+            return Err(anyhow!(
+                "workspace preserved: existing path is not a directory: {}",
+                path.display()
+            ));
         }
     } else {
         fs::create_dir_all(&path)?;
@@ -197,12 +224,11 @@ pub async fn remove_issue_workspace(settings: &Settings, identifier: &str) -> Re
 
     if settings.uses_seed_worktree_bootstrap() {
         if let Some(seed_repo) = configured_seed_repo() {
-            match remove_managed_git_worktree(&seed_repo, &workspace, identifier).await {
-                Ok(()) => return Ok(()),
-                Err(error) if managed_git_worktree_safety_error(&error) => return Err(error),
-                Err(error) if managed_git_worktree_probe_error(&error) => {}
-                Err(error) => return Err(error),
-            }
+            return remove_managed_git_worktree(&seed_repo, &workspace, identifier).await;
+        } else {
+            return Err(anyhow!(
+                "workspace preserved: KAIRASTRA_SEED_REPO is not configured"
+            ));
         }
     }
 
@@ -275,7 +301,13 @@ async fn workspace_requires_recreate(settings: &Settings, workspace: &Path) -> R
     };
 
     if !workspace.join(".git").exists() {
-        return Ok(true);
+        if fs::read_dir(workspace)?.next().is_none() {
+            return Ok(true);
+        }
+        return Err(anyhow!(
+            "workspace preserved: existing directory is not an empty bootstrap workspace: {}",
+            workspace.display()
+        ));
     }
 
     let output = Command::new("git")
@@ -285,7 +317,10 @@ async fn workspace_requires_recreate(settings: &Settings, workspace: &Path) -> R
         .await
         .with_context(|| format!("failed to validate {}", workspace.display()))?;
     if !output.status.success() {
-        return Ok(true);
+        return Err(anyhow!(
+            "workspace preserved: existing Git checkout has no verifiable HEAD: {}",
+            workspace.display()
+        ));
     }
 
     let expected_common_dir = seed_repo_git_common_dir(seed_repo).await?;
@@ -294,9 +329,13 @@ async fn workspace_requires_recreate(settings: &Settings, workspace: &Path) -> R
     };
     let workspace_common_dir = workspace_git_common_dir(workspace).await?;
 
-    Ok(workspace_common_dir
-        .map(|common_dir| common_dir != expected_common_dir)
-        .unwrap_or(true))
+    if workspace_common_dir != Some(expected_common_dir) {
+        return Err(anyhow!(
+            "workspace preserved: existing checkout belongs to another seed repository: {}",
+            workspace.display()
+        ));
+    }
+    Ok(false)
 }
 
 async fn workspace_git_common_dir(workspace: &Path) -> Result<Option<PathBuf>> {
@@ -325,11 +364,55 @@ async fn remove_managed_git_worktree(
     let Some(seed_common_dir) = seed_repo_git_common_dir(seed_repo.clone()).await? else {
         return Err(anyhow!("seed repo is not a git checkout"));
     };
-    if workspace_git_common_dir(workspace).await? != Some(seed_common_dir) {
+    if workspace_git_common_dir(workspace).await?.as_ref() != Some(&seed_common_dir) {
         return Err(anyhow!("workspace is not a managed seed worktree"));
     }
 
+    let exclude_path = seed_common_dir.join("info/exclude");
+    match fs::read_to_string(&exclude_path) {
+        Ok(exclusions)
+            if exclusions
+                .lines()
+                .any(|line| matches!(line, ".github/" | ".agents/")) =>
+        {
+            return Err(anyhow!(
+                "managed_worktree_legacy_exclusions: workspace preserved; remove legacy .github/ and .agents/ rules from {} or run the regenerated workflow hooks before cleanup",
+                exclude_path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).context("workspace preserved: cannot inspect shared Git exclusions")
+        }
+    }
+
     ensure_managed_worktree_clean(workspace).await?;
+    let head_output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .await?;
+    if !head_output.status.success() {
+        return Err(anyhow!(
+            "managed_worktree_unmerged_branch: cannot verify workspace HEAD"
+        ));
+    }
+    let head = String::from_utf8_lossy(&head_output.stdout)
+        .trim()
+        .to_string();
+    let merged = Command::new("git")
+        .arg("-C")
+        .arg(&seed_repo)
+        .args(["merge-base", "--is-ancestor", &head, "HEAD"])
+        .status()
+        .await?;
+    if !merged.success() {
+        return Err(anyhow!(
+            "managed_worktree_unmerged_branch: workspace HEAD {head}"
+        ));
+    }
     ensure_managed_branch_merged(&seed_repo, identifier).await?;
 
     let remove_output = Command::new("git")
@@ -352,23 +435,11 @@ async fn remove_managed_git_worktree(
     let _ = Command::new("git")
         .arg("-C")
         .arg(&seed_repo)
-        .args(["branch", "--delete", "--force", branch_name.as_str()])
+        .args(["branch", "--delete", branch_name.as_str()])
         .output()
         .await;
 
     Ok(())
-}
-
-fn managed_git_worktree_safety_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("managed_worktree_dirty")
-        || message.contains("managed_worktree_unmerged_branch")
-}
-
-fn managed_git_worktree_probe_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("workspace is not a managed seed worktree")
-        || message.contains("seed repo is not a git checkout")
 }
 
 async fn ensure_managed_worktree_clean(workspace: &Path) -> Result<()> {
@@ -521,8 +592,7 @@ mod tests {
 
     use super::{
         clear_pending_human_input, ensure_workspace, load_pending_human_input,
-        load_workspace_repo_workflow, managed_git_worktree_probe_error,
-        managed_git_worktree_safety_error, managed_worktree_status_line_is_kairastra_state,
+        load_workspace_repo_workflow, managed_worktree_status_line_is_kairastra_state,
         remove_issue_workspace, run_after_run_hook, run_hook, sanitize_workspace_key,
         write_pending_human_input,
     };
@@ -637,6 +707,18 @@ workspace:
     }
 
     #[tokio::test]
+    async fn existing_file_at_workspace_path_is_preserved() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("MT-1");
+        fs::write(&path, "operator data").unwrap();
+        let error = ensure_workspace(&test_settings(dir.path()), &issue("MT-1"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("workspace preserved"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "operator data");
+    }
+
+    #[tokio::test]
     async fn persists_pending_human_input_state() {
         let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("KAIRASTRA_DEPLOY_MODE");
@@ -658,10 +740,12 @@ workspace:
                     id: "scope".to_string(),
                     header: Some("Scope".to_string()),
                     question: "Pick a scope".to_string(),
+                    is_other: false,
                     options: Vec::new(),
                 }],
             },
             status: PendingHumanInputStatus::AwaitingAnswer,
+            resume_transition_applied: false,
             prompt_comment_id: Some(42),
             prompt_comment_url: Some("https://example.com/comment".to_string()),
             answered_comment_id: None,
@@ -679,25 +763,6 @@ workspace:
 
         clear_pending_human_input(&workspace.path).unwrap();
         assert!(load_pending_human_input(&workspace.path).unwrap().is_none());
-    }
-
-    #[test]
-    fn managed_worktree_error_classification_controls_cleanup_fallback() {
-        assert!(managed_git_worktree_probe_error(&anyhow::anyhow!(
-            "workspace is not a managed seed worktree"
-        )));
-        assert!(managed_git_worktree_probe_error(&anyhow::anyhow!(
-            "seed repo is not a git checkout"
-        )));
-        assert!(managed_git_worktree_safety_error(&anyhow::anyhow!(
-            "managed_worktree_dirty: /tmp/workspace"
-        )));
-        assert!(!managed_git_worktree_probe_error(&anyhow::anyhow!(
-            "git worktree remove failed: locked"
-        )));
-        assert!(!managed_git_worktree_safety_error(&anyhow::anyhow!(
-            "git worktree remove failed: locked"
-        )));
     }
 
     #[test]
@@ -835,10 +900,12 @@ git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "kairastra/MT-8" "$PWD" HE
                     id: "scope".to_string(),
                     header: Some("Scope".to_string()),
                     question: "Pick a scope".to_string(),
+                    is_other: false,
                     options: Vec::new(),
                 }],
             },
             status: PendingHumanInputStatus::AwaitingAnswer,
+            resume_transition_applied: false,
             prompt_comment_id: Some(42),
             prompt_comment_url: Some("https://example.com/comment".to_string()),
             answered_comment_id: None,
@@ -922,7 +989,7 @@ git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "kairastra/MT-7" "$PWD" HE
     }
 
     #[tokio::test]
-    async fn recreates_invalid_seed_repo_workspace_before_reusing_it() {
+    async fn preserves_invalid_seed_repo_workspace_before_reusing_it() {
         let _guard = ENV_LOCK.lock().await;
         let workspace_root = tempdir().unwrap();
         let seed_repo = tempdir().unwrap();
@@ -949,21 +1016,21 @@ git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "kairastra/MT-3" "$PWD" HE
             .unwrap();
         assert!(status.success());
 
-        let workspace = ensure_workspace(&settings, &issue("MT-3")).await.unwrap();
-        assert!(workspace.created_now);
-
-        let output = StdCommand::new("git")
-            .args(["rev-parse", "--verify", "HEAD"])
-            .current_dir(&workspace.path)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
+        fs::write(existing.join("local-notes.txt"), "keep local work").unwrap();
+        let error = ensure_workspace(&settings, &issue("MT-3"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("workspace preserved"));
+        assert_eq!(
+            fs::read_to_string(existing.join("local-notes.txt")).unwrap(),
+            "keep local work"
+        );
 
         std::env::remove_var("KAIRASTRA_SEED_REPO");
     }
 
     #[tokio::test]
-    async fn recreates_workspace_when_git_repo_is_not_seed_worktree() {
+    async fn preserves_workspace_when_git_repo_is_not_seed_worktree() {
         let _guard = ENV_LOCK.lock().await;
         let workspace_root = tempdir().unwrap();
         let seed_repo = tempdir().unwrap();
@@ -985,28 +1052,22 @@ git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "kairastra/MT-4" "$PWD" HE
         fs::create_dir_all(&existing).unwrap();
         init_git_repo(&existing);
 
-        let workspace = ensure_workspace(&settings, &issue("MT-4")).await.unwrap();
-        assert!(workspace.created_now);
-
-        let common_dir_output = StdCommand::new("git")
-            .args(["rev-parse", "--git-common-dir"])
-            .current_dir(&workspace.path)
-            .output()
-            .unwrap();
-        assert!(common_dir_output.status.success());
-        let common_dir = String::from_utf8_lossy(&common_dir_output.stdout)
-            .trim()
-            .to_string();
-        let resolved_common_dir = if Path::new(&common_dir).is_absolute() {
-            PathBuf::from(common_dir)
-        } else {
-            workspace.path.join(common_dir)
-        }
-        .canonicalize()
-        .unwrap();
+        fs::write(existing.join("local-notes.txt"), "keep local work").unwrap();
+        fs::create_dir_all(existing.join(".kairastra")).unwrap();
+        let pending = existing.join(".kairastra/pending-input.json");
+        fs::write(&pending, "pending human response").unwrap();
+        let error = ensure_workspace(&settings, &issue("MT-4"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("workspace preserved"));
+        assert!(remove_issue_workspace(&settings, "MT-4").await.is_err());
         assert_eq!(
-            resolved_common_dir,
-            seed_repo.path().join(".git").canonicalize().unwrap()
+            fs::read_to_string(existing.join("local-notes.txt")).unwrap(),
+            "keep local work"
+        );
+        assert_eq!(
+            fs::read_to_string(pending).unwrap(),
+            "pending human response"
         );
 
         std::env::remove_var("KAIRASTRA_SEED_REPO");
@@ -1146,5 +1207,110 @@ git -C "$KAIRASTRA_SEED_REPO" worktree add --force -b "kairastra/MT-5" "$PWD" HE
         let workflow = load_workspace_repo_workflow(dir.path()).unwrap();
         assert_eq!(workflow.definition.prompt_template, "");
         assert!(workflow.hooks.before_run.is_none());
+    }
+
+    #[tokio::test]
+    async fn review_cleanup_refuses_detached_unmerged_commit() {
+        let dir = tempdir().unwrap();
+        let seed = dir.path().join("seed");
+        let work = dir.path().join("work");
+        fs::create_dir_all(&seed).unwrap();
+        init_git_repo(&seed);
+        let identifier = "INPUT-1";
+        let branch = super::managed_issue_branch_name(identifier);
+        assert!(StdCommand::new("git")
+            .arg("-C")
+            .arg(&seed)
+            .args(["worktree", "add", "-q", "-b", &branch])
+            .arg(&work)
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .arg("-C")
+            .arg(&work)
+            .args(["checkout", "--detach", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(work.join("valuable.txt"), "unmerged committed work\n").unwrap();
+        assert!(StdCommand::new("git")
+            .arg("-C")
+            .arg(&work)
+            .args(["add", "valuable.txt"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .arg("-C")
+            .arg(&work)
+            .args([
+                "-c",
+                "user.name=Review",
+                "-c",
+                "user.email=review@example.com",
+                "commit",
+                "-qm",
+                "valuable work"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let result = super::remove_managed_git_worktree(&seed, &work, identifier).await;
+        assert!(
+            result.is_err(),
+            "cleanup removed the workspace containing a detached unmerged commit: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_files_hidden_by_legacy_support_exclusions() {
+        let dir = tempdir().unwrap();
+        let seed = dir.path().join("seed");
+        let work = dir.path().join("work");
+        fs::create_dir_all(&seed).unwrap();
+        init_git_repo(&seed);
+        let identifier = "LEGACY-1";
+        let branch = super::managed_issue_branch_name(identifier);
+        assert!(StdCommand::new("git")
+            .arg("-C")
+            .arg(&seed)
+            .args(["worktree", "add", "-q", "-b", &branch])
+            .arg(&work)
+            .status()
+            .unwrap()
+            .success());
+        let exclude = seed.join(".git/info/exclude");
+        fs::write(&exclude, ".github/\noperator-private.txt\n").unwrap();
+        fs::create_dir_all(work.join(".github/workflows")).unwrap();
+        let valuable = work.join(".github/workflows/new.yml");
+        fs::write(&valuable, "name: preserve me\n").unwrap();
+        let status = StdCommand::new("git")
+            .arg("-C")
+            .arg(&work)
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .unwrap();
+        assert!(
+            status.stdout.is_empty(),
+            "fixture must reproduce the hidden file"
+        );
+        let error = super::remove_managed_git_worktree(&seed, &work, identifier)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("managed_worktree_legacy_exclusions"));
+        assert_eq!(
+            fs::read_to_string(&valuable).unwrap(),
+            "name: preserve me\n"
+        );
+        // Once migrated, the ordinary dirtiness guard must see the newly visible file.
+        fs::write(&exclude, "operator-private.txt\n").unwrap();
+        let error = super::remove_managed_git_worktree(&seed, &work, identifier)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("managed_worktree_dirty"));
+        assert!(valuable.exists());
     }
 }

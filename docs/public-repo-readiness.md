@@ -33,6 +33,9 @@ Artifacts are written under `reports/public-readiness/<timestamp>/` and include:
 - `working-tree-content-findings.txt`
 - `history-content-findings.txt`
 
+The text finding files contain raw matches and may include credentials. Keep them private;
+the script creates reports with restrictive local permissions.
+
 ## Blocker policy
 
 Block publication on any unresolved secret-risk finding, including:
@@ -49,7 +52,8 @@ Manual and CI audit workflow:
 
 - `.github/workflows/public-readiness-audit.yml`
 
-It runs the same script and uploads artifacts for review.
+It runs the same script and uploads only `SUMMARY.md` and the redacted `gitleaks.sarif`.
+Raw text finding files stay out of uploaded artifacts, including when the audit fails.
 
 ## Post-flip verification
 

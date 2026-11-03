@@ -36,6 +36,6 @@ One Kairastra deployment is scoped to one repository checkout and one repository
 ## Important Operational Behaviors
 
 - `run --once` performs one dispatch pass and waits for workers started in that pass to finish.
-- Workflow reload failures do not crash a long-running process if a last known good workflow exists.
+- Workflow reload failures do not crash a long-running process if a last known good workflow exists. Token and state-mapping changes rebuild the tracker; changing the repository, project, mode, or API endpoints requires a restart and the entire reload is rejected until then. Running workers retain the settings with which they started.
 - `after_run` hook failures are surfaced in logs and fail the worker outcome.
 - `setup` fails if the generated files do not pass `doctor`.
