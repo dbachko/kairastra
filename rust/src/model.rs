@@ -55,6 +55,8 @@ pub struct HumanInputQuestion {
     pub header: Option<String>,
     pub question: String,
     pub options: Vec<HumanInputOption>,
+    #[serde(default, alias = "isOther")]
+    pub is_other: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,6 +88,8 @@ pub struct HumanInputRequest {
 pub struct PendingHumanInput {
     pub request: HumanInputRequest,
     pub status: PendingHumanInputStatus,
+    #[serde(default)]
+    pub resume_transition_applied: bool,
     pub prompt_comment_id: Option<u64>,
     pub prompt_comment_url: Option<String>,
     pub answered_comment_id: Option<u64>,

@@ -36,5 +36,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: public-readiness-audit-${{ github.run_id }}
-          path: reports/public-readiness
+          path: |
+            reports/public-readiness/SUMMARY.md
+            reports/public-readiness/gitleaks.sarif
           if-no-files-found: warn

@@ -406,7 +406,10 @@ impl CodexSession {
                 .context("failed while reading turn stream")?;
 
             let Some(line) = line else {
-                let status = self.child.wait().await.ok();
+                let grace = crate::providers::process::shutdown_grace(self.config.turn_timeout_ms);
+                let status = crate::providers::process::wait_for_exit(&mut self.child, grace)
+                    .await
+                    .ok();
                 return Err(anyhow!("app_server_exited: {:?}", status));
             };
 
@@ -732,11 +735,11 @@ impl CodexSession {
     }
 }
 
-fn effective_stall_timeout_ms_for_mode(
+pub(crate) fn effective_stall_timeout_ms_for_mode(
     stall_timeout_ms: u64,
     collaboration_mode: Option<CodexCollaborationMode>,
 ) -> u64 {
-    if matches!(collaboration_mode, Some(CodexCollaborationMode::Plan)) {
+    if stall_timeout_ms > 0 && matches!(collaboration_mode, Some(CodexCollaborationMode::Plan)) {
         stall_timeout_ms.max(PLAN_MODE_MIN_STALL_TIMEOUT_MS)
     } else {
         stall_timeout_ms
@@ -794,6 +797,10 @@ fn parse_human_input_question(question: &JsonValue) -> Option<HumanInputQuestion
         id: id.to_string(),
         header,
         question: prompt.to_string(),
+        is_other: question
+            .get("isOther")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false),
         options,
     })
 }
@@ -1392,6 +1399,56 @@ providers:
     }
 
     #[tokio::test]
+    async fn stdout_eof_does_not_wait_forever_for_process_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("workspaces");
+        let workspace = root.join("ISSUE-EOF");
+        fs::create_dir_all(&workspace).unwrap();
+        let script = dir.path().join("closed-stdout-codex.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-eof"}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-eof"}}}'
+      exec 1>&-
+      exec sleep 20
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let settings = settings_with_command(
+            &root,
+            script.to_str().unwrap(),
+            "",
+            "turn_timeout_ms: 10000",
+        );
+        let mut session = CodexSession::start(&settings, tracker(&settings), &workspace)
+            .await
+            .unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            session.run_turn(&issue("ISSUE-EOF"), "prompt", &tx),
+        )
+        .await
+        .expect("stdout EOF must not leave the worker waiting forever")
+        .unwrap_err();
+        assert!(error.to_string().contains("app_server_exited"));
+        assert!(
+            session.child.try_wait().unwrap().is_some(),
+            "stalled process was not reaped"
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_workspace_root_as_cwd() {
         let dir = tempdir().unwrap();
         let settings = settings_with_command(dir.path(), "printf ''", "", "");
@@ -1500,7 +1557,7 @@ while IFS= read -r _line; do
       printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-input"}}}'
       ;;
     4)
-      printf '%s\n' '{"method":"item/tool/requestUserInput","id":9,"params":{"questions":[{"id":"scope","header":"Scope","question":"Pick a scope","options":[{"label":"Small","description":"Minimum change"},{"label":"Large","description":"Full flow","isOther":true}]}]}}'
+      printf '%s\n' '{"method":"item/tool/requestUserInput","id":9,"params":{"questions":[{"id":"scope","header":"Scope","question":"Pick a scope","isOther":true,"options":[{"label":"Small","description":"Minimum change"},{"label":"Large","description":"Full flow"}]}]}}'
       ;;
   esac
 done
@@ -1540,6 +1597,7 @@ done
         while let Ok(event) = rx.try_recv() {
             if matches!(event.event, AgentEventKind::UserInputRequested) {
                 saw_request = true;
+                assert_eq!(event.payload["questions"][0]["is_other"], true);
                 let request_id = event
                     .payload
                     .get("request_id")

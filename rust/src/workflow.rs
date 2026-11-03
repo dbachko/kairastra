@@ -48,6 +48,21 @@ impl WorkflowStore {
     }
 
     pub fn current(&self) -> Result<WorkflowSnapshot> {
+        match self.reload() {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                if let Some(cached) = self.state.read().expect("workflow lock poisoned").clone() {
+                    warn!(workflow_path = %self.path.display(), error = ?error,
+                        "failed to reload WORKFLOW.md; keeping last known good workflow");
+                    Ok(cached.snapshot)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn reload(&self) -> Result<WorkflowSnapshot> {
         let modified_at = workflow_modified_time(&self.path)?;
         let provider_settings_modified_at = provider_settings_modified_time(&self.path)?;
 
@@ -59,37 +74,21 @@ impl WorkflowStore {
             }
         }
 
-        match load_definition(&self.path).and_then(|definition| {
-            let settings = Settings::from_workflow(&definition)?;
-            Ok(WorkflowSnapshot {
-                definition,
-                settings,
-            })
-        }) {
-            Ok(snapshot) => {
-                self.state
-                    .write()
-                    .expect("workflow lock poisoned")
-                    .replace(CachedWorkflow {
-                        modified_at,
-                        provider_settings_modified_at,
-                        snapshot: snapshot.clone(),
-                    });
-                Ok(snapshot)
-            }
-            Err(error) => {
-                if let Some(cached) = self.state.read().expect("workflow lock poisoned").clone() {
-                    warn!(
-                        workflow_path = %self.path.display(),
-                        error = ?error,
-                        "failed to reload WORKFLOW.md; keeping last known good workflow"
-                    );
-                    Ok(cached.snapshot)
-                } else {
-                    Err(error)
-                }
-            }
-        }
+        let definition = load_definition(&self.path)?;
+        let settings = Settings::from_workflow(&definition)?;
+        let snapshot = WorkflowSnapshot {
+            definition,
+            settings,
+        };
+        self.state
+            .write()
+            .expect("workflow lock poisoned")
+            .replace(CachedWorkflow {
+                modified_at,
+                provider_settings_modified_at,
+                snapshot: snapshot.clone(),
+            });
+        Ok(snapshot)
     }
 }
 
@@ -669,6 +668,24 @@ Repo prompt
         assert_eq!(
             resolved,
             fs::canonicalize(dir.path()).unwrap().join("WORKFLOW.md")
+        );
+    }
+
+    #[test]
+    fn review_missing_workflow_keeps_last_known_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("WORKFLOW.md");
+        std::fs::write(&path, "---\ntracker:\n  kind: github\n  owner: openai\n  repo: kairastra\n  mode: issues_only\n  status_source:\n    type: label\n  api_key: fake\nagent:\n  provider: codex\nproviders:\n  codex: {}\n---\nPrompt").unwrap();
+        let store = super::WorkflowStore::new(path.clone());
+        assert!(
+            store.current().is_ok(),
+            "initial load: {:?}",
+            store.current()
+        );
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            store.current().is_ok(),
+            "temporary disappearance during save must preserve the last valid snapshot"
         );
     }
 }

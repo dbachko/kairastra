@@ -2149,17 +2149,20 @@ hooks:
       fi
     }}
 
-    exclude_workspace_support_dir() {{
-      support_dir="$1"
+    remove_legacy_support_exclusions() {{
       exclude_path="$(git rev-parse --git-path info/exclude 2>/dev/null || true)"
-      if [ -z "$exclude_path" ]; then
+      if [ -z "$exclude_path" ] || [ ! -f "$exclude_path" ]; then
         return 0
       fi
-      mkdir -p "$(dirname "$exclude_path")"
-      touch "$exclude_path"
-      entry="$support_dir/"
-      if ! grep -Fqx "$entry" "$exclude_path" 2>/dev/null; then
-        printf '%s\n' "$entry" >> "$exclude_path"
+      if ! grep -Fqx '.github/' "$exclude_path" && ! grep -Fqx '.agents/' "$exclude_path"; then
+        return 0
+      fi
+      temporary="$(mktemp "${{exclude_path}}.kairastra.XXXXXX")"
+      if awk '$0 != ".github/" && $0 != ".agents/"' "$exclude_path" > "$temporary"; then
+        mv "$temporary" "$exclude_path"
+      else
+        rm -f "$temporary"
+        return 1
       fi
     }}
 
@@ -2180,7 +2183,6 @@ hooks:
           echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
           exit 1
         fi
-        exclude_workspace_support_dir "$support_dir"
       done
     }}
 
@@ -2262,6 +2264,7 @@ hooks:
     require_seed_repo
     ensure_workspace_checkout
     remove_legacy_codex_workspace_support
+    remove_legacy_support_exclusions
     require_workspace_support_dirs
     configure_origin_from_seed
     configure_github_auth
@@ -2299,17 +2302,20 @@ hooks:
       fi
     }}
 
-    exclude_workspace_support_dir() {{
-      support_dir="$1"
+    remove_legacy_support_exclusions() {{
       exclude_path="$(git rev-parse --git-path info/exclude 2>/dev/null || true)"
-      if [ -z "$exclude_path" ]; then
+      if [ -z "$exclude_path" ] || [ ! -f "$exclude_path" ]; then
         return 0
       fi
-      mkdir -p "$(dirname "$exclude_path")"
-      touch "$exclude_path"
-      entry="$support_dir/"
-      if ! grep -Fqx "$entry" "$exclude_path" 2>/dev/null; then
-        printf '%s\n' "$entry" >> "$exclude_path"
+      if ! grep -Fqx '.github/' "$exclude_path" && ! grep -Fqx '.agents/' "$exclude_path"; then
+        return 0
+      fi
+      temporary="$(mktemp "${{exclude_path}}.kairastra.XXXXXX")"
+      if awk '$0 != ".github/" && $0 != ".agents/"' "$exclude_path" > "$temporary"; then
+        mv "$temporary" "$exclude_path"
+      else
+        rm -f "$temporary"
+        return 1
       fi
     }}
 
@@ -2330,7 +2336,6 @@ hooks:
           echo "Workspace bootstrap missing required repository support directory: $support_dir" >&2
           exit 1
         fi
-        exclude_workspace_support_dir "$support_dir"
       done
     }}
 
@@ -2463,6 +2468,7 @@ hooks:
 
     require_seed_repo
     remove_legacy_codex_workspace_support
+    remove_legacy_support_exclusions
     require_workspace_support_dirs
     configure_origin_from_seed
     configure_github_auth
@@ -2718,8 +2724,8 @@ mod tests {
         assert!(!rendered.contains("KAIRASTRA_GEMINI_MODEL"));
         assert!(rendered.contains("for support_dir in .agents .github; do"));
         assert!(!rendered.contains("for support_dir in .codex .github; do"));
-        assert!(rendered.contains("git rev-parse --git-path info/exclude"));
-        assert!(rendered.contains("entry=\"$support_dir/\""));
+        assert!(rendered.contains("remove_legacy_support_exclusions"));
+        assert!(!rendered.contains("entry=\"$support_dir/\""));
         assert!(rendered.contains("remove_legacy_codex_workspace_support"));
         assert!(rendered.contains("git ls-files -- .codex"));
         assert!(
@@ -2747,6 +2753,96 @@ mod tests {
         assert!(rendered.contains("## Workpad template"));
         assert!(rendered.contains(".agents/skills/kairastra-push/SKILL.md"));
         assert!(rendered.contains(".agents/skills/kairastra-land/SKILL.md"));
+    }
+
+    #[test]
+    fn generated_hooks_leave_new_workflows_visible_in_worker_and_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("seed");
+        let workspace = dir.path().join("worker");
+        fs::create_dir_all(seed.join(".github/workflows")).unwrap();
+        fs::create_dir_all(seed.join(".agents")).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        for args in [
+            vec!["init", "-q", "--initial-branch=main"],
+            vec!["config", "remote.origin.url", seed.to_str().unwrap()],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&seed)
+                .status()
+                .unwrap()
+                .success());
+        }
+        fs::write(
+            seed.join(".github/workflows/existing.yml"),
+            "name: existing\n",
+        )
+        .unwrap();
+        fs::write(seed.join(".agents/instructions.md"), "instructions\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(&seed)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "seed"
+            ])
+            .current_dir(&seed)
+            .status()
+            .unwrap()
+            .success());
+        // Simulate the shared exclusions installed by an older generated workflow.
+        let exclude = seed.join(".git/info/exclude");
+        fs::write(&exclude, ".github/\n.agents/\noperator-private.txt\n").unwrap();
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        fs::write(
+            &workflow_path,
+            render_workflow(DeployMode::Native, &sample_values()),
+        )
+        .unwrap();
+        let definition = crate::workflow::load_definition(&workflow_path).unwrap();
+        for hook in ["after_create", "before_run"] {
+            let script = definition.config["hooks"][hook].as_str().unwrap();
+            let output = Command::new("bash")
+                .args(["-c", script])
+                .current_dir(&workspace)
+                .env("KAIRASTRA_SEED_REPO", &seed)
+                .env("ISSUE_IDENTIFIER", "TEST-1")
+                .env("KAIRASTRA_GIT_DEFAULT_BRANCH", "main")
+                .env("GIT_CONFIG_GLOBAL", dir.path().join("gitconfig"))
+                .env_remove("KAIRASTRA_WORKTREE_BRANCH")
+                .env_remove("KAIRASTRA_GIT_PUSH_URL")
+                .env_remove("GITHUB_TOKEN")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{hook}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&exclude).unwrap(),
+            "operator-private.txt\n"
+        );
+        for checkout in [&seed, &workspace] {
+            fs::write(checkout.join(".github/workflows/new.yml"), "name: new\n").unwrap();
+            let output = Command::new("git")
+                .args(["status", "--porcelain", "--untracked-files=all"])
+                .current_dir(checkout)
+                .output()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&output.stdout).contains(".github/workflows/new.yml"));
+        }
     }
 
     #[test]
